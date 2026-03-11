@@ -9,35 +9,39 @@ use core::format_args;
 use embedded_graphics::prelude::*;
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use esp_backtrace as _;
-use esp_hal::{delay::Delay, prelude::*};
+use esp_hal::{delay::Delay, main};
 use lilygo_epd47::{pin_config, Display, DrawMode};
 use u8g2_fonts::FontRenderer;
 
 static FONT: FontRenderer = FontRenderer::new::<u8g2_fonts::fonts::u8g2_font_spleen32x64_mr>();
 
-#[entry]
+esp_bootloader_esp_idf::esp_app_desc!();
+
+#[main]
 fn main() -> ! {
     esp_println::logger::init_logger_from_env();
 
-    let peripherals = esp_hal::init(esp_hal::Config::default());
+    let config = esp_hal::Config::default();
+    let config = config.with_cpu_clock(esp_hal::clock::CpuClock::_240MHz);
+    let peripherals = esp_hal::init(config);
 
     // Create PSRAM allocator
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
 
     let mut display = Display::new(
         pin_config!(peripherals),
-        peripherals.DMA,
+        peripherals.DMA_CH0,
         peripherals.LCD_CAM,
         peripherals.RMT,
     )
-    .expect("Failed to initialize display");
+    .expect("to initialize display");
 
     let delay = Delay::new();
 
     delay.delay_millis(100);
     display.power_on();
     delay.delay_millis(10);
-    display.clear().unwrap();
+    display.clear().expect("to clear screen");
 
     let mut counter = 0;
     loop {
@@ -56,15 +60,21 @@ fn main() -> ! {
                 },
                 &mut display,
             )
-            .unwrap();
+            .expect("to render font in framebuffer");
 
-        display.flush(DrawMode::BlackOnWhite).unwrap();
+        display
+            .flush(DrawMode::BlackOnWhite)
+            .expect("to flush to display");
         counter += 1;
         delay.delay_millis(1000);
         // clear rect
         if let Some(rect) = rect {
-            display.fill_solid(&rect, Gray4::WHITE).unwrap();
-            display.flush(DrawMode::WhiteOnBlack).unwrap();
+            display
+                .fill_solid(&rect, Gray4::WHITE)
+                .expect("to draw rectangle to framebuffer");
+            display
+                .flush(DrawMode::WhiteOnBlack)
+                .expect("to flush to display");
         }
     }
 }

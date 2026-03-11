@@ -1,20 +1,36 @@
 use esp_hal::{
-    dma::{self, DmaTxBuf},
+    dma::DmaTxBuf,
     dma_buffers,
-    gpio::{GpioPin, Level, Output, OutputPin},
+    gpio::{Level, Output, OutputConfig, OutputPin},
     lcd_cam::{
         lcd::{i8080, i8080::Command},
         LcdCam,
     },
-    peripheral::Peripheral,
     peripherals,
-    prelude::*,
+    rmt::PulseCode,
+    time::Rate,
     Blocking,
 };
 
 use crate::rmt;
 
-const DMA_BUFFER_SIZE: usize = 240;
+macro_rules! pulse {
+    ($high:expr, $low:expr) => {
+        if $high > 0 {
+            [
+                PulseCode::new(Level::High, $high, Level::Low, $low),
+                PulseCode::end_marker(),
+            ]
+        } else {
+            [
+                PulseCode::new(Level::High, $low, Level::Low, 0),
+                PulseCode::end_marker(),
+            ]
+        }
+    };
+}
+
+const DMA_BUFFER_SIZE: usize = 248;
 
 struct ConfigRegister {
     latch_enable: bool,
@@ -50,15 +66,11 @@ struct ConfigWriter<'a> {
 }
 
 impl<'a> ConfigWriter<'a> {
-    fn new(
-        data: impl Peripheral<P = impl OutputPin> + 'a,
-        clk: impl Peripheral<P = impl OutputPin> + 'a,
-        str: impl Peripheral<P = impl OutputPin> + 'a,
-    ) -> Self {
+    fn new(data: impl OutputPin + 'a, clk: impl OutputPin + 'a, str: impl OutputPin + 'a) -> Self {
         ConfigWriter {
-            pin_data: Output::new(data, Level::High),
-            pin_clk: Output::new(clk, Level::High),
-            pin_str: Output::new(str, Level::Low),
+            pin_data: Output::new(data, Level::High, OutputConfig::default()),
+            pin_clk: Output::new(clk, Level::High, OutputConfig::default()),
+            pin_str: Output::new(str, Level::Low, OutputConfig::default()),
             config: ConfigRegister::default(),
         }
     }
@@ -87,21 +99,21 @@ impl<'a> ConfigWriter<'a> {
     }
 }
 
-pub struct PinConfig {
-    pub data0: GpioPin<6>,
-    pub data1: GpioPin<7>,
-    pub data2: GpioPin<4>,
-    pub data3: GpioPin<5>,
-    pub data4: GpioPin<2>,
-    pub data5: GpioPin<3>,
-    pub data6: GpioPin<8>,
-    pub data7: GpioPin<1>,
-    pub cfg_data: GpioPin<13>,
-    pub cfg_clk: GpioPin<12>,
-    pub cfg_str: GpioPin<0>,
-    pub lcd_dc: GpioPin<40>,
-    pub lcd_wrx: GpioPin<41>,
-    pub rmt: GpioPin<38>,
+pub struct PinConfig<'a> {
+    pub data0: peripherals::GPIO8<'a>,
+    pub data1: peripherals::GPIO1<'a>,
+    pub data2: peripherals::GPIO2<'a>,
+    pub data3: peripherals::GPIO3<'a>,
+    pub data4: peripherals::GPIO4<'a>,
+    pub data5: peripherals::GPIO5<'a>,
+    pub data6: peripherals::GPIO6<'a>,
+    pub data7: peripherals::GPIO7<'a>,
+    pub cfg_data: peripherals::GPIO13<'a>,
+    pub cfg_clk: peripherals::GPIO12<'a>,
+    pub cfg_str: peripherals::GPIO0<'a>,
+    pub lcd_dc: peripherals::GPIO40<'a>,
+    pub lcd_wrx: peripherals::GPIO41<'a>,
+    pub rmt: peripherals::GPIO38<'a>,
 }
 
 pub(crate) struct ED047TC1<'a> {
@@ -113,21 +125,11 @@ pub(crate) struct ED047TC1<'a> {
 
 impl<'a> ED047TC1<'a> {
     pub(crate) fn new(
-        pins: PinConfig,
-        dma: impl Peripheral<P = peripherals::DMA> + 'a,
-        lcd_cam: impl Peripheral<P = peripherals::LCD_CAM> + 'a,
-        rmt: impl Peripheral<P = peripherals::RMT> + 'a,
+        pins: PinConfig<'a>,
+        dma: peripherals::DMA_CH0<'a>,
+        lcd_cam: peripherals::LCD_CAM<'a>,
+        rmt: peripherals::RMT<'a>,
     ) -> crate::Result<Self> {
-        // configure data pins
-        let tx_pins = i8080::TxEightBits::new(
-            pins.data0, pins.data1, pins.data2, pins.data3, pins.data4, pins.data5, pins.data6,
-            pins.data7,
-        );
-
-        // configure dma
-        let dma = dma::Dma::new(dma);
-        let channel = dma.channel0.configure(false, dma::DmaPriority::Priority0);
-
         // init lcd
         let lcd_cam = LcdCam::new(lcd_cam);
 
@@ -139,22 +141,26 @@ impl<'a> ED047TC1<'a> {
         let dma_buf =
             Some(DmaTxBuf::new(tx_descriptors, tx_buffer).map_err(crate::Error::DmaBuffer)?);
 
+        let config = i8080::Config::default()
+            .with_frequency(Rate::from_mhz(10))
+            .with_cd_idle_edge(false)
+            .with_cd_cmd_edge(true)
+            .with_cd_dummy_edge(false)
+            .with_cd_data_edge(false);
         let ctrl = ED047TC1 {
             i8080: Some(
-                i8080::I8080::new(
-                    lcd_cam.lcd,
-                    channel.tx,
-                    tx_pins,
-                    10.MHz(),
-                    i8080::Config {
-                        cd_idle_edge: false,  // dc_idle_level
-                        cd_cmd_edge: true,    // dc_cmd_level
-                        cd_dummy_edge: false, // dc_dummy_level
-                        cd_data_edge: false,  // dc_data_level
-                        ..Default::default()
-                    },
-                )
-                .with_ctrl_pins(pins.lcd_dc, pins.lcd_wrx),
+                i8080::I8080::new(lcd_cam.lcd, dma, config)
+                    .expect("to create i8080 device")
+                    .with_dc(pins.lcd_dc)
+                    .with_wrx(pins.lcd_wrx)
+                    .with_data0(pins.data6)
+                    .with_data1(pins.data7)
+                    .with_data2(pins.data4)
+                    .with_data3(pins.data5)
+                    .with_data4(pins.data2)
+                    .with_data5(pins.data3)
+                    .with_data6(pins.data0)
+                    .with_data7(pins.data1),
             ),
             cfg_writer,
             rmt: rmt::Rmt::new(rmt),
@@ -179,7 +185,6 @@ impl<'a> ED047TC1<'a> {
     }
 
     pub(crate) fn power_off(&mut self) {
-        self.cfg_writer.config.power_enable = false;
         self.cfg_writer.config.pos_power_enable = false;
         self.cfg_writer.write();
         busy_delay(10 * 240);
@@ -187,8 +192,7 @@ impl<'a> ED047TC1<'a> {
         self.cfg_writer.write();
         busy_delay(100 * 240);
         self.cfg_writer.config.power_disable = true;
-        self.cfg_writer.config.mode = false;
-        // self.cfg_writer.write();
+        self.cfg_writer.write();
         self.cfg_writer.config.stv = false;
         self.cfg_writer.write();
     }
@@ -197,23 +201,31 @@ impl<'a> ED047TC1<'a> {
         self.cfg_writer.config.mode = true;
         self.cfg_writer.write();
 
-        self.rmt.pulse(10, 10, true)?;
+        let data = pulse!(10, 10);
+        self.rmt.pulse(&data, true)?;
 
         self.cfg_writer.config.stv = false;
         self.cfg_writer.write();
 
-        self.rmt.pulse(10000, 1000, false)?;
+        busy_delay(240);
+        let data = pulse!(100, 100);
+        let rmt_tx = self.rmt.pulse(&data, false)?;
+
         self.cfg_writer.config.stv = true;
         self.cfg_writer.write();
-        // self.rmt.pulse(0, 100, true)?;
-        self.rmt.pulse(10, 10, true)?;
-        self.rmt.pulse(10, 10, true)?;
-        self.rmt.pulse(10, 10, true)?;
-        self.rmt.pulse(10, 10, true)?;
+
+        if let Some(rmt_tx) = rmt_tx {
+            self.rmt.reclaim_channel(rmt_tx)?;
+        }
+
+        let data = pulse!(0, 100);
+        self.rmt.pulse(&data, true)?;
 
         self.cfg_writer.config.output_enable = true;
         self.cfg_writer.write();
-        self.rmt.pulse(10, 10, true)?;
+
+        let data = pulse!(10, 10);
+        self.rmt.pulse(&data, true)?;
 
         Ok(())
     }
@@ -227,13 +239,16 @@ impl<'a> ED047TC1<'a> {
     }
 
     pub(crate) fn skip(&mut self) -> crate::Result<()> {
-        self.rmt.pulse(45, 5, false)?;
+        let data = pulse!(45, 5);
+        self.rmt.pulse(&data, false)?;
         Ok(())
     }
 
     pub(crate) fn output_row(&mut self, output_time: u16) -> crate::Result<()> {
         self.latch_row();
-        self.rmt.pulse(output_time, 50, false)?;
+
+        let data = pulse!(output_time, 50);
+        let rmt_tx = self.rmt.pulse(&data, false)?;
         let i8080 = self.i8080.take().ok_or(crate::Error::Unknown)?;
         let dma_buf = self.dma_buf.take().ok_or(crate::Error::Unknown)?;
         let tx = i8080
@@ -244,6 +259,9 @@ impl<'a> ED047TC1<'a> {
                 crate::Error::Dma(err)
             })?;
         let (r, i8080, dma_buf) = tx.wait();
+        if let Some(rmt_tx) = rmt_tx {
+            self.rmt.reclaim_channel(rmt_tx)?;
+        }
         r.map_err(crate::Error::Dma)?;
         self.i8080 = Some(i8080);
         self.dma_buf = Some(dma_buf);
@@ -254,10 +272,11 @@ impl<'a> ED047TC1<'a> {
     pub(crate) fn frame_end(&mut self) -> crate::Result<()> {
         self.cfg_writer.config.output_enable = false;
         self.cfg_writer.write();
-        self.cfg_writer.config.mode = true;
+        self.cfg_writer.config.mode = false;
         self.cfg_writer.write();
-        self.rmt.pulse(10, 10, true)?;
-        self.rmt.pulse(10, 10, true)?;
+        let data = pulse!(10, 10);
+        self.rmt.pulse(&data, true)?;
+        self.rmt.pulse(&data, true)?;
 
         Ok(())
     }

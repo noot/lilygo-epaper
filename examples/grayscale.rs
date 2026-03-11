@@ -12,30 +12,34 @@ use embedded_graphics_core::{
 };
 #[allow(unused_imports)]
 use esp_backtrace as _;
-use esp_hal::{delay::Delay, prelude::*};
+use esp_hal::{delay::Delay, main};
 use lilygo_epd47::{pin_config, Display, DrawMode};
 
-#[entry]
+esp_bootloader_esp_idf::esp_app_desc!();
+
+#[main]
 fn main() -> ! {
     esp_println::logger::init_logger_from_env();
 
-    let peripherals = esp_hal::init(esp_hal::Config::default());
+    let config = esp_hal::Config::default();
+    let config = config.with_cpu_clock(esp_hal::clock::CpuClock::_240MHz);
+    let peripherals = esp_hal::init(config);
 
     // Create PSRAM allocator
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
 
     let mut display = Display::new(
         pin_config!(peripherals),
-        peripherals.DMA,
+        peripherals.DMA_CH0,
         peripherals.LCD_CAM,
         peripherals.RMT,
     )
-    .expect("Failed to initialize display");
+    .expect("to initialize correctly");
 
     let delay = Delay::new();
     display.power_on();
     delay.delay_millis(10);
-    display.clear().unwrap();
+    display.clear().expect("to clear display");
 
     loop {
         let height = display.bounding_box().size.height / 16;
@@ -50,14 +54,16 @@ fn main() -> ! {
                     .build(),
             )
             .draw(&mut display)
-            .unwrap();
+            .expect("to draw in framebuffer");
         }
 
-        display.flush(DrawMode::BlackOnWhite).unwrap();
+        display
+            .flush(DrawMode::BlackOnWhite)
+            .expect("to flush to display");
 
         delay.delay_millis(5000);
 
-        display.clear().unwrap();
+        display.clear().expect("to clear display");
 
         let width = display.bounding_box().size.width / 16;
         for shade in 0x0..0x0F {
@@ -71,13 +77,15 @@ fn main() -> ! {
                     .build(),
             )
             .draw(&mut display)
-            .unwrap();
+            .expect("to draw in framebuffer");
         }
 
-        display.flush(DrawMode::BlackOnWhite).unwrap();
+        display
+            .flush(DrawMode::BlackOnWhite)
+            .expect("to flush to display");
 
         delay.delay_millis(5000);
 
-        display.clear().unwrap();
+        display.clear().expect("to clear display");
     }
 }

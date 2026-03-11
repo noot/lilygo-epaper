@@ -14,7 +14,8 @@ use embedded_graphics_core::{
 use esp_backtrace as _;
 use esp_hal::{
     delay::Delay,
-    prelude::*,
+    main,
+    ram,
     rtc_cntl::{
         reset_reason,
         sleep::{RtcSleepConfig, TimerWakeupSource},
@@ -22,17 +23,19 @@ use esp_hal::{
         Rtc,
         SocResetReason,
     },
-    Cpu,
+    system::Cpu,
 };
 use lilygo_epd47::{pin_config, Display, DrawMode};
 use u8g2_fonts::FontRenderer;
 
 static FONT: FontRenderer = FontRenderer::new::<u8g2_fonts::fonts::u8g2_font_spleen16x32_mr>();
 
-#[ram(rtc_fast)]
+esp_bootloader_esp_idf::esp_app_desc!();
+
+#[ram(unstable(rtc_fast))]
 static mut CYCLE: u16 = 0;
 
-#[ram(rtc_fast)]
+#[ram(unstable(rtc_fast))]
 static mut LAST_RECT: Rectangle = Rectangle {
     top_left: Point { x: 0, y: 0 },
     size: Size {
@@ -41,22 +44,24 @@ static mut LAST_RECT: Rectangle = Rectangle {
     },
 };
 
-#[entry]
+#[main]
 fn main() -> ! {
     esp_println::logger::init_logger_from_env();
 
-    let peripherals = esp_hal::init(esp_hal::Config::default());
+    let config = esp_hal::Config::default();
+    let config = config.with_cpu_clock(esp_hal::clock::CpuClock::_240MHz);
+    let peripherals = esp_hal::init(config);
 
     // Create PSRAM allocator
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
 
     let mut display = Display::new(
         pin_config!(peripherals),
-        peripherals.DMA,
+        peripherals.DMA_CH0,
         peripherals.LCD_CAM,
         peripherals.RMT,
     )
-    .expect("Failed to initialize display");
+    .expect("to initialize display");
 
     let delay = Delay::new();
     let mut rtc = Rtc::new(peripherals.LPWR);
@@ -72,8 +77,12 @@ fn main() -> ! {
     let last_rect = unsafe { LAST_RECT };
 
     if cycle > 0 && cycle % 5 != 0 {
-        display.fill_solid(&last_rect, Gray4::WHITE).unwrap();
-        display.flush(DrawMode::WhiteOnBlack).unwrap();
+        display
+            .fill_solid(&last_rect, Gray4::WHITE)
+            .expect("to draw rectangle to framebuffer");
+        display
+            .flush(DrawMode::WhiteOnBlack)
+            .expect("to flush to display");
     } else {
         display.clear().unwrap();
     }
@@ -102,8 +111,10 @@ fn main() -> ! {
             },
             &mut display,
         )
-        .unwrap();
-    display.flush(DrawMode::BlackOnWhite).unwrap();
+        .expect("to render font to framebuffer");
+    display
+        .flush(DrawMode::BlackOnWhite)
+        .expect("to flush to display");
     // turn screen off
     display.power_off();
     unsafe {

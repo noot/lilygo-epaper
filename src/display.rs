@@ -1,6 +1,7 @@
 use alloc::{boxed::Box, vec, vec::Vec};
 
-use esp_hal::{delay::Delay, peripheral::Peripheral, peripherals};
+use esp_hal::{delay::Delay, peripherals};
+use log::*;
 
 use crate::{ed047tc1, Error, Result};
 
@@ -66,10 +67,10 @@ impl<'a> Display<'a> {
         height: Self::HEIGHT,
     };
     pub fn new(
-        pins: ed047tc1::PinConfig,
-        dma: impl Peripheral<P = peripherals::DMA> + 'a,
-        lcd_cam: impl Peripheral<P = peripherals::LCD_CAM> + 'a,
-        rmt: impl Peripheral<P = peripherals::RMT> + 'a,
+        pins: ed047tc1::PinConfig<'a>,
+        dma: peripherals::DMA_CH0<'a>,
+        lcd_cam: peripherals::LCD_CAM<'a>,
+        rmt: peripherals::RMT<'a>,
     ) -> Result<Self> {
         Ok(Display {
             epd: ed047tc1::ED047TC1::new(pins, dma, lcd_cam, rmt)?,
@@ -81,11 +82,13 @@ impl<'a> Display<'a> {
 
     /// Turn the display on.
     pub fn power_on(&mut self) {
+        debug!("Display power on");
         self.epd.power_on()
     }
 
     /// Turn the display off.
     pub fn power_off(&mut self) {
+        debug!("Display power off");
         self.epd.power_off()
     }
 
@@ -117,6 +120,7 @@ impl<'a> Display<'a> {
 
     /// Fill the whole framebuffer with the same color.
     pub fn fill(&mut self, color: u8) -> Result<()> {
+        debug!("display fill");
         if color > 0x0F {
             return Err(Error::InvalidColor);
         }
@@ -129,6 +133,7 @@ impl<'a> Display<'a> {
     /// method clears the framebuffer. The provided mode should match the
     /// contents of your framebuffer.
     pub fn flush(&mut self, mode: DrawMode) -> Result<()> {
+        debug!("display flush");
         self.draw(mode)?;
         self.tainted_rows.fill(0);
         self.framebuffer.fill(0xFF);
@@ -137,12 +142,14 @@ impl<'a> Display<'a> {
 
     /// Clears the screen.
     pub fn clear(&mut self) -> Result<()> {
+        debug!("display clear");
         self.clear_area(Self::BOUNDING_BOX)
     }
 
     /// Performs the screen repair routine as described here
     /// https://github.com/Xinyuan-LilyGO/LilyGo-EPD47/blob/master/examples/screen_repair/screen_repair.ino
     pub fn repair(&mut self, delay: Delay) -> Result<()> {
+        debug!("display repair");
         self.clear()?;
         for _ in 0..20 {
             self.push_pixels(Self::BOUNDING_BOX, 50, 0)?;
@@ -186,7 +193,7 @@ impl<'a> Display<'a> {
         line_buffer_reorder(&mut row);
         self.epd.frame_start()?;
 
-        for i in 0..Self::WIDTH {
+        for i in 0..Self::HEIGHT {
             // before are of interest: skip
             if i < area.y {
                 self.row_skip(time)?;

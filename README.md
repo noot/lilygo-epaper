@@ -63,7 +63,7 @@ fn main() -> ! {
         peripherals.LCD_CAM,
         peripherals.RMT,
     )
-        .expect("Failed to initialize display");
+        .expect("to initialize display");
     // Turn the display on
     display.power_on();
     delay.delay_millis(10);

@@ -44,7 +44,7 @@
 //!         peripherals.LCD_CAM,
 //!         peripherals.RMT,
 //!     )
-//!     .expect("Failed to initialize display");
+//!     .expect("to initialize display");
 //!     // Turn the display on
 //!     display.power_on();
 //!     delay.delay_millis(10);
@@ -107,14 +107,14 @@ macro_rules! pin_config {
         $(
             #[allow(unused_mut)]
             lilygo_epd47::PinConfig {
-                data0: $name.GPIO6,
-                data1: $name.GPIO7,
-                data2: $name.GPIO4,
-                data3: $name.GPIO5,
-                data4: $name.GPIO2,
-                data5: $name.GPIO3,
-                data6: $name.GPIO8,
-                data7: $name.GPIO1,
+                data0: $name.GPIO8,
+                data1: $name.GPIO1,
+                data2: $name.GPIO2,
+                data3: $name.GPIO3,
+                data4: $name.GPIO4,
+                data5: $name.GPIO5,
+                data6: $name.GPIO6,
+                data7: $name.GPIO7,
                 cfg_data: $name.GPIO13,
                 cfg_clk: $name.GPIO12,
                 cfg_str: $name.GPIO0,

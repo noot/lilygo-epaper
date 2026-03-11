@@ -9,28 +9,32 @@ use core::format_args;
 use embedded_graphics::prelude::*;
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use esp_backtrace as _;
-use esp_hal::{delay::Delay, gpio::Io, prelude::*};
+use esp_hal::{delay::Delay, main};
 use lilygo_epd47::{pin_config, Battery, Display, DrawMode};
 use u8g2_fonts::FontRenderer;
 
 static FONT: FontRenderer = FontRenderer::new::<u8g2_fonts::fonts::u8g2_font_spleen32x64_mr>();
 
-#[entry]
+esp_bootloader_esp_idf::esp_app_desc!();
+
+#[main]
 fn main() -> ! {
     esp_println::logger::init_logger_from_env();
 
-    let peripherals = esp_hal::init(esp_hal::Config::default());
+    let config = esp_hal::Config::default();
+    let config = config.with_cpu_clock(esp_hal::clock::CpuClock::_240MHz);
+    let peripherals = esp_hal::init(config);
 
     // Create PSRAM allocator
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
 
     let mut display = Display::new(
         pin_config!(peripherals),
-        peripherals.DMA,
+        peripherals.DMA_CH0,
         peripherals.LCD_CAM,
         peripherals.RMT,
     )
-    .expect("Failed to initialize display");
+    .expect("to initialize display");
 
     let mut battery = Battery::new(peripherals.GPIO14, peripherals.ADC2);
 
@@ -40,7 +44,7 @@ fn main() -> ! {
     delay.delay_millis(10);
 
     loop {
-        display.clear().unwrap();
+        display.clear().expect("to clear screen");
         FONT.render_aligned(
             format_args!("Voltage: {}V", battery.read()),
             Point::new(
@@ -55,9 +59,11 @@ fn main() -> ! {
             },
             &mut display,
         )
-        .unwrap();
+        .expect("to render font in the framebuffer");
 
-        display.flush(DrawMode::BlackOnWhite).unwrap();
+        display
+            .flush(DrawMode::BlackOnWhite)
+            .expect("to flush to display");
         delay.delay_millis(5000);
     }
 }
