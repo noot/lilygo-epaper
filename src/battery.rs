@@ -29,9 +29,10 @@ where
         }
     }
 
-    /// Default voltage correction factor. This factor has been experimentally
-    /// determined. It might be device specific.
-    pub const DEFAULT_CORRECTION_FACTOR: f32 = 1.144632;
+    /// Default voltage correction factor.
+    /// esp-hal 1.0's AdcCalCurve already provides accurate calibration,
+    /// so no additional correction is needed.
+    pub const DEFAULT_CORRECTION_FACTOR: f32 = 1.0;
 
     /// Set a correction factor other than [`DEFAULT_CORRECTION_FACTOR`]
     pub fn set_correction_factor(&mut self, factor: f32) {
@@ -40,9 +41,7 @@ where
 
     /// Read the current voltage of the battery
     pub fn read(&mut self) -> f32 {
-        let v = self
-            .adc
-            .read_oneshot(&mut self.adc_pin)
+        let v = nb::block!(self.adc.read_oneshot(&mut self.adc_pin))
             .expect("to read oneshot from adc");
 
         (((v as f32) * 2.0) / 1000.0) * self.correction_factor

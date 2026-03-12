@@ -12,6 +12,7 @@ keywords = ["epd", "lilygo", "esp-hal", "ED047TC1", "embedded-graphics"]
 
 [dependencies]
 critical-section = "1.2.0"
+nb = "1"
 esp-hal = { version = "1.0.0", features = ["esp32s3","unstable","psram"] }
 embedded-graphics-core = { version = "0.4.0", optional = true }
 esp-alloc = "0.9.0"
