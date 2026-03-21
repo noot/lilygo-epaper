@@ -11,6 +11,20 @@ const CONTRAST_CYCLES_4BPP: &[u16; 15] = &[
 const CONTRAST_CYCLES_4BPP_WHITE: &[u16; 15] =
     &[10, 10, 8, 8, 8, 8, 8, 10, 10, 15, 15, 20, 20, 100, 300];
 
+/// Display rotation, only 90° increments supported
+#[derive(Clone, Copy, Default)]
+pub enum DisplayRotation {
+    /// No rotation
+    #[default]
+    Rotate0,
+    /// Rotate by 90 degrees clockwise
+    Rotate90,
+    /// Rotate by 180 degrees clockwise
+    Rotate180,
+    /// Rotate 270 degrees clockwise
+    Rotate270,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum DrawMode {
     BlackOnWhite,
@@ -52,6 +66,7 @@ pub struct Display<'a> {
     skipping: u16,
     framebuffer: Box<[u8; FRAMEBUFFER_SIZE]>,
     tainted_rows: [u8; TAINTED_ROWS_SIZE],
+    rotation: DisplayRotation,
 }
 
 impl<'a> Display<'a> {
@@ -77,7 +92,18 @@ impl<'a> Display<'a> {
             skipping: 0,
             framebuffer: Box::new([0xFF; FRAMEBUFFER_SIZE]),
             tainted_rows: [0; TAINTED_ROWS_SIZE],
+            rotation: DisplayRotation::default(),
         })
+    }
+
+    /// Set the rotation
+    pub fn set_rotation(&mut self, rotation: DisplayRotation) {
+        self.rotation = rotation;
+    }
+
+    /// Get rotation
+    pub fn rotation(&self) -> DisplayRotation {
+        self.rotation
     }
 
     /// Turn the display on.
