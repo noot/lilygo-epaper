@@ -1,4 +1,5 @@
 use alloc::{boxed::Box, vec, vec::Vec};
+use core::time::Duration;
 
 use esp_hal::{delay::Delay, peripherals};
 use log::*;
@@ -139,6 +140,31 @@ impl<'a> Display<'a> {
     pub fn power_off(&mut self) -> Result<()> {
         debug!("Display power off");
         self.epd.power_off()
+    }
+
+    /// Request full PMIC shutdown.
+    ///
+    /// On the Paper Pro Lite this uses the BQ25896 BATFET-off path from the
+    /// official firmware. It is intended for battery-powered operation; with
+    /// USB connected the board may remain powered.
+    pub fn shutdown(mut self) -> Result<()> {
+        if let Err(err) = self.power_off() {
+            warn!("display power off before shutdown failed: {:?}", err);
+        }
+        self.epd.shutdown()
+    }
+
+    /// Power the display down and enter deep sleep.
+    ///
+    /// The boot button (`GPIO0`) is always enabled as a wake source. If
+    /// `timer` is provided, it is enabled as an additional wake source.
+    pub fn deep_sleep(mut self, lpwr: peripherals::LPWR<'a>, timer: Option<Duration>) -> ! {
+        if let Err(err) = self.power_off() {
+            warn!("display power off before sleep failed: {:?}", err);
+        }
+
+        let boot_button = self.epd.into_boot_button();
+        crate::power::deep_sleep(lpwr, boot_button, timer)
     }
 
     /// Read the battery voltage in volts from the on-board BQ27220 fuel gauge.

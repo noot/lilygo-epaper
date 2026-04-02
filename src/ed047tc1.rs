@@ -1,7 +1,7 @@
 use esp_hal::{
     dma::DmaTxBuf,
     dma_buffers,
-    gpio::{Flex, Input, InputConfig, Level, Output, OutputConfig, Pull, RtcPin},
+    gpio::{AnyPin, Flex, Input, InputConfig, Level, Output, OutputConfig, Pin, Pull, RtcPin},
     i2c::master::{Config as I2cConfig, I2c},
     lcd_cam::{
         lcd::{i8080, i8080::Command},
@@ -50,6 +50,9 @@ const TPS_REG_PG: u8 = 0x0F;
 const BQ27220_ADDR: u8 = 0x55;
 const BQ27220_REG_VOLTAGE: u8 = 0x08;
 const BQ27220_REG_STATE_OF_CHARGE: u8 = 0x2C;
+const BQ25896_ADDR: u8 = 0x6B;
+const BQ25896_REG_MISC_OPERATION: u8 = 0x09;
+const BQ25896_BATFET_DIS: u8 = 1 << 5;
 const GT911_ADDR_LOW: u8 = 0x5D;
 const GT911_ADDR_HIGH: u8 = 0x14;
 const GT911_PRODUCT_ID: u16 = 0x8140;
@@ -241,6 +244,12 @@ impl<'a> ConfigWriter<'a> {
 
     fn battery_state_of_charge(&mut self) -> crate::Result<u16> {
         self.read_register_u16(BQ27220_ADDR, BQ27220_REG_STATE_OF_CHARGE)
+    }
+
+    fn shutdown(&mut self) -> crate::Result<()> {
+        let mut value = self.read_register(BQ25896_ADDR, BQ25896_REG_MISC_OPERATION)?;
+        value |= BQ25896_BATFET_DIS;
+        self.write_register(BQ25896_ADDR, &[BQ25896_REG_MISC_OPERATION, value])
     }
 
     fn auxiliary_button_pressed(&mut self) -> crate::Result<bool> {
@@ -463,7 +472,7 @@ pub(crate) struct ED047TC1<'a> {
     cfg_writer: ConfigWriter<'a>,
     rmt: rmt::Rmt<'a>,
     dma_buf: Option<DmaTxBuf>,
-    boot_btn: Input<'a>,
+    boot_btn: AnyPin<'a>,
 }
 
 impl<'a> ED047TC1<'a> {
@@ -516,7 +525,7 @@ impl<'a> ED047TC1<'a> {
             cfg_writer,
             rmt: rmt::Rmt::new(rmt, pins.rmt),
             dma_buf,
-            boot_btn: Input::new(pins.boot_btn, InputConfig::default().with_pull(Pull::Up)),
+            boot_btn: pins.boot_btn.degrade(),
         };
         Ok(ctrl)
     }
@@ -567,11 +576,20 @@ impl<'a> ED047TC1<'a> {
         self.cfg_writer.battery_state_of_charge()
     }
 
+    pub(crate) fn shutdown(&mut self) -> crate::Result<()> {
+        self.cfg_writer.shutdown()
+    }
+
     pub(crate) fn input_state(&mut self) -> crate::Result<InputState> {
         let mut input = self.cfg_writer.input_state()?;
         input.buttons.auxiliary = self.cfg_writer.auxiliary_button_pressed()?;
-        input.buttons.boot = self.boot_btn.is_low();
+        let boot_btn = Input::new(self.boot_btn.reborrow(), InputConfig::default().with_pull(Pull::Up));
+        input.buttons.boot = boot_btn.is_low();
         Ok(input)
+    }
+
+    pub(crate) fn into_boot_button(self) -> AnyPin<'a> {
+        self.boot_btn
     }
 
     pub(crate) fn touch_resolution(&self) -> (u16, u16) {

@@ -16,16 +16,8 @@ use esp_hal::{
     delay::Delay,
     main,
     ram,
-    rtc_cntl::{
-        reset_reason,
-        sleep::{RtcSleepConfig, TimerWakeupSource},
-        wakeup_cause,
-        Rtc,
-        SocResetReason,
-    },
-    system::Cpu,
 };
-use lilygo_epd47::{pin_config, Display, DrawMode};
+use lilygo_epd47::{pin_config, power, Display, DrawMode};
 use u8g2_fonts::FontRenderer;
 
 static FONT: FontRenderer = FontRenderer::new::<u8g2_fonts::fonts::u8g2_font_spleen16x32_mr>();
@@ -65,10 +57,7 @@ fn main() -> ! {
     .expect("to initialize display");
 
     let delay = Delay::new();
-    let mut rtc = Rtc::new(peripherals.LPWR);
-
-    let reason = reset_reason(Cpu::ProCpu).unwrap_or(SocResetReason::ChipPowerOn);
-    let wake_reason = wakeup_cause();
+    let wake = power::wake_status();
 
     // turn screen on
     display.power_on().expect("to power on display");
@@ -92,8 +81,8 @@ fn main() -> ! {
         .render_aligned(
             format_args!(
                 "Reset Reason: {:?}\nWake reason: {:?}\nCycle: {}\nRect: ({}, {}, {}, {})",
-                reason,
-                wake_reason,
+                wake.reset_reason,
+                wake.wakeup_cause,
                 cycle,
                 last_rect.top_left.x,
                 last_rect.top_left.y,
@@ -127,12 +116,5 @@ fn main() -> ! {
 
     delay.delay_millis(100);
 
-    let mut rtc_cfg = RtcSleepConfig::deep();
-    rtc_cfg.set_rtc_fastmem_pd_en(false);
-    rtc_cfg.set_rtc_slowmem_pd_en(false);
-
-    let timer = TimerWakeupSource::new(Duration::from_secs(30));
-    rtc.sleep(&rtc_cfg, &[&timer]);
-
-    loop {}
+    display.deep_sleep(peripherals.LPWR, Some(Duration::from_secs(30)));
 }

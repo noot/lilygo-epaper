@@ -37,6 +37,18 @@ Use `flush_partial_fast()` only when all of these are true:
 
 It is not a general grayscale partial-refresh API.
 
+## Power And Sleep
+
+The crate also exposes the board's boot/wakeup path:
+
+- `lilygo_epd47::power::wake_status()` reports the current reset reason and wakeup source
+- `display.deep_sleep(lpwr, timer)` powers the panel down and enters deep sleep
+- `display.shutdown()` requests full PMIC shutdown through the BQ25896 charger
+
+`Display::deep_sleep()` always enables the `boot` button (`GPIO0`) as a wake source, matching the official firmware. You can also provide an optional timer wake.
+
+`Display::shutdown()` is different: it asks the BQ25896 to cut the battery power path. Per the official firmware and the vendor shutdown example, this only works when the board is running from battery alone. After shutdown, the board should come back only via the PMIC/QON (`pwr`) button or by plugging in USB.
+
 ## Usage
 
 1. Prepare your development requirement according to
@@ -108,6 +120,16 @@ let area = Rectangle {
 };
 
 display.flush_partial_fast(area).unwrap();
+```
+
+For deep sleep:
+
+```rust
+use core::time::Duration;
+use lilygo_epd47::power;
+
+let wake = power::wake_status();
+display.deep_sleep(peripherals.LPWR, Some(Duration::from_secs(30)));
 ```
 
 ## Examples
