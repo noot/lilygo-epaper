@@ -90,6 +90,8 @@
 extern crate alloc;
 
 pub mod display;
+pub mod input;
+pub mod touchscreen;
 
 #[cfg(feature = "embedded-graphics")]
 pub mod graphics;
@@ -125,6 +127,8 @@ pub enum Error {
     MissingRmtPin,
     /// RMT channel was unexpectedly unavailable.
     MissingRmtChannel,
+    /// Touch controller initialization failed.
+    TouchInitFailed,
 }
 
 type Result<T> = core::result::Result<T, Error>;
@@ -133,6 +137,8 @@ pub use crate::{
     battery::Battery,
     display::{Display, DrawMode},
     ed047tc1::PinConfig,
+    input::{Buttons, InputState},
+    touchscreen::{TouchPoint, TouchState},
 };
 
 /// Convenience macro to build the pin config struct.
@@ -155,6 +161,9 @@ macro_rules! pin_config {
             lcd_wrx: $name.GPIO4,
             rmt: $name.GPIO48,
             stv: $name.GPIO45,
+            touch_int: $name.GPIO3,
+            touch_rst: $name.GPIO9,
+            boot_btn: $name.GPIO0,
         }
     }};
 }

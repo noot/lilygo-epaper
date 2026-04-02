@@ -3,7 +3,7 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use esp_hal::{delay::Delay, peripherals};
 use log::*;
 
-use crate::{ed047tc1, Error, Result};
+use crate::{ed047tc1, input::InputState, touchscreen::TouchState, Error, Result};
 
 const CONTRAST_CYCLES_4BPP: &[u16; 15] = &[
     30, 30, 20, 20, 30, 30, 30, 40, 40, 50, 50, 50, 100, 200, 300,
@@ -151,13 +151,43 @@ impl<'a> Display<'a> {
         self.epd.battery_state_of_charge()
     }
 
+    /// Return the touchscreen resolution reported by the GT911 controller.
+    pub fn touch_resolution(&self) -> (u16, u16) {
+        self.epd.touch_resolution()
+    }
+
+    /// Read the current input state from the GT911 controller.
+    pub fn input(&mut self) -> Result<InputState> {
+        self.epd.input_state()
+    }
+
+    /// Read the current touch state if the touchscreen is pressed.
+    pub fn touch(&mut self) -> Result<Option<TouchState>> {
+        Ok(self.input()?.touch)
+    }
+
+    /// Return whether the circular home button is currently being reported.
+    pub fn home_button(&mut self) -> Result<bool> {
+        Ok(self.input()?.buttons.home)
+    }
+
+    /// Return whether the board auxiliary button is currently pressed.
+    pub fn auxiliary_button(&mut self) -> Result<bool> {
+        Ok(self.input()?.buttons.auxiliary)
+    }
+
+    /// Return whether the boot button is currently pressed.
+    pub fn boot_button(&mut self) -> Result<bool> {
+        Ok(self.input()?.buttons.boot)
+    }
+
     /// Sets a single pixel in the framebuffer without updating the display.
     ///
     /// If the provided coordinates are outside the screen, this method returns
     /// [Error::OutOfBounds]. If the provided color is greater than 0x0F,
     /// this method returns [Error::InvalidColor].
     pub fn set_pixel(&mut self, x: u16, y: u16, color: u8) -> Result<()> {
-        if x > Self::WIDTH || y > Self::HEIGHT {
+        if x >= Self::WIDTH || y >= Self::HEIGHT {
             return Err(Error::OutOfBounds);
         }
         if color > 0x0F {
