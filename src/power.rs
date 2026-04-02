@@ -10,6 +10,8 @@ use esp_hal::{
     system::{reset_reason, wakeup_cause, SleepSource},
 };
 
+use crate::{Display, Result};
+
 /// Reset and wake information for the current boot.
 #[derive(Clone, Copy, Debug)]
 pub struct WakeStatus {
@@ -59,4 +61,13 @@ pub fn deep_sleep(lpwr: LPWR<'_>, mut boot_button: AnyPin<'_>, timer: Option<Dur
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// Request full PMIC shutdown.
+///
+/// On the Paper Pro Lite this uses the BQ25896 BATFET-off path from the
+/// official firmware. It is intended for battery-powered operation; with USB
+/// connected the board may remain powered.
+pub fn shutdown(display: Display<'_>) -> Result<()> {
+    display.shutdown_inner()
 }

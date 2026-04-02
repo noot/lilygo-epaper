@@ -8,8 +8,9 @@
 //! `Display::flush()` is the general-purpose update path.
 //! `Display::flush_partial_fast()` is available for low-flicker monochrome
 //! updates on small rectangular UI regions.
-//! `power::wake_status()`, `Display::deep_sleep()`, and `Display::shutdown()`
+//! `power::wake_status()`, `Display::deep_sleep()`, and `power::shutdown()`
 //! expose the board's reset/wakeup and power-management paths.
+//! `rtc::Clock` exposes the RTC-backed clock functions.
 //!
 //!
 //! Built using [`esp-hal`] and [`embedded-graphics`]
@@ -94,6 +95,7 @@ extern crate alloc;
 pub mod display;
 pub mod input;
 pub mod power;
+pub mod rtc;
 pub mod touchscreen;
 
 #[cfg(feature = "embedded-graphics")]
@@ -142,6 +144,7 @@ pub use crate::{
     ed047tc1::PinConfig,
     input::{Buttons, InputState},
     power::WakeStatus,
+    rtc::Clock,
     touchscreen::{TouchPoint, TouchState},
 };
 

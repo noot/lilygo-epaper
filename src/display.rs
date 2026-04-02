@@ -142,12 +142,7 @@ impl<'a> Display<'a> {
         self.epd.power_off()
     }
 
-    /// Request full PMIC shutdown.
-    ///
-    /// On the Paper Pro Lite this uses the BQ25896 BATFET-off path from the
-    /// official firmware. It is intended for battery-powered operation; with
-    /// USB connected the board may remain powered.
-    pub fn shutdown(mut self) -> Result<()> {
+    pub(crate) fn shutdown_inner(mut self) -> Result<()> {
         if let Err(err) = self.power_off() {
             warn!("display power off before shutdown failed: {:?}", err);
         }

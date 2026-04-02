@@ -43,11 +43,20 @@ The crate also exposes the board's boot/wakeup path:
 
 - `lilygo_epd47::power::wake_status()` reports the current reset reason and wakeup source
 - `display.deep_sleep(lpwr, timer)` powers the panel down and enters deep sleep
-- `display.shutdown()` requests full PMIC shutdown through the BQ25896 charger
+- `power::shutdown(display)` requests full PMIC shutdown through the BQ25896 charger
 
 `Display::deep_sleep()` always enables the `boot` button (`GPIO0`) as a wake source, matching the official firmware. You can also provide an optional timer wake.
 
-`Display::shutdown()` is different: it asks the BQ25896 to cut the battery power path. Per the official firmware and the vendor shutdown example, this only works when the board is running from battery alone. After shutdown, the board should come back only via the PMIC/QON (`pwr`) button or by plugging in USB.
+`power::shutdown(display)` is different: it asks the BQ25896 to cut the battery power path. Per the official firmware and the vendor shutdown example, this only works when the board is running from battery alone. After shutdown, the board should come back only via the PMIC/QON (`pwr`) button or by plugging in USB.
+
+## RTC Clock
+
+The crate exposes a small RTC wrapper as `lilygo_epd47::rtc::Clock` for the RTC-backed timekeeping functions:
+
+- `Clock::now_us()` / `Clock::now()`
+- `Clock::set_now_us(...)` / `Clock::set_now(...)`
+- `Clock::uptime()`
+- `Clock::estimate_xtal_frequency_mhz()`
 
 ## Usage
 
@@ -143,6 +152,7 @@ Run examples like this ` cargo run --release --example <name>`.
 - `hello-world` - [`embedded-graphics`] demo. The bmp images used have been converted using
   imagemagick
   `convert <source>.png -size 200x200 -background white -flatten -alpha off -type Grayscale -depth 4 <output>.bmp`
+- `rtc-clock` - RTC clock example showing current RTC time, uptime, wake reason, then deep sleeping and waking again
 - `screen-repair` - Showcases how to use the repair
   methodology [provided by lilygo](https://github.com/Xinyuan-LilyGO/LilyGo-EPD47/blob/master/examples/screen_repair/screen_repair.ino).
 - `simple` - Boilerplate, same as the example above.
