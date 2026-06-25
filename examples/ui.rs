@@ -4,6 +4,7 @@
 extern crate alloc;
 extern crate lilygo_t5s3paperpro;
 
+use alloc::vec::Vec;
 use core::fmt::Write as _;
 
 use embedded_graphics::{
@@ -18,7 +19,7 @@ use embedded_graphics::{
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use esp_backtrace as _;
-use esp_hal::{delay::Delay, main};
+use esp_hal::{delay::Delay, main, rng::Rng};
 use lilygo_t5s3paperpro::{
     display::DisplayRotation,
     pin_config,
@@ -61,8 +62,10 @@ const SLEEP_BTN_Y: i32 = 420;
 const SLEEP_BTN_W: u32 = 220;
 const SLEEP_BTN_H: u32 = 90;
 
-// 540x960 grayscale BMP on the SD card root, shown as the sleep screensaver
-const WALLPAPER_PATH: &str = "/WALL1.BMP";
+// folder of 540x960 grayscale .bmp wallpapers on the SD card; one is picked at
+// random as the sleep screensaver. this must be a FAT 8.3 name (<=8 chars), as
+// must the .bmp files inside it, so they can be opened by name.
+const WALLPAPER_DIR: &str = "/WALLS";
 
 // loop ticks between GPS readout refreshes (~50ms per tick)
 #[cfg(feature = "gps")]
@@ -732,13 +735,42 @@ fn show_wallpaper<'d>(
     let Ok(sdcard) = SdCard::new(pins, spi) else {
         return false;
     };
-    let Ok(bytes) = sdcard.read_file(WALLPAPER_PATH) else {
+    let Ok(entries) = sdcard.list_dir(WALLPAPER_DIR) else {
         return false;
     };
-    let Ok(bmp) = Bmp::<Gray4>::from_slice(&bytes) else {
+
+    let mut paths = Vec::new();
+    for entry in entries {
+        if !entry.is_directory && is_bmp(&entry.name) {
+            paths.push(entry.path);
+        }
+    }
+    if paths.is_empty() {
         return false;
-    };
-    Image::new(&bmp, Point::zero()).draw(display).is_ok()
+    }
+
+    // pick one at random, then fall through the rest so an unreadable file
+    // (e.g. a long filename the FAT layer can't open by its 8.3 name) is
+    // skipped rather than aborting.
+    let start = Rng::new().random() as usize % paths.len();
+    for offset in 0..paths.len() {
+        let path = &paths[(start + offset) % paths.len()];
+        let Ok(bytes) = sdcard.read_file(path) else {
+            continue;
+        };
+        let Ok(bmp) = Bmp::<Gray4>::from_slice(&bytes) else {
+            continue;
+        };
+        if Image::new(&bmp, Point::zero()).draw(display).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_bmp(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("bmp"))
 }
 
 // ── main ────────────────────────────────────────────────────────────
@@ -978,7 +1010,8 @@ fn main() -> ! {
         LAST_SCREEN = current_screen.to_index();
     }
     display.clear().ok();
-    // show the SD-card wallpaper if present, otherwise the drawn screensaver.
+    // pick a random wallpaper from the SD card; fall back to the drawn
+    // screensaver if the folder is missing or has no usable .bmp files.
     if !show_wallpaper(
         &mut display,
         peripherals.SPI2,
