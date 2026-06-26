@@ -19,7 +19,12 @@ use embedded_graphics::{
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use esp_backtrace as _;
-use esp_hal::{delay::Delay, main, rng::Rng};
+use esp_hal::{
+    delay::Delay,
+    gpio::{Level, Output, OutputConfig},
+    main,
+    rng::Rng,
+};
 use lilygo_t5s3paperpro::{
     display::DisplayRotation,
     pin_config,
@@ -731,21 +736,44 @@ fn show_wallpaper<'d>(
     display: &mut Display,
     spi: esp_hal::peripherals::SPI2<'d>,
     pins: lilygo_t5s3paperpro::sdcard::PinConfig<'d>,
+    lora_cs: esp_hal::peripherals::GPIO46<'d>,
 ) -> bool {
-    let Ok(sdcard) = SdCard::new(pins, spi) else {
-        return false;
+    // the SD card shares the SPI bus (sclk/mosi/miso) with the LoRa SX1262
+    // radio. drive the radio's chip-select high so it releases MISO; otherwise
+    // it corrupts SD init and the card comes back as CardNotFound. held for the
+    // duration of the SD access below.
+    let _lora_cs = Output::new(lora_cs, Level::High, OutputConfig::default());
+
+    let sdcard = match SdCard::new(pins, spi) {
+        Ok(sdcard) => sdcard,
+        Err(e) => {
+            esp_println::println!("wallpaper: sd init failed: {e:?}");
+            return false;
+        }
     };
-    let Ok(entries) = sdcard.list_dir(WALLPAPER_DIR) else {
-        return false;
+    let entries = match sdcard.list_dir(WALLPAPER_DIR) {
+        Ok(entries) => entries,
+        Err(e) => {
+            esp_println::println!("wallpaper: list_dir {WALLPAPER_DIR} failed: {e:?}");
+            return false;
+        }
     };
+    esp_println::println!("wallpaper: {} entries in {}", entries.len(), WALLPAPER_DIR);
 
     let mut paths = Vec::new();
     for entry in entries {
+        esp_println::println!(
+            "wallpaper: entry name={} dir={} size={}",
+            entry.name,
+            entry.is_directory,
+            entry.size
+        );
         if !entry.is_directory && is_bmp(&entry.name) {
             paths.push(entry.path);
         }
     }
     if paths.is_empty() {
+        esp_println::println!("wallpaper: no usable .bmp files");
         return false;
     }
 
@@ -755,13 +783,19 @@ fn show_wallpaper<'d>(
     let start = Rng::new().random() as usize % paths.len();
     for offset in 0..paths.len() {
         let path = &paths[(start + offset) % paths.len()];
-        let Ok(bytes) = sdcard.read_file(path) else {
-            continue;
+        let bytes = match sdcard.read_file(path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                esp_println::println!("wallpaper: read {path} failed: {e:?}");
+                continue;
+            }
         };
         let Ok(bmp) = Bmp::<Gray4>::from_slice(&bytes) else {
+            esp_println::println!("wallpaper: parse {path} failed");
             continue;
         };
         if Image::new(&bmp, Point::zero()).draw(display).is_ok() {
+            esp_println::println!("wallpaper: drew {path} ({} bytes)", bytes.len());
             return true;
         }
     }
@@ -1016,6 +1050,7 @@ fn main() -> ! {
         &mut display,
         peripherals.SPI2,
         sdcard_pin_config!(peripherals),
+        peripherals.GPIO46,
     ) {
         let pct = display.battery_percentage().unwrap_or(0);
         draw_screensaver(&mut display, pct);

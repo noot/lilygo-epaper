@@ -126,7 +126,20 @@ impl<'d> SdCard<'d> {
         let sd_device = ExclusiveDevice::new(sd_bus, sd_cs, Delay::new())
             .map_err(|_| Error::InvalidPath("failed to create SPI device"))?;
         let sd_card = embedded_sdmmc::SdCard::new(sd_device, Delay::new());
+        // card acquisition must run at <=400 kHz (SD spec). num_bytes() forces
+        // that acquisition, after which the clock can be raised so data transfer
+        // isn't glacial — a 1.5 MB read at 400 kHz takes ~30s versus well under
+        // a second at 20 MHz.
         let card_size_bytes = sd_card.num_bytes().map_err(Error::Card)?;
+        sd_card
+            .spi(|device| {
+                device.bus_mut().apply_config(
+                    &SpiConfig::default()
+                        .with_frequency(Rate::from_mhz(20))
+                        .with_mode(SpiMode::_0),
+                )
+            })
+            .map_err(Error::SpiConfig)?;
         let volume_mgr = VolumeManager::new(sd_card, time_source);
 
         Ok(Self {

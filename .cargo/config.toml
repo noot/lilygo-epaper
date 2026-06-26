@@ -3,7 +3,9 @@ runner = "espflash flash --monitor --chip esp32s3"
 
 
 [env]
-ESP_LOG = "DEBUG"
+# keep app logs at debug, but silence embedded-sdmmc's per-block read spam that
+# otherwise floods the serial port (and slows transfers) during SD card reads
+ESP_LOG = "debug,embedded_sdmmc=warn"
 ESP_HAL_CONFIG_PSRAM_MODE = "octal"
 
 [build]

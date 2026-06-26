@@ -328,15 +328,19 @@ impl<'a> ConfigWriter<'a> {
 
         let x_res = self.touch_read_u16(GT911_X_RESOLUTION)?;
         let y_res = self.touch_read_u16(GT911_Y_RESOLUTION)?;
-        self.touch_resolution = if x_res == 0 && y_res == 0 {
-            debug!("touch init: resolution registers are zero, using default 540x960");
-            (
-                crate::display::Display::HEIGHT,
-                crate::display::Display::WIDTH,
-            )
-        } else {
-            (x_res, y_res)
-        };
+        // the GT911 reports an inconsistent resolution depending on whether it
+        // has been configured before: zero on a cold boot, non-zero after a
+        // deep-sleep wake (its config survives). that flips the coordinate
+        // mapping below. the panel is a fixed 540x960, so pin it to keep touch
+        // stable across boots.
+        debug!(
+            "touch init: reported resolution {}x{}, pinning to 540x960",
+            x_res, y_res
+        );
+        self.touch_resolution = (
+            crate::display::Display::HEIGHT,
+            crate::display::Display::WIDTH,
+        );
         self.touch_set_interrupt_mode_low_level_query()?;
         debug!(
             "touch init: resolution={}x{}",
