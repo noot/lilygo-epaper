@@ -12,6 +12,10 @@ pub const LORA_NSS: u8 = 7;
 pub const LORA_RST: u8 = 8;
 pub const LORA_BUSY: u8 = 34;
 pub const LORA_DIO1: u8 = 33;
+// radio power-enable: the factory firmware drives this high in initBoard() to
+// power the radio's oscillator/analog rail. without it the xosc never starts
+// (GetDeviceErrors reports XOSC_START_ERR) and every tx/rx times out.
+pub const LORA_POW: u8 = 35;
 
 // e-paper display (separate spi bus) — reserved for future use
 pub const EINK_MOSI: u8 = 11;
@@ -28,7 +32,3 @@ pub const BATTERY_ADC: u8 = 1;
 
 /// Default LoRa centre frequency for this board (US/AU 915 MHz).
 pub const DEFAULT_FREQUENCY_HZ: u32 = 915_000_000;
-
-/// TCXO supply voltage fed from the radio's DIO3 pin on this board.
-pub const TCXO_VOLTAGE: crate::sx1262::params::TcxoVoltage =
-    crate::sx1262::params::TcxoVoltage::V1_8;

@@ -6,13 +6,18 @@ edition = "2024"
 # the library is pure embedded-hal, so it stays platform-agnostic and testable.
 [dependencies]
 embedded-hal = "1.0"
+embedded-graphics-core = "0.4"
 
 # the esp32-s3 platform glue is only needed to build and run the examples.
 [dev-dependencies]
+# esp-hal 1.0.0 has a full-duplex-after-half-duplex SPI bug (esp-rs/esp-hal#3122)
+# that breaks SX1262 register reads; fixed by #3176 in 1.1.x — require >= 1.1.
 esp-hal = { version = "1.1", features = ["esp32s3", "unstable"] }
+esp-bootloader-esp-idf = { version = "0.5", features = ["esp32s3"] }
 esp-backtrace = { version = "0.19", features = ["esp32s3", "panic-handler", "println"] }
 esp-println = { version = "0.17", features = ["esp32s3"] }
 embedded-hal-bus = "0.3"
+embedded-graphics = "0.8"
 
 # esp-hal strongly recommends building dependencies with optimizations even in dev.
 [profile.dev.package.esp-hal]

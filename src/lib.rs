@@ -7,4 +7,5 @@
 #![no_std]
 
 pub mod board;
+pub mod ssd1680;
 pub mod sx1262;
