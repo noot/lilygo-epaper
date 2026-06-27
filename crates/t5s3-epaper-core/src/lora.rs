@@ -182,8 +182,8 @@ pub struct PinConfig<'d> {
 ///
 /// Talks to the radio over the shared board SPI bus with a dedicated chip
 /// select. The GPS/LoRa 3.3 V power rail (PCA9555 IO0_0) is enabled by
-/// `Display::new()`, so the radio is powered as long as the display has been
-/// initialised.
+/// `Display::new()`, so the radio is powered for the rest of this power cycle,
+/// until `Display::deep_sleep()` cuts the rail.
 pub struct Lora<'d> {
     spi: Spi<'d, Blocking>,
     cs: Output<'d>,

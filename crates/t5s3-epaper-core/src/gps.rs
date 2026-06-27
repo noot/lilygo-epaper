@@ -38,8 +38,8 @@ pub struct PinConfig<'a> {
 ///
 /// Wraps a UART connection to either an L76K or MIA-M10Q GPS module and
 /// provides parsed NMEA data. The GPS/LoRa 3.3 V power rail (PCA9535 IO0_0)
-/// is enabled by `Display::new()`, so the module is powered as long as the
-/// display has been initialised.
+/// is enabled by `Display::new()`, so the module is powered for the rest of
+/// this power cycle, until `Display::deep_sleep()` cuts the rail.
 ///
 /// Call [`Gps::update()`] in your main loop to read new NMEA data from
 /// the UART and update the internal parser state.

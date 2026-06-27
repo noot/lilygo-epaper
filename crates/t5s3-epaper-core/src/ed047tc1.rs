@@ -74,6 +74,9 @@ const GT911_X_RESOLUTION: u16 = 0x8146;
 const GT911_Y_RESOLUTION: u16 = 0x8148;
 const GT911_DEV_ID: u32 = 911;
 const VCOM_MV: u16 = 1600;
+// port 0 bit 0 gates the GPS/LoRa 3.3 V rail (active high); matches the factory
+// firmware's `io_extend_lora_gps_power_on`.
+const PCA_BIT_LORA_GPS_PWR: u8 = 1 << 0;
 const PCA_BIT_OE: u8 = 1 << 0;
 const PCA_BIT_MODE: u8 = 1 << 1;
 const PCA_BIT_BUTTON: u8 = 1 << 2;
@@ -101,6 +104,7 @@ struct ConfigWriter<'a> {
     touch_initialized: bool,
     touch_addr: u8,
     touch_resolution: (u16, u16),
+    output_port0: u8,
     output_port1: u8,
     config: ConfigRegister,
 }
@@ -141,6 +145,7 @@ impl<'a> ConfigWriter<'a> {
             touch_initialized: false,
             touch_addr: GT911_ADDR_LOW,
             touch_resolution: (0, 0),
+            output_port0: 0xFF,
             output_port1: 0,
             config: ConfigRegister::default(),
         };
@@ -155,7 +160,10 @@ impl<'a> ConfigWriter<'a> {
         writer.write_register(PCA9555_ADDR, &[PCA9555_REG_INVERT_PORT0, 0x00])?;
         writer.write_register(PCA9555_ADDR, &[PCA9555_REG_INVERT_PORT1, 0x00])?;
         writer.write_register(PCA9555_ADDR, &[PCA9555_REG_CONFIG_PORT0, 0x00])?;
-        writer.write_register(PCA9555_ADDR, &[PCA9555_REG_OUTPUT_PORT0, 0xFF])?;
+        writer.write_register(
+            PCA9555_ADDR,
+            &[PCA9555_REG_OUTPUT_PORT0, writer.output_port0],
+        )?;
         writer.write()?;
 
         Ok(writer)
@@ -180,6 +188,15 @@ impl<'a> ConfigWriter<'a> {
         }
         self.output_port1 = value;
         self.write_register(PCA9555_ADDR, &[PCA9555_REG_OUTPUT_PORT1, value])
+    }
+
+    fn set_lora_gps_power(&mut self, on: bool) -> crate::Result<()> {
+        if on {
+            self.output_port0 |= PCA_BIT_LORA_GPS_PWR;
+        } else {
+            self.output_port0 &= !PCA_BIT_LORA_GPS_PWR;
+        }
+        self.write_register(PCA9555_ADDR, &[PCA9555_REG_OUTPUT_PORT0, self.output_port0])
     }
 
     fn set_stv(&mut self, level: bool) {
@@ -640,6 +657,10 @@ impl<'a> ED047TC1<'a> {
 
     pub(crate) fn shutdown(&mut self) -> crate::Result<()> {
         self.cfg_writer.shutdown()
+    }
+
+    pub(crate) fn lora_gps_power_off(&mut self) -> crate::Result<()> {
+        self.cfg_writer.set_lora_gps_power(false)
     }
 
     pub(crate) fn input_state(&mut self) -> crate::Result<InputState> {

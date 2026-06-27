@@ -158,6 +158,13 @@ impl<'a> Display<'a> {
             warn!("display power off before sleep failed: {:?}", err);
         }
 
+        // cut the GPS/LoRa 3.3 V rail; left on it draws tens of mA through deep
+        // sleep, since the IO expander retains its output state while the chip
+        // is asleep.
+        if let Err(err) = self.epd.lora_gps_power_off() {
+            warn!("lora/gps power off before sleep failed: {:?}", err);
+        }
+
         let boot_button = self.epd.into_boot_button();
         crate::power::deep_sleep(lpwr, boot_button, timer)
     }
