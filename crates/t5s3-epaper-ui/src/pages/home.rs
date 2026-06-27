@@ -32,7 +32,7 @@ pub(crate) struct Icon {
     pub(crate) screen: Screen,
 }
 
-pub(crate) const ICONS: [Icon; 5] = [
+pub(crate) const ICONS: [Icon; 6] = [
     Icon {
         label: "GPS",
         glyph: "GPS",
@@ -57,6 +57,11 @@ pub(crate) const ICONS: [Icon; 5] = [
         label: "Info",
         glyph: "(i)",
         screen: Screen::Info,
+    },
+    Icon {
+        label: "Files",
+        glyph: "SD",
+        screen: Screen::Files,
     },
 ];
 
