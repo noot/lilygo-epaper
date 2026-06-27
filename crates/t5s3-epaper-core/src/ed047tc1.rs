@@ -68,6 +68,8 @@ const GT911_MODULE_SWITCH_1: u16 = 0x804D;
 const GT911_CONFIG_CHKSUM: u16 = 0x80FF;
 const GT911_CONFIG_FRESH: u16 = 0x8100;
 const GT911_CONFIG_LENGTH: usize = 186;
+const GT911_COMMAND: u16 = 0x8040;
+const GT911_CMD_SLEEP: u8 = 0x05;
 const GT911_POINT_INFO: u16 = 0x814E;
 const GT911_POINT_1: u16 = 0x814F;
 const GT911_X_RESOLUTION: u16 = 0x8146;
@@ -197,6 +199,16 @@ impl<'a> ConfigWriter<'a> {
             self.output_port0 &= !PCA_BIT_LORA_GPS_PWR;
         }
         self.write_register(PCA9555_ADDR, &[PCA9555_REG_OUTPUT_PORT0, self.output_port0])
+    }
+
+    fn sleep_touch(&mut self) -> crate::Result<()> {
+        if !self.touch_initialized {
+            return Ok(());
+        }
+        // GT911 sits on the always-on 3.3 V rail and keeps scanning until told
+        // to sleep; 0x05 to the command register drops it to standby. A hardware
+        // reset (see `touch_reset_for_address`) wakes it on the next boot.
+        self.write_register16(self.touch_addr, GT911_COMMAND, &[GT911_CMD_SLEEP])
     }
 
     fn set_stv(&mut self, level: bool) {
@@ -661,6 +673,10 @@ impl<'a> ED047TC1<'a> {
 
     pub(crate) fn lora_gps_power_off(&mut self) -> crate::Result<()> {
         self.cfg_writer.set_lora_gps_power(false)
+    }
+
+    pub(crate) fn sleep_touch(&mut self) -> crate::Result<()> {
+        self.cfg_writer.sleep_touch()
     }
 
     pub(crate) fn input_state(&mut self) -> crate::Result<InputState> {

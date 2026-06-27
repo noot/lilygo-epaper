@@ -158,6 +158,13 @@ impl<'a> Display<'a> {
             warn!("display power off before sleep failed: {:?}", err);
         }
 
+        // put the GT911 touch controller to sleep; it lives on the always-on
+        // 3.3 V rail and keeps scanning otherwise. its internal sleep state
+        // survives the chip's deep sleep (a reset on the next boot wakes it).
+        if let Err(err) = self.epd.sleep_touch() {
+            warn!("touch sleep before deep sleep failed: {:?}", err);
+        }
+
         // cut the GPS/LoRa 3.3 V rail; left on it draws tens of mA through deep
         // sleep, since the IO expander retains its output state while the chip
         // is asleep.
