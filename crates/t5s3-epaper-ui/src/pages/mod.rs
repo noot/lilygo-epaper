@@ -1,3 +1,4 @@
+pub(crate) mod files;
 pub(crate) mod frontlight;
 #[cfg(feature = "gps")]
 pub(crate) mod gps;

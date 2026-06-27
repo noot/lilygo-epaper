@@ -25,8 +25,8 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 - [ ] **waveform LUT temperature compensation** — use TPS65185 temp sensor to select waveform table at draw time
 
 ## file handling and management
-- [ ] sd card file browser in UI
-- [ ] open bmp images in file browser
+- [x] sd card file browser in UI
+- [x] open bmp images in file browser
 - [ ] epub reader functionality
 - [ ] always-on lora receive functionality with unread notification icon
 
