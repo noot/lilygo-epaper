@@ -1,32 +1,30 @@
-# LilyGo T5 S3 ePaper Pro — Rust workspace
+# LilyGo T5 S3 ePaper Pro
 
-![Demo](_docs/hello-world.jpg)
+<p align="center">
+  <img src="_docs/photo-1.jpg" width="32%" />
+  <img src="_docs/photo-2.jpg" width="32%" />
+  <img src="_docs/photo-3.jpg" width="32%" />
+</p>
 
 Rust driver and UI firmware for the [LilyGo T5 E-Paper S3 Pro](https://lilygo.cc/products/t5-e-paper-s3-pro)
 device family (ESP32-S3, ED047TC1 4.7" panel).
 
-Diverged from the upstream fork at
+Forked from
 [azw413/lilygo-t5s3paperpro-rs](https://github.com/azw413/lilygo-t5s3paperpro-rs)
 (itself a fork of [fridolin-koch/lilygo-epd47-rs](https://github.com/fridolin-koch/lilygo-epd47-rs)).
+
 Hardware behavior was reverse-engineered from the vendor firmware at
-[Xinyuan-LilyGO/T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S3-4.7-e-paper-PRO),
-so treat this as practical rather than authoritative.
+[Xinyuan-LilyGO/T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S3-4.7-e-paper-PRO).
 
-> **Warning:** experimental, hardware-focused, and validated only on the T5 S3
-> Pro Lite. The driver depends on `alloc` and requires a PSRAM global allocator —
-> the framebuffer and LUT need ~325 kB.
-
-## Layout
-
-This is a Cargo workspace:
+## project layout
 
 | Path | What |
 | --- | --- |
-| `crates/t5s3-epaper-core` | The driver library (display, touch, RTC, SD, LoRa, GPS, power, frontlight) plus all hardware examples. |
-| `crates/t5s3-epaper-ui` | Binary firmware: the touchscreen UI (wifi clock, LoRa keyboard messenger, GPS, wallpapers). |
-| `tools/wallpaper` | Host-side tool to convert images into the BMP format the UI loads from SD. Built with the host toolchain (excluded from the embedded workspace). |
+| `crates/t5s3-epaper-core` | the driver library (display, touch, RTC, SD, LoRa, GPS, power, frontlight) plus all hardware examples. |
+| `crates/t5s3-epaper-ui` | binary firmware: the touchscreen UI (wifi clock, LoRa keyboard messenger, GPS, wallpapers). |
+| `tools/wallpaper` | tool to convert images into the BMP format the UI loads from SD. built with the host toolchain (excluded from the embedded workspace). |
 
-## Prerequisites
+## requirements
 
 - The Espressif Rust toolchain via [`espup`](https://github.com/esp-rs/espup)
   (this repo pins `channel = "esp"` in `rust-toolchain.toml`).
@@ -37,7 +35,7 @@ This is a Cargo workspace:
 The cargo runner flashes **and** opens the serial monitor, so `cargo run …`
 builds, flashes the connected board, and tails its output.
 
-## Running the examples
+## examples
 
 Examples live in the core crate. Plain examples need no extra features:
 
@@ -84,7 +82,7 @@ just check   # compile-check everything
 just lint    # fmt + clippy across the workspace
 ```
 
-## Flashing the UI
+## flashing the UI
 
 The UI bakes wifi credentials in at build time, so configure them first:
 
@@ -99,12 +97,11 @@ just ui
 # equivalent to:
 SSID=… PASSWORD=… TZ_OFFSET_HOURS=… \
   cargo run -p t5s3-epaper-ui --features gps
-```
+``
 
-GPS support is optional — drop `--features gps` to build the UI without it (the
-GPS page then shows a "compile with --features gps" hint). The UI loads
-wallpapers as BMP files from the SD card; use `tools/wallpaper` to prepare them.
+notes:
+- GPS support is optional — drop `--features gps` to build the UI without it (the
+GPS page then shows a "compile with --features gps" hint). 
+- The UI loads
+wallpapers as BMP files from the SD card from `WALLS/` in the root; use `tools/wallpaper` to prepare them.
 
-## License
-
-GPL-3.0. See [LICENSE](LICENSE).
