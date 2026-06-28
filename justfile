@@ -21,3 +21,8 @@ check:
 lint:
     cargo fmt
     cargo clippy --workspace --all-features
+
+# host unit tests for the standalone epub-reader crate (RUSTFLAGS cleared so the
+# root's -nostartfiles link arg doesn't leak into the host test binary)
+test-epub:
+    cd crates/epub-reader && RUSTFLAGS= cargo +stable test
