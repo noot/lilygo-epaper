@@ -16,7 +16,6 @@ extern crate alloc;
 
 use alloc::vec;
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicU32, Ordering};
 
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::mono_font::MonoTextStyle;
@@ -66,15 +65,6 @@ const MTU: usize = 1492;
 const HTTP_SOCKETS: usize = 3;
 /// Longest LoRa payload we accept from the form.
 const MSG_CAP: usize = 200;
-
-/// DIAGNOSTIC: counts every ethernet frame esp-radio hands smoltcp. If this stays
-/// at 0 while a phone is joined, the driver isn't delivering RX frames at all.
-static RX_FRAMES: AtomicU32 = AtomicU32::new(0);
-/// DIAGNOSTIC: counts every frame smoltcp transmits (ARP replies, SYN-ACKs, the
-/// DHCP reply). If this barely moves while the phone hammers us, the TX path is
-/// the problem; if it climbs but the browser still times out, the phone is
-/// refusing to route over a no-internet network.
-static TX_FRAMES: AtomicU32 = AtomicU32::new(0);
 
 #[main]
 fn main() -> ! {
@@ -211,28 +201,8 @@ fn main() -> ! {
 
     let mut delay = Delay::new();
     let mut counter: u32 = 0;
-    let mut last_beat = HalInstant::now();
     loop {
         iface.poll(now(), &mut device, &mut sockets);
-
-        // DIAGNOSTIC: every ~2s report whether frames are arriving and the state
-        // of each HTTP socket, so a browser timeout can be traced to its layer.
-        if HalInstant::now().duration_since_epoch().as_millis()
-            - last_beat.duration_since_epoch().as_millis()
-            >= 2_000
-        {
-            last_beat = HalInstant::now();
-            let mut states = FmtBuf::new();
-            for &handle in &http_handles {
-                let _ = write!(states, "{:?} ", sockets.get::<tcp::Socket>(handle).state());
-            }
-            println!(
-                "heartbeat: rx_frames={} tx_frames={} http=[{}]",
-                RX_FRAMES.load(Ordering::Relaxed),
-                TX_FRAMES.load(Ordering::Relaxed),
-                states.as_str()
-            );
-        }
 
         // hand the connecting phone an address.
         let dhcp = sockets.get_mut::<udp::Socket>(dhcp_handle);
@@ -259,11 +229,6 @@ fn main() -> ! {
 
             let mut request = [0u8; 1024];
             let n = socket.recv_slice(&mut request).unwrap_or(0);
-            println!(
-                "http: {} bytes: {:?}",
-                n,
-                core::str::from_utf8(&request[..n.min(48)]).unwrap_or("<binary>")
-            );
             let mut msg = [0u8; MSG_CAP];
             let msg_len = parse_send(&request[..n], &mut msg).unwrap_or(0);
 
@@ -419,16 +384,11 @@ fn serve_dhcp(socket: &mut udp::Socket) {
     if len < 240 || request[236..240] != [0x63, 0x82, 0x53, 0x63] {
         return;
     }
-    let msg_type = find_option(&request[240..len], 53).and_then(|v| v.first().copied());
-    let reply_type = match msg_type {
+    let reply_type = match find_option(&request[240..len], 53).and_then(|v| v.first().copied()) {
         Some(1) => 2, // DISCOVER -> OFFER
         Some(3) => 5, // REQUEST  -> ACK
-        other => {
-            println!("dhcp: ignoring message type {other:?}");
-            return;
-        }
+        _ => return,
     };
-    println!("dhcp: got type {msg_type:?}, replying with type {reply_type}");
 
     let mut reply = [0u8; 300];
     reply[0] = 2; // BOOTREPLY
@@ -459,10 +419,7 @@ fn serve_dhcp(socket: &mut udp::Socket) {
 
     // the client has no address yet, so reply to the broadcast address.
     let to = IpEndpoint::new(IpAddress::v4(255, 255, 255, 255), 68);
-    match socket.send_slice(&reply[..at], to) {
-        Ok(()) => println!("dhcp: queued {}-byte reply -> 192.168.4.2", at),
-        Err(e) => println!("dhcp: send failed: {e:?}"),
-    }
+    let _ = socket.send_slice(&reply[..at], to);
 }
 
 /// Minimal captive-portal DNS server: answer every A query with [`GATEWAY`], so
@@ -566,10 +523,9 @@ impl Device for WifiStackDevice<'_> {
         &mut self,
         _timestamp: NetInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        self.iface.receive().map(|(rx, tx)| {
-            RX_FRAMES.fetch_add(1, Ordering::Relaxed);
-            (DeviceRxToken(rx), DeviceTxToken(tx))
-        })
+        self.iface
+            .receive()
+            .map(|(rx, tx)| (DeviceRxToken(rx), DeviceTxToken(tx)))
     }
 
     fn transmit(&mut self, _timestamp: NetInstant) -> Option<Self::TxToken<'_>> {
@@ -598,7 +554,6 @@ impl TxToken for DeviceTxToken {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        TX_FRAMES.fetch_add(1, Ordering::Relaxed);
         self.0.consume_token(len, f)
     }
 }
