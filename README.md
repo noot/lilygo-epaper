@@ -1,6 +1,10 @@
 # LilyGo T5 S3 ePaper Pro
 
-![Demo](_docs/hello-world.jpg)
+<p align="center">
+  <img src="_docs/photo-1.jpg" width="32%" />
+  <img src="_docs/photo-2.jpg" width="32%" />
+  <img src="_docs/photo-3.jpg" width="32%" />
+</p>
 
 Rust driver and UI firmware for the [LilyGo T5 E-Paper S3 Pro](https://lilygo.cc/products/t5-e-paper-s3-pro)
 device family (ESP32-S3, ED047TC1 4.7" panel).
