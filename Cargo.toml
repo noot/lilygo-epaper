@@ -19,7 +19,7 @@ esp-println = { version = "0.17", features = ["esp32s3"] }
 embedded-hal-bus = "0.3"
 embedded-graphics = "0.8"
 
-# wifi soft-ap for the wifi_tx example. esp-radio (formerly esp-wifi) is the
+# wifi soft-ap for the wifi_lora_bridge example. esp-radio (formerly esp-wifi) is the
 # wifi controller/driver, esp-rtos provides the preemptive scheduler the radio
 # firmware requires, and smoltcp is the TCP/IP stack we drive directly (the AP
 # bring-up, a small DHCP server and the HTTP server all live in the example).

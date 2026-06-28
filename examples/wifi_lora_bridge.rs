@@ -1,13 +1,15 @@
 //! Wi-Fi soft-AP to LoRa bridge: the board hosts an open Wi-Fi network and a tiny
 //! web page. Join the network from a phone, open `http://192.168.4.1/`, type a
-//! message, hit send, and it goes out over LoRa (SX1262). The last message sent
-//! is shown on the e-paper display.
+//! message, hit send, and it goes out over LoRa (SX1262). Incoming LoRa packets
+//! are listed live on the same page (it polls `/rx`) and shown on the e-paper.
 //!
 //! esp-radio is the Wi-Fi driver; this example owns the network bring-up: it runs
-//! a soft access point, a minimal DHCP server (so the phone gets an address) and a
-//! small HTTP server, all driven through `smoltcp` in a blocking poll loop.
+//! a soft access point, a minimal DHCP server (so the phone gets an address), a
+//! captive-portal DNS server (so the phone opens the page) and a small HTTP
+//! server, all driven through `smoltcp` in a blocking poll loop. Between web
+//! requests the radio sits in continuous receive and is polled without blocking.
 //!
-//! Flash with `cargo run --example wifi_tx` (requires the `esp` toolchain + espflash).
+//! Flash with `cargo run --example wifi_lora_bridge` (requires the `esp` toolchain + espflash).
 
 #![no_std]
 #![no_main]
@@ -61,10 +63,13 @@ const CLIENT_IP: [u8; 4] = [192, 168, 4, 2];
 /// esp-radio's default Wi-Fi MTU; advertised to smoltcp so it never hands the TX
 /// token a frame longer than the driver's internal buffer.
 const MTU: usize = 1492;
-/// Number of HTTP listener sockets — phones open several connections in parallel.
-const HTTP_SOCKETS: usize = 3;
-/// Longest LoRa payload we accept from the form.
+/// Number of HTTP listener sockets — phones open several connections in parallel,
+/// and the page's /rx polling adds churn, so keep a few spare past TIME-WAIT.
+const HTTP_SOCKETS: usize = 4;
+/// Longest LoRa payload we accept from the form or show from a received packet.
 const MSG_CAP: usize = 200;
+/// How many recently-received LoRa packets to keep for the web page.
+const RX_LOG_LEN: usize = 6;
 
 #[main]
 fn main() -> ! {
@@ -195,12 +200,16 @@ fn main() -> ! {
     };
     let http_handles: [_; HTTP_SOCKETS] = core::array::from_fn(|_| {
         let rx = tcp::SocketBuffer::new(vec![0u8; 1536]);
-        let tx = tcp::SocketBuffer::new(vec![0u8; 2560]);
+        let tx = tcp::SocketBuffer::new(vec![0u8; 4096]);
         sockets.add(tcp::Socket::new(rx, tx))
     });
 
     let mut delay = Delay::new();
     let mut counter: u32 = 0;
+    let mut rx_log = RxLog::new();
+    // start listening for incoming LoRa packets between web requests.
+    radio.start_receive().unwrap();
+
     loop {
         iface.poll(now(), &mut device, &mut sockets);
 
@@ -216,7 +225,47 @@ fn main() -> ! {
             serve_dns(dns);
         }
 
-        // serve the form and pick up any message the phone submitted.
+        // non-blocking check for an incoming LoRa packet; show it on the display.
+        let mut lora_buf = [0u8; 255];
+        match radio.try_receive(&mut lora_buf) {
+            Ok(Some(info)) => {
+                let payload = &lora_buf[..info.len];
+                println!(
+                    "rx {} bytes rssi={} snr={}: {:?}",
+                    info.len,
+                    info.rssi_dbm,
+                    info.snr_db,
+                    core::str::from_utf8(payload)
+                );
+                rx_log.push(payload, info.rssi_dbm, info.snr_db);
+                let mut meta = FmtBuf::new();
+                let _ = write!(meta, "rssi {} snr {}", info.rssi_dbm, info.snr_db);
+                let mut line = FmtBuf::new();
+                match core::str::from_utf8(payload) {
+                    Ok(text) => {
+                        let _ = write!(line, "rx: {text}");
+                    }
+                    Err(_) => {
+                        let _ = write!(line, "rx: <binary>");
+                    }
+                }
+                render(
+                    &mut display,
+                    "LoRa -> WiFi",
+                    "join wifi: lora-tx",
+                    meta.as_str(),
+                    line.as_str(),
+                );
+                display.refresh_partial().unwrap();
+            }
+            Ok(None) => {}
+            Err(e) => {
+                println!("rx error: {e:?}");
+                let _ = radio.start_receive(); // recover continuous rx after a bad packet
+            }
+        }
+
+        // serve the form / live updates, and pick up any message the phone submitted.
         let mut submitted: Option<([u8; MSG_CAP], usize)> = None;
         for &handle in &http_handles {
             let socket = sockets.get_mut::<tcp::Socket>(handle);
@@ -230,27 +279,28 @@ fn main() -> ! {
             let mut request = [0u8; 1024];
             let n = socket.recv_slice(&mut request).unwrap_or(0);
             let mut msg = [0u8; MSG_CAP];
-            let msg_len = parse_send(&request[..n], &mut msg).unwrap_or(0);
-
-            let status = if msg_len > 0 {
-                match radio.transmit(&msg[..msg_len]) {
-                    Ok(()) => {
-                        println!("tx #{counter}: {:?}", core::str::from_utf8(&msg[..msg_len]));
-                        submitted = Some((msg, msg_len));
-                        counter = counter.wrapping_add(1);
-                        Status::Sent(&msg[..msg_len])
-                    }
-                    Err(e) => {
-                        println!("tx error: {e:?}");
-                        Status::Error
-                    }
-                }
-            } else {
-                Status::None
-            };
-
             let mut page = PageBuf::new();
-            write_page(&mut page, status);
+            match parse_route(&request[..n], &mut msg) {
+                Route::Rx => write_rx_response(&mut page, &rx_log),
+                Route::Send(len) if len > 0 => {
+                    let status = match radio.transmit(&msg[..len]) {
+                        Ok(()) => {
+                            println!("tx #{counter}: {:?}", core::str::from_utf8(&msg[..len]));
+                            submitted = Some((msg, len));
+                            counter = counter.wrapping_add(1);
+                            Status::Sent(&msg[..len])
+                        }
+                        Err(e) => {
+                            println!("tx error: {e:?}");
+                            Status::Error
+                        }
+                    };
+                    // transmitting drops the radio to standby; resume listening.
+                    let _ = radio.start_receive();
+                    write_page(&mut page, status, &rx_log);
+                }
+                _ => write_page(&mut page, Status::None, &rx_log),
+            }
             let _ = socket.send_slice(page.as_bytes());
             socket.close();
         }
@@ -281,20 +331,93 @@ fn main() -> ! {
     }
 }
 
-/// What the served page should report about the last action.
+/// What the served page should report about the last send.
 enum Status<'a> {
     None,
     Sent(&'a [u8]),
     Error,
 }
 
-/// Build the HTTP response: a small form, plus a status line after a submission.
-fn write_page(out: &mut PageBuf, status: Status<'_>) {
+/// Which resource an HTTP request is asking for.
+enum Route {
+    /// `GET /send?msg=...` — the URL-decoded message length written into the buffer.
+    Send(usize),
+    /// `GET /rx` — the live received-packet list the page's script polls for.
+    Rx,
+    /// anything else (including the captive-portal probes) — serve the full page.
+    Page,
+}
+
+/// A received LoRa packet kept for display on the web page.
+#[derive(Clone, Copy)]
+struct RxEntry {
+    payload: [u8; MSG_CAP],
+    len: usize,
+    rssi_dbm: i16,
+    snr_db: i16,
+    seq: u32,
+}
+
+impl RxEntry {
+    const EMPTY: Self = Self {
+        payload: [0; MSG_CAP],
+        len: 0,
+        rssi_dbm: 0,
+        snr_db: 0,
+        seq: 0,
+    };
+
+    fn payload(&self) -> &[u8] {
+        &self.payload[..self.len]
+    }
+}
+
+/// A small ring buffer of the most recently received packets.
+struct RxLog {
+    entries: [RxEntry; RX_LOG_LEN],
+    /// total packets ever stored; also the next sequence number and write cursor.
+    total: u32,
+}
+
+impl RxLog {
+    fn new() -> Self {
+        Self {
+            entries: [RxEntry::EMPTY; RX_LOG_LEN],
+            total: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    fn push(&mut self, payload: &[u8], rssi_dbm: i16, snr_db: i16) {
+        let len = payload.len().min(MSG_CAP);
+        let entry = &mut self.entries[self.total as usize % RX_LOG_LEN];
+        entry.payload[..len].copy_from_slice(&payload[..len]);
+        entry.len = len;
+        entry.rssi_dbm = rssi_dbm;
+        entry.snr_db = snr_db;
+        entry.seq = self.total;
+        self.total = self.total.wrapping_add(1);
+    }
+
+    /// Iterate the stored packets, newest first.
+    fn iter_newest(&self) -> impl Iterator<Item = &RxEntry> {
+        let stored = (self.total as usize).min(RX_LOG_LEN);
+        let total = self.total as usize;
+        (0..stored).map(move |i| &self.entries[(total - 1 - i) % RX_LOG_LEN])
+    }
+}
+
+/// Build the full HTTP page: the send form, a status line, and the received-packet
+/// list, with a small script that refreshes the list in place.
+fn write_page(out: &mut PageBuf, status: Status<'_>, rx_log: &RxLog) {
     let _ = out.write_str(
         "HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n\
          <!doctype html><html><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
-         <title>LoRa TX</title></head><body style=\"font-family:sans-serif;margin:2em\">\
+         <title>LoRa</title></head><body style=\"font-family:sans-serif;margin:2em\">\
          <h2>Send a LoRa message</h2>\
          <form action=\"/send\" method=\"get\">\
          <input name=\"msg\" autofocus autocomplete=off maxlength=200 \
@@ -312,22 +435,70 @@ fn write_page(out: &mut PageBuf, status: Status<'_>) {
             let _ = out.write_str("<p style=\"color:red\">Send failed — try again.</p>");
         }
     }
-    let _ = out.write_str("</body></html>");
+    let _ = out.write_str("<h2>Received</h2><div id=rx>");
+    write_rx_list(out, rx_log);
+    // poll /rx every 2s and swap it in, so new packets appear without a reload.
+    let _ = out.write_str(
+        "</div><script>setInterval(function(){fetch('/rx').then(function(r){return r.text()})\
+         .then(function(t){document.getElementById('rx').innerHTML=t})},2000)</script>\
+         </body></html>",
+    );
 }
 
-/// Parse `GET /send?msg=...` from an HTTP request, writing the URL-decoded message
-/// into `out`. Returns the decoded length, or `None` if this is not a send request.
-fn parse_send(request: &[u8], out: &mut [u8]) -> Option<usize> {
-    let line_end = request.iter().position(|&b| b == b'\r' || b == b'\n')?;
-    let path = request[..line_end].strip_prefix(b"GET ")?;
-    let path_end = path.iter().position(|&b| b == b' ')?;
-    let query = path[..path_end].strip_prefix(b"/send?")?;
-    for param in query.split(|&b| b == b'&') {
-        if let Some(value) = param.strip_prefix(b"msg=") {
-            return Some(url_decode(value, out));
+/// The bare received-packet list, returned for `GET /rx` and embedded in the page.
+fn write_rx_response(out: &mut PageBuf, rx_log: &RxLog) {
+    let _ = out.write_str(
+        "HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n",
+    );
+    write_rx_list(out, rx_log);
+}
+
+fn write_rx_list(out: &mut PageBuf, rx_log: &RxLog) {
+    if rx_log.is_empty() {
+        let _ = out.write_str("<p>nothing yet</p>");
+        return;
+    }
+    let _ = out.write_str("<ul>");
+    for entry in rx_log.iter_newest() {
+        let _ = out.write_str("<li><small>");
+        let mut meta = FmtBuf::new();
+        let _ = write!(
+            meta,
+            "#{} {} dBm snr {}: ",
+            entry.seq, entry.rssi_dbm, entry.snr_db
+        );
+        let _ = out.write_str(meta.as_str());
+        let _ = out.write_str("</small>");
+        out.write_escaped(entry.payload());
+        let _ = out.write_str("</li>");
+    }
+    let _ = out.write_str("</ul>");
+}
+
+/// Decide what an HTTP request wants. For `/send`, the URL-decoded message is
+/// written into `out` and its length returned in [`Route::Send`].
+fn parse_route(request: &[u8], out: &mut [u8]) -> Route {
+    let Some(line_end) = request.iter().position(|&b| b == b'\r' || b == b'\n') else {
+        return Route::Page;
+    };
+    let Some(after_method) = request[..line_end].strip_prefix(b"GET ") else {
+        return Route::Page;
+    };
+    let Some(path_end) = after_method.iter().position(|&b| b == b' ') else {
+        return Route::Page;
+    };
+    let path = &after_method[..path_end];
+    if path == b"/rx" {
+        return Route::Rx;
+    }
+    if let Some(query) = path.strip_prefix(b"/send?") {
+        for param in query.split(|&b| b == b'&') {
+            if let Some(value) = param.strip_prefix(b"msg=") {
+                return Route::Send(url_decode(value, out));
+            }
         }
     }
-    None
+    Route::Page
 }
 
 /// Decode an `application/x-www-form-urlencoded` value into `out`, returning its
@@ -580,14 +751,14 @@ where
 /// a fixed-capacity buffer for building the HTTP response, with helpers to append
 /// HTML-escaped bytes from the (untrusted) submitted message.
 struct PageBuf {
-    buf: [u8; 1536],
+    buf: [u8; 4096],
     len: usize,
 }
 
 impl PageBuf {
     fn new() -> Self {
         Self {
-            buf: [0; 1536],
+            buf: [0; 4096],
             len: 0,
         }
     }

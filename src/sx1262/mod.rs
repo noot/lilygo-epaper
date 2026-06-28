@@ -169,13 +169,39 @@ where
     /// The payload is written into `buf` and the returned [`RxInfo`] reports its
     /// length along with signal quality.
     pub fn receive(&mut self, buf: &mut [u8]) -> Result<RxInfo, Error<SPI::Error, PE>> {
+        self.start_receive()?;
+        self.wait_dio1(None)?;
+        self.read_completed_packet(buf)
+    }
+
+    /// Put the radio into continuous receive mode and return immediately. Pair
+    /// with [`try_receive`](Self::try_receive) to poll for packets without
+    /// blocking. After a [`transmit`](Self::transmit) the radio falls back to
+    /// standby, so call this again to resume listening.
+    pub fn start_receive(&mut self) -> Result<(), Error<SPI::Error, PE>> {
         self.write_cmd(cmd::SET_STANDBY, &[cmd::STDBY_RC])?;
         self.set_packet_params(0xFF)?;
         self.clear_irq_status(cmd::IRQ_ALL)?;
+        // set_rx with 0xFFFFFF is continuous receive: the radio stays in RX after
+        // each packet, so the caller just clears the irq and keeps polling.
+        self.write_cmd(cmd::SET_RX, &[0xFF, 0xFF, 0xFF])
+    }
 
-        // set_rx with 0xFFFFFF is continuous receive; block until dio1 signals.
-        self.write_cmd(cmd::SET_RX, &[0xFF, 0xFF, 0xFF])?;
-        self.wait_dio1(None)?;
+    /// Poll for a packet received since [`start_receive`](Self::start_receive),
+    /// without blocking. Returns `Ok(None)` if none has arrived yet; the radio
+    /// stays in continuous receive mode either way.
+    pub fn try_receive(&mut self, buf: &mut [u8]) -> Result<Option<RxInfo>, Error<SPI::Error, PE>> {
+        // dio1 is asserted (and stays high until the irq is cleared) when an
+        // enabled irq fires; no spi access until then.
+        if self.dio1.is_low().map_err(Error::Pin)? {
+            return Ok(None);
+        }
+        self.read_completed_packet(buf).map(Some)
+    }
+
+    /// Read the packet the radio has just signalled as complete, returning its
+    /// payload length and signal quality. Clears the irq so receive can continue.
+    fn read_completed_packet(&mut self, buf: &mut [u8]) -> Result<RxInfo, Error<SPI::Error, PE>> {
         let irq = self.get_irq_status()?;
         self.clear_irq_status(cmd::IRQ_ALL)?;
         if irq & cmd::IRQ_CRC_ERR != 0 {
