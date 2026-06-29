@@ -117,9 +117,13 @@ use crate::{
             font_size_button_rect,
             format_button_rect,
             hit_test as settings_hit,
+            icon_size_button_rect,
+            icons_button_rect,
             redraw_family,
             redraw_font_size,
             redraw_format,
+            redraw_icon_size,
+            redraw_icons,
             redraw_spacing,
             redraw_tz,
             spacing_button_rect,
@@ -341,6 +345,8 @@ async fn main(_spawner: Spawner) -> ! {
                 Screen::Home => draw_home(
                     &mut display,
                     status_date(&mut clock, settings.tz_offset_hours),
+                    settings.icon_style,
+                    settings.icon_size,
                 ),
                 Screen::Gps => {
                     let bold = MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK);
@@ -753,6 +759,18 @@ async fn main(_spawner: Spawner) -> ! {
                             display.flush_partial_fast(format_button_rect()).ok();
                             last_status_minute =
                                 refresh_statusbar_clock(&mut display, &mut clock, &settings);
+                        }
+                        Some(SettingsHit::CycleIcons) => {
+                            settings.icon_style = settings.icon_style.next();
+                            settings.save();
+                            redraw_icons(&mut display, &settings);
+                            display.flush_partial_fast(icons_button_rect()).ok();
+                        }
+                        Some(SettingsHit::CycleIconSize) => {
+                            settings.icon_size = settings.icon_size.next();
+                            settings.save();
+                            redraw_icon_size(&mut display, &settings);
+                            display.flush_partial_fast(icon_size_button_rect()).ok();
                         }
                         Some(SettingsHit::CycleFontSize) => {
                             settings.reader_font_size = settings.reader_font_size.next();

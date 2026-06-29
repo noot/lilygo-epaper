@@ -138,6 +138,82 @@ impl LineSpacing {
     }
 }
 
+// home-screen icon set: thin-line Lucide or solid-filled Material. see
+// `pages::home`, where each maps to a directory of BMP glyphs.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum IconStyle {
+    Lucide,
+    Material,
+}
+
+impl IconStyle {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            IconStyle::Lucide => IconStyle::Material,
+            IconStyle::Material => IconStyle::Lucide,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            IconStyle::Lucide => "Lucide",
+            IconStyle::Material => "Material",
+        }
+    }
+
+    fn to_byte(self) -> u8 {
+        match self {
+            IconStyle::Lucide => 0,
+            IconStyle::Material => 1,
+        }
+    }
+
+    fn from_byte(b: u8) -> Self {
+        match b {
+            1 => IconStyle::Material,
+            _ => IconStyle::Lucide,
+        }
+    }
+}
+
+// home-screen icon size: each maps to a directory of pre-rendered glyphs at
+// that pixel size. see `pages::home`.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum IconSize {
+    Small,
+    Regular,
+}
+
+impl IconSize {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            IconSize::Small => IconSize::Regular,
+            IconSize::Regular => IconSize::Small,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            IconSize::Small => "Small",
+            IconSize::Regular => "Regular",
+        }
+    }
+
+    fn to_byte(self) -> u8 {
+        match self {
+            IconSize::Small => 0,
+            IconSize::Regular => 1,
+        }
+    }
+
+    fn from_byte(b: u8) -> Self {
+        match b {
+            0 => IconSize::Small,
+            _ => IconSize::Regular,
+        }
+    }
+}
+
 // the reader's text styling, bundled so it can be passed in one argument.
 #[derive(Clone, Copy)]
 pub(crate) struct ReaderStyle {
@@ -199,6 +275,8 @@ pub(crate) struct Settings {
     pub(crate) reader_font_size: FontSize,
     pub(crate) reader_font_family: FontFamily,
     pub(crate) reader_line_spacing: LineSpacing,
+    pub(crate) icon_style: IconStyle,
+    pub(crate) icon_size: IconSize,
 }
 
 impl Default for Settings {
@@ -210,6 +288,8 @@ impl Default for Settings {
             reader_font_size: FontSize::Medium,
             reader_font_family: FontFamily::Sans,
             reader_line_spacing: LineSpacing::Normal,
+            icon_style: IconStyle::Lucide,
+            icon_size: IconSize::Regular,
         }
     }
 }
@@ -218,8 +298,8 @@ impl Default for Settings {
 // checksum over the preceding bytes. anything that doesn't validate (blank
 // flash, older/newer layout, corruption) falls back to defaults.
 const MAGIC: [u8; 2] = [0x54, 0x35];
-const VERSION: u8 = 2;
-const BLOB_LEN: usize = 10;
+const VERSION: u8 = 4;
+const BLOB_LEN: usize = 12;
 
 // the flash peripheral is a singleton held by `esp_hal::init`; settings access
 // is brief and self-contained, so steal it here the same way the SD card and
@@ -240,7 +320,9 @@ impl Settings {
         buf[6] = self.reader_font_size.to_byte();
         buf[7] = self.reader_font_family.to_byte();
         buf[8] = self.reader_line_spacing.to_byte();
-        buf[9] = buf[0..9].iter().fold(0u8, |acc, &b| acc ^ b);
+        buf[9] = self.icon_style.to_byte();
+        buf[10] = self.icon_size.to_byte();
+        buf[11] = buf[0..11].iter().fold(0u8, |acc, &b| acc ^ b);
         buf
     }
 
@@ -248,8 +330,8 @@ impl Settings {
         if buf[0..2] != MAGIC || buf[2] != VERSION {
             return None;
         }
-        let checksum = buf[0..9].iter().fold(0u8, |acc, &b| acc ^ b);
-        if checksum != buf[9] {
+        let checksum = buf[0..11].iter().fold(0u8, |acc, &b| acc ^ b);
+        if checksum != buf[11] {
             return None;
         }
         Some(Self {
@@ -259,6 +341,8 @@ impl Settings {
             reader_font_size: FontSize::from_byte(buf[6]),
             reader_font_family: FontFamily::from_byte(buf[7]),
             reader_line_spacing: LineSpacing::from_byte(buf[8]),
+            icon_style: IconStyle::from_byte(buf[9]),
+            icon_size: IconSize::from_byte(buf[10]),
         })
     }
 

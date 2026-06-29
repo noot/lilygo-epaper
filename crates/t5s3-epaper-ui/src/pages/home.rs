@@ -19,6 +19,7 @@ use crate::{
     fmt::FmtBuf,
     layout::{SCREEN_W, STATUS_H},
     screen::Screen,
+    settings::{IconSize, IconStyle},
 };
 
 const COLS: usize = 3;
@@ -87,34 +88,59 @@ pub(crate) fn hit_test(sx: i32, sy: i32) -> Option<usize> {
     None
 }
 
-const ICON_PX: i32 = 100;
+macro_rules! icon_set {
+    ($dir:literal, $screen:expr) => {
+        match $screen {
+            Screen::Gps => include_bytes!(concat!("../../assets/icons/", $dir, "/gps.bmp")),
+            Screen::Lora => include_bytes!(concat!("../../assets/icons/", $dir, "/lora.bmp")),
+            Screen::Frontlight => {
+                include_bytes!(concat!("../../assets/icons/", $dir, "/light.bmp"))
+            }
+            Screen::Sleep => include_bytes!(concat!("../../assets/icons/", $dir, "/sleep.bmp")),
+            Screen::Files => include_bytes!(concat!("../../assets/icons/", $dir, "/files.bmp")),
+            Screen::Info => include_bytes!(concat!("../../assets/icons/", $dir, "/info.bmp")),
+            Screen::Settings => {
+                include_bytes!(concat!("../../assets/icons/", $dir, "/settings.bmp"))
+            }
+            Screen::Home | Screen::Image | Screen::Reader => return None,
+        }
+    };
+}
 
-fn icon_bytes(screen: Screen) -> Option<&'static [u8]> {
-    Some(match screen {
-        Screen::Gps => include_bytes!("../../assets/icons/gps.bmp"),
-        Screen::Lora => include_bytes!("../../assets/icons/lora.bmp"),
-        Screen::Frontlight => include_bytes!("../../assets/icons/light.bmp"),
-        Screen::Sleep => include_bytes!("../../assets/icons/sleep.bmp"),
-        Screen::Files => include_bytes!("../../assets/icons/files.bmp"),
-        Screen::Info => include_bytes!("../../assets/icons/info.bmp"),
-        Screen::Settings => include_bytes!("../../assets/icons/settings.bmp"),
-        Screen::Home | Screen::Image | Screen::Reader => return None,
+fn icon_bytes(screen: Screen, style: IconStyle, size: IconSize) -> Option<&'static [u8]> {
+    Some(match (style, size) {
+        (IconStyle::Lucide, IconSize::Regular) => icon_set!("lucide/regular", screen),
+        (IconStyle::Lucide, IconSize::Small) => icon_set!("lucide/small", screen),
+        (IconStyle::Material, IconSize::Regular) => icon_set!("material/regular", screen),
+        (IconStyle::Material, IconSize::Small) => icon_set!("material/small", screen),
     })
 }
 
-fn draw_glyph(display: &mut Display, screen: Screen, cx: i32, cy: i32) {
-    let Some(bytes) = icon_bytes(screen) else {
+fn draw_glyph(
+    display: &mut Display,
+    screen: Screen,
+    style: IconStyle,
+    size: IconSize,
+    cx: i32,
+    cy: i32,
+) {
+    let Some(bytes) = icon_bytes(screen, style, size) else {
         return;
     };
     let Ok(bmp) = Bmp::<Gray4>::from_slice(bytes) else {
         return;
     };
-    Image::new(&bmp, Point::new(cx - ICON_PX / 2, cy - ICON_PX / 2))
-        .draw(display)
-        .ok();
+    let dim = bmp.size();
+    let top_left = Point::new(cx - dim.width as i32 / 2, cy - dim.height as i32 / 2);
+    Image::new(&bmp, top_left).draw(display).ok();
 }
 
-pub(crate) fn draw_home(display: &mut Display, date: Option<(usize, i64, u32, u32)>) {
+pub(crate) fn draw_home(
+    display: &mut Display,
+    date: Option<(usize, i64, u32, u32)>,
+    icon_style: IconStyle,
+    icon_size: IconSize,
+) {
     let bold = MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK);
     let small = MonoTextStyle::new(&FONT_6X10, Gray4::new(4));
 
@@ -157,7 +183,14 @@ pub(crate) fn draw_home(display: &mut Display, date: Option<(usize, i64, u32, u3
         .draw(display)
         .ok();
 
-        draw_glyph(display, icon.screen, x + ICON_W as i32 / 2, y + 80);
+        draw_glyph(
+            display,
+            icon.screen,
+            icon_style,
+            icon_size,
+            x + ICON_W as i32 / 2,
+            y + 80,
+        );
 
         Text::with_alignment(
             icon.label,

@@ -31,11 +31,13 @@ const TZ_PLUS_X: i32 = 440;
 const TZ_VAL_X: i32 = 345;
 const TZ_VAL_W: u32 = 90;
 
-const FMT_Y: i32 = 320;
-const READER_HDR_Y: i32 = 430;
-const FONT_SIZE_Y: i32 = 470;
-const FONT_FAMILY_Y: i32 = 560;
-const SPACING_Y: i32 = 650;
+const FMT_Y: i32 = 300;
+const ICONS_Y: i32 = 380;
+const ICON_SIZE_Y: i32 = 460;
+const READER_HDR_Y: i32 = 545;
+const FONT_SIZE_Y: i32 = 585;
+const FONT_FAMILY_Y: i32 = 675;
+const SPACING_Y: i32 = 765;
 
 // which control a tap landed on, dispatched by the main loop.
 pub(crate) enum Hit {
@@ -43,6 +45,8 @@ pub(crate) enum Hit {
     TzMinus,
     TzPlus,
     ToggleFormat,
+    CycleIcons,
+    CycleIconSize,
     CycleFontSize,
     CycleFontFamily,
     CycleSpacing,
@@ -61,6 +65,10 @@ pub(crate) fn hit_test(sx: i32, sy: i32) -> Option<Hit> {
         Some(Hit::TzPlus)
     } else if in_rect(sx, sy, WIDE_BTN_X, FMT_Y, WIDE_BTN_W, BTN_H) {
         Some(Hit::ToggleFormat)
+    } else if in_rect(sx, sy, WIDE_BTN_X, ICONS_Y, WIDE_BTN_W, BTN_H) {
+        Some(Hit::CycleIcons)
+    } else if in_rect(sx, sy, WIDE_BTN_X, ICON_SIZE_Y, WIDE_BTN_W, BTN_H) {
+        Some(Hit::CycleIconSize)
     } else if in_rect(sx, sy, WIDE_BTN_X, FONT_SIZE_Y, WIDE_BTN_W, BTN_H) {
         Some(Hit::CycleFontSize)
     } else if in_rect(sx, sy, WIDE_BTN_X, FONT_FAMILY_Y, WIDE_BTN_W, BTN_H) {
@@ -130,6 +138,13 @@ pub(crate) fn draw_settings_screen(display: &mut Display, settings: &Settings) {
     label(display, "Time format", FMT_Y);
     draw_format_button(display, settings.time_24h);
 
+    // home-screen icon set and size.
+    label(display, "Icons", ICONS_Y);
+    draw_icons_button(display, settings);
+
+    label(display, "Icon size", ICON_SIZE_Y);
+    draw_icon_size_button(display, settings);
+
     // reader section.
     Text::with_alignment(
         "Reader",
@@ -188,6 +203,26 @@ fn draw_format_button(display: &mut Display, time_24h: bool) {
     );
 }
 
+fn draw_icons_button(display: &mut Display, settings: &Settings) {
+    button(
+        display,
+        WIDE_BTN_X,
+        ICONS_Y,
+        WIDE_BTN_W,
+        settings.icon_style.label(),
+    );
+}
+
+fn draw_icon_size_button(display: &mut Display, settings: &Settings) {
+    button(
+        display,
+        WIDE_BTN_X,
+        ICON_SIZE_Y,
+        WIDE_BTN_W,
+        settings.icon_size.label(),
+    );
+}
+
 fn draw_font_size_button(display: &mut Display, settings: &Settings) {
     button(
         display,
@@ -226,6 +261,14 @@ pub(crate) fn format_button_rect() -> t5s3_epaper_core::display::Rectangle {
     screen_to_native_rect(WIDE_BTN_X, FMT_Y, WIDE_BTN_W as i32, BTN_H as i32)
 }
 
+pub(crate) fn icons_button_rect() -> t5s3_epaper_core::display::Rectangle {
+    screen_to_native_rect(WIDE_BTN_X, ICONS_Y, WIDE_BTN_W as i32, BTN_H as i32)
+}
+
+pub(crate) fn icon_size_button_rect() -> t5s3_epaper_core::display::Rectangle {
+    screen_to_native_rect(WIDE_BTN_X, ICON_SIZE_Y, WIDE_BTN_W as i32, BTN_H as i32)
+}
+
 pub(crate) fn font_size_button_rect() -> t5s3_epaper_core::display::Rectangle {
     screen_to_native_rect(WIDE_BTN_X, FONT_SIZE_Y, WIDE_BTN_W as i32, BTN_H as i32)
 }
@@ -244,6 +287,14 @@ pub(crate) fn redraw_tz(display: &mut Display, offset_hours: i8) {
 
 pub(crate) fn redraw_format(display: &mut Display, time_24h: bool) {
     draw_format_button(display, time_24h);
+}
+
+pub(crate) fn redraw_icons(display: &mut Display, settings: &Settings) {
+    draw_icons_button(display, settings);
+}
+
+pub(crate) fn redraw_icon_size(display: &mut Display, settings: &Settings) {
+    draw_icon_size_button(display, settings);
 }
 
 pub(crate) fn redraw_font_size(display: &mut Display, settings: &Settings) {
