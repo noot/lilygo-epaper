@@ -70,8 +70,8 @@ impl CodingRate {
     }
 }
 
-/// RadioLib's "private network" LoRa sync word, the default for a stock RadioLib
-/// peer. Both endpoints must agree on the sync word to communicate.
+/// RadioLib's "private network" LoRa sync word, the default for a stock
+/// RadioLib peer. Both endpoints must agree on the sync word to communicate.
 pub const SYNC_WORD_PRIVATE: u16 = 0x1424;
 
 /// Radio configuration applied during [`crate::sx1262::Sx1262::init`].

@@ -1,28 +1,37 @@
-//! Display example: draw text on the e-paper, then demonstrate a partial update.
+//! Display example: draw text on the e-paper, then demonstrate a partial
+//! update.
 //!
-//! Flash with `cargo run --example display` (requires the `esp` toolchain + espflash).
+//! Flash with `cargo run --example display` (requires the `esp` toolchain +
+//! espflash).
 
 #![no_std]
 #![no_main]
 
-use embedded_graphics::mono_font::MonoTextStyle;
-use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_10X20};
-use embedded_graphics::pixelcolor::BinaryColor;
-use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{Line, PrimitiveStyle};
-use embedded_graphics::text::Text;
+use embedded_graphics::{
+    mono_font::{
+        MonoTextStyle,
+        ascii::{FONT_6X10, FONT_10X20},
+    },
+    pixelcolor::BinaryColor,
+    prelude::*,
+    primitives::{Line, PrimitiveStyle},
+    text::Text,
+};
 use embedded_hal::delay::DelayNs as _;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_backtrace as _;
-use esp_hal::delay::Delay;
-use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
-use esp_hal::main;
-use esp_hal::spi::Mode;
-use esp_hal::spi::master::{Config as SpiConfig, Spi};
-use esp_hal::time::Rate;
+use esp_hal::{
+    delay::Delay,
+    gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
+    main,
+    spi::{
+        Mode,
+        master::{Config as SpiConfig, Spi},
+    },
+    time::Rate,
+};
 use esp_println::println;
-
-use lilygo_t3s3_epaper::ssd1680::{Display, Rotation};
+use t3s3_epaper::ssd1680::{Display, Rotation};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 

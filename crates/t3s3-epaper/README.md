@@ -1,4 +1,4 @@
-# lilygo-t3s3-epaper
+# t3s3-epaper
 
 Firmware support library and examples for the [LilyGO T3-S3](https://www.lilygo.cc/products/t3-s3-meshtastic) e-paper board (SX1262 LoRa variant).
 

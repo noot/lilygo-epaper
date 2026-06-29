@@ -3,12 +3,13 @@
 //! Advertises as "T3S3-Msg" and exposes a Nordic UART Service: RX
 //! `6e400002-...` (write, central -> board, forwarded to LoRa) and TX
 //! `6e400003-...` (notify, board -> central: BLE echo + LoRa receipts), under
-//! service `6e400001-...`. A BLE write and a received LoRa packet are each shown
-//! on the e-paper and relayed to the other side.
+//! service `6e400001-...`. A BLE write and a received LoRa packet are each
+//! shown on the e-paper and relayed to the other side.
 //!
 //! Flash with `cargo run --release --example ble` (requires the `esp` toolchain
-//! and espflash; `--release` because esp-radio's scheduling is timing-sensitive).
-//! Drive it from a host with `tools/ble.py` (`--send`, `--listen`, `--interact`).
+//! and espflash; `--release` because esp-radio's scheduling is
+//! timing-sensitive). Drive it from a host with `tools/ble.py` (`--send`,
+//! `--listen`, `--interact`).
 //!
 //! The BLE host runs on core 0 (HCI pump on its own task so the handshake stays
 //! reliable); the blocking LoRa + ~2 s e-paper work runs on core 1, the two
@@ -25,35 +26,43 @@ use core::fmt::Write as _;
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel;
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_time::{Duration, Timer};
-use embedded_graphics::draw_target::DrawTarget;
-use embedded_graphics::mono_font::MonoTextStyle;
-use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_10X20};
-use embedded_graphics::pixelcolor::BinaryColor;
-use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{Line, PrimitiveStyle};
-use embedded_graphics::text::Text;
+use embedded_graphics::{
+    draw_target::DrawTarget,
+    mono_font::{
+        MonoTextStyle,
+        ascii::{FONT_6X10, FONT_10X20},
+    },
+    pixelcolor::BinaryColor,
+    prelude::*,
+    primitives::{Line, PrimitiveStyle},
+    text::Text,
+};
 use embedded_hal::delay::DelayNs as _;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_backtrace as _;
-use esp_hal::clock::CpuClock;
-use esp_hal::delay::Delay;
-use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
-use esp_hal::interrupt::software::SoftwareInterruptControl;
-use esp_hal::spi::Mode;
-use esp_hal::spi::master::{Config as SpiConfig, Spi};
-use esp_hal::system::Stack as CpuStack;
-use esp_hal::time::Rate;
-use esp_hal::timer::timg::TimerGroup;
+use esp_hal::{
+    clock::CpuClock,
+    delay::Delay,
+    gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
+    interrupt::software::SoftwareInterruptControl,
+    spi::{
+        Mode,
+        master::{Config as SpiConfig, Spi},
+    },
+    system::Stack as CpuStack,
+    time::Rate,
+    timer::timg::TimerGroup,
+};
 use esp_println::println;
 use esp_radio::ble::controller::BleConnector;
+use t3s3_epaper::{
+    ssd1680::{Display, Rotation},
+    sx1262::{Config as RadioConfig, Sx1262},
+};
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
-
-use lilygo_t3s3_epaper::ssd1680::{Display, Rotation};
-use lilygo_t3s3_epaper::sx1262::{Config as RadioConfig, Sx1262};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -66,7 +75,8 @@ const MSG_CAP: usize = 64;
 const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 2; // signalling + att
 
-/// stack for the core-1 (LoRa + display) thread; sized for the e-paper framebuffer.
+/// stack for the core-1 (LoRa + display) thread; sized for the e-paper
+/// framebuffer.
 const CORE1_STACK: usize = 16 * 1024;
 
 type Msg = heapless::Vec<u8, MSG_CAP>;
@@ -82,7 +92,8 @@ static BLE_TO_LORA: Channel<CriticalSectionRawMutex, Msg, 4> = Channel::new();
 static LORA_TO_BLE: Channel<CriticalSectionRawMutex, Msg, 4> = Channel::new();
 
 // nordic uart service: a de-facto standard "serial over ble" layout that
-// generic tools recognise. rx = central -> peripheral, tx = peripheral -> central.
+// generic tools recognise. rx = central -> peripheral, tx = peripheral ->
+// central.
 #[gatt_server]
 struct Server {
     nus: NusService,

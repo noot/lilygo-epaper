@@ -1,22 +1,23 @@
 //! Blocking driver for the Semtech SX1262 LoRa transceiver.
 //!
-//! The driver talks to the radio over an `embedded-hal` SPI bus plus four GPIOs:
-//! NSS/CS and RESET (outputs), BUSY and DIO1 (inputs). It drives the chip-select
-//! line itself and uses single full-duplex transfers, which is what the SX126x
-//! expects. Transmit/receive completion is detected by polling the DIO1 line
-//! (the radio holds BUSY high during a transmit, so SPI cannot be used to read
-//! the IRQ status until DIO1 signals done). It is configured for LoRa
-//! point-to-point transmit and receive.
+//! The driver talks to the radio over an `embedded-hal` SPI bus plus four
+//! GPIOs: NSS/CS and RESET (outputs), BUSY and DIO1 (inputs). It drives the
+//! chip-select line itself and uses single full-duplex transfers, which is what
+//! the SX126x expects. Transmit/receive completion is detected by polling the
+//! DIO1 line (the radio holds BUSY high during a transmit, so SPI cannot be
+//! used to read the IRQ status until DIO1 signals done). It is configured for
+//! LoRa point-to-point transmit and receive.
 
 mod command;
 mod error;
 pub mod params;
 
-use embedded_hal::delay::DelayNs;
-use embedded_hal::digital::{InputPin, OutputPin};
-use embedded_hal::spi::SpiBus;
-
 use command as cmd;
+use embedded_hal::{
+    delay::DelayNs,
+    digital::{InputPin, OutputPin},
+    spi::SpiBus,
+};
 pub use error::Error;
 pub use params::{Bandwidth, CodingRate, Config, SpreadingFactor};
 
@@ -166,8 +167,8 @@ where
 
     /// Receive a single LoRa packet, blocking until one arrives.
     ///
-    /// The payload is written into `buf` and the returned [`RxInfo`] reports its
-    /// length along with signal quality.
+    /// The payload is written into `buf` and the returned [`RxInfo`] reports
+    /// its length along with signal quality.
     pub fn receive(&mut self, buf: &mut [u8]) -> Result<RxInfo, Error<SPI::Error, PE>> {
         self.start_receive()?;
         self.wait_dio1(None)?;
@@ -200,7 +201,8 @@ where
     }
 
     /// Read the packet the radio has just signalled as complete, returning its
-    /// payload length and signal quality. Clears the irq so receive can continue.
+    /// payload length and signal quality. Clears the irq so receive can
+    /// continue.
     fn read_completed_packet(&mut self, buf: &mut [u8]) -> Result<RxInfo, Error<SPI::Error, PE>> {
         let irq = self.get_irq_status()?;
         self.clear_irq_status(cmd::IRQ_ALL)?;
@@ -225,8 +227,8 @@ where
         })
     }
 
-    /// Read the radio's status byte (`GetStatus`). Bits 6:4 encode the chip mode
-    /// and bits 3:1 the status of the last command.
+    /// Read the radio's status byte (`GetStatus`). Bits 6:4 encode the chip
+    /// mode and bits 3:1 the status of the last command.
     pub fn status(&mut self) -> Result<u8, Error<SPI::Error, PE>> {
         let mut resp = [0u8; 1];
         self.read_cmd(cmd::GET_STATUS, &mut resp)?;
@@ -402,8 +404,9 @@ where
 
     /// Block until the DIO1 line goes high (an enabled IRQ fired). The pin is
     /// polled rather than the IRQ register because BUSY is held high during a
-    /// transmit, which forbids SPI access. With `Some(iters)` give up after that
-    /// many polls; with `None` wait indefinitely (used for continuous receive).
+    /// transmit, which forbids SPI access. With `Some(iters)` give up after
+    /// that many polls; with `None` wait indefinitely (used for continuous
+    /// receive).
     fn wait_dio1(&mut self, max_iters: Option<u32>) -> Result<(), Error<SPI::Error, PE>> {
         let mut count = 0u32;
         loop {

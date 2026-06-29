@@ -1,37 +1,48 @@
 //! Transmit example: send an incrementing LoRa packet every ~3 seconds and show
 //! the status on the e-paper display.
 //!
-//! Flash with `cargo run --example tx` (requires the `esp` toolchain + espflash).
+//! Flash with `cargo run --example tx` (requires the `esp` toolchain +
+//! espflash).
 
 #![no_std]
 #![no_main]
 
 use core::fmt::Write as _;
 
-use embedded_graphics::draw_target::DrawTarget;
-use embedded_graphics::mono_font::MonoTextStyle;
-use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_10X20};
-use embedded_graphics::pixelcolor::BinaryColor;
-use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{Line, PrimitiveStyle};
-use embedded_graphics::text::Text;
+use embedded_graphics::{
+    draw_target::DrawTarget,
+    mono_font::{
+        MonoTextStyle,
+        ascii::{FONT_6X10, FONT_10X20},
+    },
+    pixelcolor::BinaryColor,
+    prelude::*,
+    primitives::{Line, PrimitiveStyle},
+    text::Text,
+};
 use embedded_hal::delay::DelayNs as _;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_backtrace as _;
-use esp_hal::delay::Delay;
-use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
-use esp_hal::main;
-use esp_hal::spi::Mode;
-use esp_hal::spi::master::{Config as SpiConfig, Spi};
-use esp_hal::time::Rate;
+use esp_hal::{
+    delay::Delay,
+    gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
+    main,
+    spi::{
+        Mode,
+        master::{Config as SpiConfig, Spi},
+    },
+    time::Rate,
+};
 use esp_println::println;
-
-use lilygo_t3s3_epaper::ssd1680::{Display, Rotation};
-use lilygo_t3s3_epaper::sx1262::{Config, Sx1262};
+use t3s3_epaper::{
+    ssd1680::{Display, Rotation},
+    sx1262::{Config, Sx1262},
+};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-/// do a clean full refresh every this many updates to clear partial-refresh ghosting.
+/// do a clean full refresh every this many updates to clear partial-refresh
+/// ghosting.
 const FULL_REFRESH_EVERY: u32 = 10;
 
 #[main]

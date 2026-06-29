@@ -11,3 +11,7 @@ target/
 
 # local secrets (wifi credentials etc.) — copy .env.example to .env
 .env
+
+# python tooling (crates/t3s3-epaper/tools/ble.py)
+__pycache__/
+*.pyc

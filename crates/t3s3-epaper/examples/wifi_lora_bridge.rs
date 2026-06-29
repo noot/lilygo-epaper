@@ -1,15 +1,17 @@
-//! Wi-Fi soft-AP to LoRa bridge: the board hosts an open Wi-Fi network and a tiny
-//! web page. Join the network from a phone, open `http://192.168.4.1/`, type a
+//! Wi-Fi soft-AP to LoRa bridge: the board hosts an open Wi-Fi network and a
+//! tiny web page. Join the network from a phone, open `http://192.168.4.1/`, type a
 //! message, hit send, and it goes out over LoRa (SX1262). Incoming LoRa packets
 //! are listed live on the same page (it polls `/rx`) and shown on the e-paper.
 //!
-//! esp-radio is the Wi-Fi driver; this example owns the network bring-up: it runs
-//! a soft access point, a minimal DHCP server (so the phone gets an address), a
-//! captive-portal DNS server (so the phone opens the page) and a small HTTP
-//! server, all driven through `smoltcp` in a blocking poll loop. Between web
-//! requests the radio sits in continuous receive and is polled without blocking.
+//! esp-radio is the Wi-Fi driver; this example owns the network bring-up: it
+//! runs a soft access point, a minimal DHCP server (so the phone gets an
+//! address), a captive-portal DNS server (so the phone opens the page) and a
+//! small HTTP server, all driven through `smoltcp` in a blocking poll loop.
+//! Between web requests the radio sits in continuous receive and is polled
+//! without blocking.
 //!
-//! Flash with `cargo run --example wifi_lora_bridge` (requires the `esp` toolchain + espflash).
+//! Flash with `cargo run --example wifi_lora_bridge` (requires the `esp`
+//! toolchain + espflash).
 
 #![no_std]
 #![no_main]
@@ -19,38 +21,53 @@ extern crate alloc;
 use alloc::vec;
 use core::fmt::Write as _;
 
-use embedded_graphics::draw_target::DrawTarget;
-use embedded_graphics::mono_font::MonoTextStyle;
-use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_10X20};
-use embedded_graphics::pixelcolor::BinaryColor;
-use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{Line, PrimitiveStyle};
-use embedded_graphics::text::Text;
+use embedded_graphics::{
+    draw_target::DrawTarget,
+    mono_font::{
+        MonoTextStyle,
+        ascii::{FONT_6X10, FONT_10X20},
+    },
+    pixelcolor::BinaryColor,
+    prelude::*,
+    primitives::{Line, PrimitiveStyle},
+    text::Text,
+};
 use embedded_hal::delay::DelayNs as _;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_backtrace as _;
-use esp_hal::clock::CpuClock;
-use esp_hal::delay::Delay;
-use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
-use esp_hal::interrupt::software::SoftwareInterruptControl;
-use esp_hal::main;
-use esp_hal::spi::Mode;
-use esp_hal::spi::master::{Config as SpiConfig, Spi};
-use esp_hal::time::{Instant as HalInstant, Rate};
-use esp_hal::timer::timg::TimerGroup;
-use esp_println::println;
-use esp_radio::wifi::ap::AccessPointConfig;
-use esp_radio::wifi::{
-    Config as WifiConfig, ControllerConfig, Interface, WifiRxToken, WifiTxToken,
+use esp_hal::{
+    clock::CpuClock,
+    delay::Delay,
+    gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
+    interrupt::software::SoftwareInterruptControl,
+    main,
+    spi::{
+        Mode,
+        master::{Config as SpiConfig, Spi},
+    },
+    time::{Instant as HalInstant, Rate},
+    timer::timg::TimerGroup,
 };
-use smoltcp::iface::{Config as IfaceConfig, Interface as NetInterface, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::{tcp, udp};
-use smoltcp::time::Instant as NetInstant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint};
-
-use lilygo_t3s3_epaper::ssd1680::{Display, Rotation};
-use lilygo_t3s3_epaper::sx1262::{Config as RadioConfig, Sx1262};
+use esp_println::println;
+use esp_radio::wifi::{
+    Config as WifiConfig,
+    ControllerConfig,
+    Interface,
+    WifiRxToken,
+    WifiTxToken,
+    ap::AccessPointConfig,
+};
+use t3s3_epaper::{
+    ssd1680::{Display, Rotation},
+    sx1262::{Config as RadioConfig, Sx1262},
+};
+use smoltcp::{
+    iface::{Config as IfaceConfig, Interface as NetInterface, SocketSet},
+    phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
+    socket::{tcp, udp},
+    time::Instant as NetInstant,
+    wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint},
+};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -60,11 +77,12 @@ const SSID: &str = "lora-tx";
 const GATEWAY: [u8; 4] = [192, 168, 4, 1];
 /// The single address leased to the connecting phone.
 const CLIENT_IP: [u8; 4] = [192, 168, 4, 2];
-/// esp-radio's default Wi-Fi MTU; advertised to smoltcp so it never hands the TX
-/// token a frame longer than the driver's internal buffer.
+/// esp-radio's default Wi-Fi MTU; advertised to smoltcp so it never hands the
+/// TX token a frame longer than the driver's internal buffer.
 const MTU: usize = 1492;
-/// Number of HTTP listener sockets — phones open several connections in parallel,
-/// and the page's /rx polling adds churn, so keep a few spare past TIME-WAIT.
+/// Number of HTTP listener sockets — phones open several connections in
+/// parallel, and the page's /rx polling adds churn, so keep a few spare past
+/// TIME-WAIT.
 const HTTP_SOCKETS: usize = 4;
 /// Longest LoRa payload we accept from the form or show from a received packet.
 const MSG_CAP: usize = 200;
@@ -340,11 +358,13 @@ enum Status<'a> {
 
 /// Which resource an HTTP request is asking for.
 enum Route {
-    /// `GET /send?msg=...` — the URL-decoded message length written into the buffer.
+    /// `GET /send?msg=...` — the URL-decoded message length written into the
+    /// buffer.
     Send(usize),
     /// `GET /rx` — the live received-packet list the page's script polls for.
     Rx,
-    /// anything else (including the captive-portal probes) — serve the full page.
+    /// anything else (including the captive-portal probes) — serve the full
+    /// page.
     Page,
 }
 
@@ -375,7 +395,8 @@ impl RxEntry {
 /// A small ring buffer of the most recently received packets.
 struct RxLog {
     entries: [RxEntry; RX_LOG_LEN],
-    /// total packets ever stored; also the next sequence number and write cursor.
+    /// total packets ever stored; also the next sequence number and write
+    /// cursor.
     total: u32,
 }
 
@@ -410,8 +431,8 @@ impl RxLog {
     }
 }
 
-/// Build the full HTTP page: the send form, a status line, and the received-packet
-/// list, with a small script that refreshes the list in place.
+/// Build the full HTTP page: the send form, a status line, and the
+/// received-packet list, with a small script that refreshes the list in place.
 fn write_page(out: &mut PageBuf, status: Status<'_>, rx_log: &RxLog) {
     let _ = out.write_str(
         "HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n\
@@ -445,7 +466,8 @@ fn write_page(out: &mut PageBuf, status: Status<'_>, rx_log: &RxLog) {
     );
 }
 
-/// The bare received-packet list, returned for `GET /rx` and embedded in the page.
+/// The bare received-packet list, returned for `GET /rx` and embedded in the
+/// page.
 fn write_rx_response(out: &mut PageBuf, rx_log: &RxLog) {
     let _ = out.write_str(
         "HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n",
@@ -501,8 +523,8 @@ fn parse_route(request: &[u8], out: &mut [u8]) -> Route {
     Route::Page
 }
 
-/// Decode an `application/x-www-form-urlencoded` value into `out`, returning its
-/// length (capped at `out.len()`).
+/// Decode an `application/x-www-form-urlencoded` value into `out`, returning
+/// its length (capped at `out.len()`).
 fn url_decode(input: &[u8], out: &mut [u8]) -> usize {
     let mut written = 0;
     let mut i = 0;
@@ -543,8 +565,9 @@ fn hex_value(c: u8) -> Option<u8> {
     }
 }
 
-/// Minimal DHCP server: answer a DISCOVER with an OFFER and a REQUEST with an ACK,
-/// always leasing [`CLIENT_IP`]. Enough for one phone to get on the network.
+/// Minimal DHCP server: answer a DISCOVER with an OFFER and a REQUEST with an
+/// ACK, always leasing [`CLIENT_IP`]. Enough for one phone to get on the
+/// network.
 fn serve_dhcp(socket: &mut udp::Socket) {
     let mut request = [0u8; 600];
     let len = match socket.recv_slice(&mut request) {
@@ -594,8 +617,9 @@ fn serve_dhcp(socket: &mut udp::Socket) {
 }
 
 /// Minimal captive-portal DNS server: answer every A query with [`GATEWAY`], so
-/// the phone's connectivity check resolves to us and hits the HTTP server. Other
-/// query types get an empty (no-error) answer so the client falls back to A.
+/// the phone's connectivity check resolves to us and hits the HTTP server.
+/// Other query types get an empty (no-error) answer so the client falls back to
+/// A.
 fn serve_dns(socket: &mut udp::Socket) {
     let mut query = [0u8; 512];
     let (len, meta) = match socket.recv_slice(&mut query) {
@@ -671,8 +695,8 @@ fn now() -> NetInstant {
     NetInstant::from_micros(HalInstant::now().duration_since_epoch().as_micros() as i64)
 }
 
-/// smoltcp [`Device`] over esp-radio's Wi-Fi [`Interface`]; the RX/TX tokens just
-/// forward to the driver's own buffer-borrowing tokens.
+/// smoltcp [`Device`] over esp-radio's Wi-Fi [`Interface`]; the RX/TX tokens
+/// just forward to the driver's own buffer-borrowing tokens.
 struct WifiStackDevice<'d> {
     iface: Interface<'d>,
 }
@@ -748,8 +772,8 @@ where
     let _ = Text::new(line3, Point::new(8, 84), body).draw(display);
 }
 
-/// a fixed-capacity buffer for building the HTTP response, with helpers to append
-/// HTML-escaped bytes from the (untrusted) submitted message.
+/// a fixed-capacity buffer for building the HTTP response, with helpers to
+/// append HTML-escaped bytes from the (untrusted) submitted message.
 struct PageBuf {
     buf: [u8; 4096],
     len: usize,
@@ -801,7 +825,8 @@ impl core::fmt::Write for PageBuf {
     }
 }
 
-/// a tiny fixed-capacity buffer that implements `core::fmt::Write` for display lines.
+/// a tiny fixed-capacity buffer that implements `core::fmt::Write` for display
+/// lines.
 struct FmtBuf {
     buf: [u8; 48],
     len: usize,

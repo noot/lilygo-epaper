@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/t5s3-epaper-core", "crates/t5s3-epaper-ui"]
+members = ["crates/t5s3-epaper-core", "crates/t5s3-epaper-ui", "crates/t3s3-epaper"]
 exclude = ["tools/wallpaper"]
 
 [workspace.package]
@@ -52,3 +52,15 @@ incremental = false
 lto = 'fat'
 opt-level = 's'
 overflow-checks = false
+
+# esp-hal strongly recommends building dependencies with optimizations even in dev.
+[profile.dev.package.esp-hal]
+opt-level = 3
+
+# esp-radio's docs require opt-level 2 or 3, otherwise the wifi driver misbehaves;
+# the esp-rtos scheduler is timing-sensitive too.
+[profile.dev.package.esp-radio]
+opt-level = 3
+
+[profile.dev.package.esp-rtos]
+opt-level = 3

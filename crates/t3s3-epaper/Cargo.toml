@@ -1,5 +1,5 @@
 [package]
-name = "lilygo-t3s3-epaper"
+name = "t3s3-epaper"
 version = "0.1.0"
 edition = "2024"
 
@@ -50,18 +50,3 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "socket-tcp",
     "socket-udp",
 ] }
-
-# esp-hal strongly recommends building dependencies with optimizations even in dev.
-[profile.dev.package.esp-hal]
-opt-level = 3
-
-# esp-radio's docs require opt-level 2 or 3, otherwise the wifi driver misbehaves;
-# the esp-rtos scheduler is timing-sensitive too.
-[profile.dev.package.esp-radio]
-opt-level = 3
-
-[profile.dev.package.esp-rtos]
-opt-level = 3
-
-[profile.dev]
-opt-level = "s"

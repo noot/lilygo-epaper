@@ -2,25 +2,29 @@
 //! LilyGO T3-S3 e-paper board (2.13", 122 x 250, black/white).
 //!
 //! The driver keeps a 1-bit framebuffer in RAM, implements `embedded-graphics`
-//! [`DrawTarget`] so text and shapes can be drawn into it, and flushes it to the
-//! panel with a full or partial (differential) refresh.
+//! [`DrawTarget`] so text and shapes can be drawn into it, and flushes it to
+//! the panel with a full or partial (differential) refresh.
 //!
-//! It talks to the controller over a write-only `embedded-hal` SPI device (which
-//! owns the CS line) plus three GPIOs: DC and RESET (outputs) and BUSY (input).
+//! It talks to the controller over a write-only `embedded-hal` SPI device
+//! (which owns the CS line) plus three GPIOs: DC and RESET (outputs) and BUSY
+//! (input).
 
 mod command;
 mod error;
 mod lut;
 
-use embedded_graphics_core::Pixel;
-use embedded_graphics_core::draw_target::DrawTarget;
-use embedded_graphics_core::geometry::{OriginDimensions, Size};
-use embedded_graphics_core::pixelcolor::BinaryColor;
-use embedded_hal::delay::DelayNs;
-use embedded_hal::digital::{InputPin, OutputPin};
-use embedded_hal::spi::SpiDevice;
-
 use command as cmd;
+use embedded_graphics_core::{
+    Pixel,
+    draw_target::DrawTarget,
+    geometry::{OriginDimensions, Size},
+    pixelcolor::BinaryColor,
+};
+use embedded_hal::{
+    delay::DelayNs,
+    digital::{InputPin, OutputPin},
+    spi::SpiDevice,
+};
 pub use error::Error;
 
 /// visible panel width in pixels (source axis).
@@ -32,7 +36,8 @@ const ROW_BYTES: usize = 16;
 /// full framebuffer size, 16 bytes/row x 250 rows.
 const FB_SIZE: usize = ROW_BYTES * PANEL_HEIGHT as usize;
 
-/// a full refresh can take well over five seconds; poll up to ~40 s as a safety net.
+/// a full refresh can take well over five seconds; poll up to ~40 s as a safety
+/// net.
 const BUSY_POLL_ITERS: u32 = 4_000;
 const BUSY_POLL_MS: u32 = 10;
 
@@ -129,8 +134,8 @@ where
     /// Flush the framebuffer with a partial (differential) refresh: faster and
     /// flicker-free, at the cost of some ghosting over many updates.
     ///
-    /// A full [`refresh`](Self::refresh) must have run at least once first so the
-    /// panel has a reference image to diff against.
+    /// A full [`refresh`](Self::refresh) must have run at least once first so
+    /// the panel has a reference image to diff against.
     pub fn refresh_partial(&mut self) -> Result<(), Error<SPI::Error, PE>> {
         self.cmd_data(cmd::WRITE_LUT, &lut::PARTIAL)?;
         self.write_ram(cmd::WRITE_RAM_BW)?;

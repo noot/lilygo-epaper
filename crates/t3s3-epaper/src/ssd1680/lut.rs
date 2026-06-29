@@ -1,7 +1,8 @@
 //! Partial-refresh waveform lookup table for the DEPG0213BN (SSD1680).
 //!
-//! 153 bytes, copied verbatim from GxEPD2's `GxEPD2_213_BN::lut_partial`. Loaded
-//! via the `WRITE_LUT` (0x32) command before a differential (partial) update.
+//! 153 bytes, copied verbatim from GxEPD2's `GxEPD2_213_BN::lut_partial`.
+//! Loaded via the `WRITE_LUT` (0x32) command before a differential (partial)
+//! update.
 
 pub(crate) const PARTIAL: [u8; 153] = [
     0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
