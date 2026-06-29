@@ -2,7 +2,6 @@
 name = "t5s3-epaper-core"
 description = "Simple driver for the LilyGo T5 S3 ePaper Pro family on ESP32-S3"
 version.workspace = true
-authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

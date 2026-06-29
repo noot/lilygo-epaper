@@ -7,8 +7,7 @@ exclude = ["tools/wallpaper"]
 version = "1.1.0"
 edition = "2021"
 license = "GPL-3.0"
-authors = ["Andrew Whaley <andrew@whaley.org.uk", "Frido Koch <info@fridokoch.de>"]
-repository = "https://github.com/azw413/lilygo-t5s3paperpro-rs"
+repository = "https://github.com/noot/t5s3-epaper"
 
 [workspace.dependencies]
 critical-section = "1.2.0"

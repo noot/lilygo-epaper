@@ -6,10 +6,7 @@
   <img src="_docs/photo-3.jpg" width="32%" />
 </p>
 
-Rust drivers and firmware for LilyGo ESP32-S3 e-paper boards. The headline target
-is the [LilyGo T5 E-Paper S3 Pro](https://lilygo.cc/products/t5-e-paper-s3-pro)
-(ED047TC1 4.7" panel); the workspace also vendors a driver and examples for the
-T3-S3 LoRa e-paper board.
+Rust drivers and firmware for LilyGo ESP32-S3 e-paper boards. Supports T5-S3 Pro and T3-S3 e-paper.
 
 ## crates
 
