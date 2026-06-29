@@ -11,6 +11,9 @@ bitflags = { version = "2.6", default-features = false }
 thiserror = { version = "2.0", default-features = false }
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 xmlparser = { version = "0.13", default-features = false }
+zune-core = { version = "0.5.1", default-features = false }
+zune-jpeg = { version = "0.5.15", default-features = false }
+zune-png = { version = "0.5.2", default-features = false }
 
 # isolate this crate from the embedded repo root so its tests build for the host
 # with a stable toolchain rather than the esp32 target the root .cargo/config

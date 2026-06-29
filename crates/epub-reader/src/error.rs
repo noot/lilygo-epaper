@@ -14,4 +14,6 @@ pub enum Error {
     Inflate { entry: String },
     #[error("zip entry not found: {0}")]
     MissingEntry(String),
+    #[error("image: {0}")]
+    Image(&'static str),
 }

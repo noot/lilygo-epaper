@@ -10,7 +10,17 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
-use epub_reader::{parse_markdown, parse_txt, Block, Document, Epub, Span, Style};
+use epub_reader::{
+    decode_image,
+    parse_markdown,
+    parse_txt,
+    Block,
+    Document,
+    Epub,
+    GrayImage,
+    Span,
+    Style,
+};
 use esp_hal::gpio::{Level, Output, OutputConfig};
 use t5s3_epaper_core::{
     sdcard::{Error, PinConfig},
@@ -41,10 +51,12 @@ struct Segment {
 }
 
 // a laid-out display line. heights drive pagination; `Blank` is the gap between
-// paragraphs and around headings.
+// paragraphs and around headings. `Image` is rendered alone on its own page, so
+// its height never participates in line packing.
 enum Line {
     Blank,
     Rule,
+    Image(String),
     Text(Vec<Segment>),
     Heading(Vec<Segment>),
 }
@@ -52,6 +64,7 @@ enum Line {
 impl Line {
     fn height(&self) -> i32 {
         match self {
+            Line::Image(_) => 0,
             Line::Blank => BLANK_H,
             _ => LINE_H,
         }
@@ -193,6 +206,7 @@ pub(crate) fn draw(display: &mut Display, doc: &ReaderDoc) {
     for line in &doc.lines[start..end] {
         match line {
             Line::Blank => {}
+            Line::Image(href) => render_image(display, &doc.source, href),
             Line::Rule => {
                 Rectangle::new(
                     Point::new(MARGIN_X, y - 8),
@@ -283,6 +297,74 @@ fn draw_segments(display: &mut Display, segments: &[Segment], baseline: i32, for
     }
 }
 
+// fetch, decode and draw an image filling the content area, or a placeholder if
+// it can't be read/decoded (missing, unsupported, or over the size budget).
+fn render_image(display: &mut Display, source: &Source, href: &str) {
+    let decoded = match source {
+        Source::Book(epub) => epub
+            .read_resource(href)
+            .ok()
+            .and_then(|bytes| decode_image(&bytes).ok()),
+        Source::Memory(_) => None,
+    };
+    match decoded {
+        Some(image) => draw_image(display, &image),
+        None => {
+            Text::with_alignment(
+                "[image unavailable]",
+                Point::new(SCREEN_W / 2, (CONTENT_TOP + CONTENT_BOTTOM) / 2),
+                MonoTextStyle::new(&FONT_9X15, Gray4::new(6)),
+                Alignment::Center,
+            )
+            .draw(display)
+            .ok();
+        }
+    }
+}
+
+// scale an image to fit the content box (preserving aspect), nearest-neighbour
+// sampled and ordered-dithered to the panel's 16 gray levels, centered.
+fn draw_image(display: &mut Display, image: &GrayImage) {
+    let box_w = (SCREEN_W - 2 * MARGIN_X) as u32;
+    let box_h = (CONTENT_BOTTOM - CONTENT_TOP) as u32;
+    let src_w = u32::from(image.width()).max(1);
+    let src_h = u32::from(image.height()).max(1);
+
+    let (dst_w, dst_h) = if box_w * src_h <= box_h * src_w {
+        (box_w, (box_w * src_h / src_w).max(1))
+    } else {
+        ((box_h * src_w / src_h).max(1), box_h)
+    };
+
+    let off_x = MARGIN_X + ((box_w - dst_w) / 2) as i32;
+    let off_y = CONTENT_TOP + ((box_h - dst_h) / 2) as i32;
+    let area = Rectangle::new(Point::new(off_x, off_y), Size::new(dst_w, dst_h));
+
+    let colors = (0..dst_h).flat_map(move |dy| {
+        (0..dst_w).map(move |dx| {
+            let sx = (dx * src_w / dst_w) as u16;
+            let sy = (dy * src_h / dst_h) as u16;
+            Gray4::new(dither(image.sample(sx, sy), dx, dy))
+        })
+    });
+    display.fill_contiguous(&area, colors).ok();
+}
+
+// 4x4 ordered (Bayer) dithering of an 8-bit luma value to a 0..=15 gray level.
+fn dither(luma: u8, x: u32, y: u32) -> u8 {
+    const BAYER: [[u32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+    let scaled = u32::from(luma) * 15;
+    let base = scaled / 255;
+    let frac = scaled % 255;
+    let threshold = BAYER[(y & 3) as usize][(x & 3) as usize];
+    let level = if frac * 16 / 255 > threshold {
+        base + 1
+    } else {
+        base
+    };
+    level.min(15) as u8
+}
+
 // lay out a single chapter's blocks into display lines. parsing the chapter
 // from an epub happens here, on demand, so only one chapter is resident.
 fn layout_chapter(source: &Source, chapter: usize) -> Vec<Line> {
@@ -322,12 +404,7 @@ fn layout_blocks(blocks: &[Block]) -> Vec<Line> {
                 lines.push(Line::Blank);
             }
             Block::Rule => lines.push(Line::Rule),
-            Block::Image { href } => {
-                lines.push(Line::Text(vec![Segment {
-                    text: format!("[image: {href}]"),
-                    bold: false,
-                }]));
-            }
+            Block::Image { href } => lines.push(Line::Image(href.clone())),
         }
     }
     lines
@@ -337,6 +414,18 @@ fn paginate(lines: &[Line]) -> Vec<usize> {
     let mut starts = vec![0];
     let mut height = 0;
     for (i, line) in lines.iter().enumerate() {
+        // an image takes its own page: close the current page (if any) at it and
+        // start a fresh page for whatever follows.
+        if matches!(line, Line::Image(_)) {
+            if height > 0 {
+                starts.push(i);
+            }
+            if i + 1 < lines.len() {
+                starts.push(i + 1);
+            }
+            height = 0;
+            continue;
+        }
         let line_h = line.height();
         if height > 0 && height + line_h > CONTENT_H {
             starts.push(i);

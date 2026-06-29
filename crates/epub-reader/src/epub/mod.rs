@@ -6,7 +6,7 @@ mod zip;
 use alloc::{format, string::String, vec::Vec};
 
 use crate::{
-    document::{Chapter, Document, Meta},
+    document::{Block, Chapter, Document, Meta},
     error::Error,
 };
 
@@ -65,8 +65,25 @@ impl Epub {
             .get(index)
             .ok_or_else(|| Error::MissingEntry(format!("spine item {index}")))?;
         let archive = zip::Archive::open(&self.bytes)?;
-        let blocks = xhtml::parse(&archive.read(href)?)?;
+        let mut blocks = xhtml::parse(&archive.read(href)?)?;
+        // image src attributes are relative to the chapter file; rewrite them to
+        // full archive paths so the caller can fetch them via `read_resource`.
+        let base = dir_of(href);
+        for block in &mut blocks {
+            if let Block::Image { href } = block {
+                *href = resolve(base, href);
+            }
+        }
         Ok(Chapter::new(None, blocks))
+    }
+
+    /// Read a raw archive entry (e.g. an image) by its full path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the archive is invalid or the entry is missing.
+    pub fn read_resource(&self, path: &str) -> Result<Vec<u8>, Error> {
+        zip::Archive::open(&self.bytes)?.read(path)
     }
 }
 
