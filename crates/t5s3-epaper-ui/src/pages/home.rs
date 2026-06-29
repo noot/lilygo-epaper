@@ -203,7 +203,7 @@ fn draw_glyph(display: &mut Display, screen: Screen, cx: i32, cy: i32) {
             .draw(display)
             .ok();
         }
-        Screen::Home | Screen::Image => {}
+        Screen::Home | Screen::Image | Screen::Reader => {}
     }
 }
 

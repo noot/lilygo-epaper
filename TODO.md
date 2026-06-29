@@ -41,6 +41,7 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 ## other
 - [ ] turn ui into its own library; have a UiBuilder with pluggable components
 - [x] page icons for ui homepage
+- [ ] user settings stored on sd card
 - [ ] customizable fonts/font size
 - [ ] customizable timezone
 - [ ] pull now playing from music server (see waveshare-epaper repo)

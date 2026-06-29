@@ -6,6 +6,7 @@ use embedded_sdmmc::{
     LfnBuffer,
     Mode,
     SdCardError,
+    ShortFileName,
     TimeSource,
     Timestamp,
     VolumeIdx,
@@ -200,8 +201,13 @@ impl<'d> SdCard<'d> {
         let volume = self.open_volume0()?;
         let mut dir = volume.open_root_dir().map_err(Error::Filesystem)?;
         change_dir_all(&mut dir, &parent_components).map_err(Error::Filesystem)?;
+        // open by the on-disk short name resolved from the directory listing.
+        // passing the long name straight to `open_file_in_dir` would try to
+        // parse it as an 8.3 name and fail for long names or >3-char extensions
+        // (e.g. `.epub`).
+        let short = resolve_short_name(&dir, name).map_err(Error::Filesystem)?;
         let file = dir
-            .open_file_in_dir(name, Mode::ReadOnly)
+            .open_file_in_dir(short, Mode::ReadOnly)
             .map_err(Error::Filesystem)?;
         let mut data = Vec::new();
 
@@ -396,6 +402,37 @@ where
         dir.change_dir(*segment)?;
     }
     Ok(())
+}
+
+// resolve a (possibly long) file name within a directory to its on-disk 8.3
+// short name by scanning the directory's entries. matches the long name when
+// present, otherwise the short name, both case-insensitively.
+fn resolve_short_name<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    dir: &embedded_sdmmc::Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    name: &str,
+) -> core::result::Result<ShortFileName, embedded_sdmmc::Error<D::Error>>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut lfn_storage = [0u8; 260];
+    let mut lfn_buffer = LfnBuffer::new(&mut lfn_storage);
+    let mut found: Option<ShortFileName> = None;
+    dir.iterate_dir_lfn(&mut lfn_buffer, |entry, long_name| {
+        if found.is_none()
+            && (long_name.is_some_and(|long| long.eq_ignore_ascii_case(name))
+                || format!("{}", entry.name).eq_ignore_ascii_case(name))
+        {
+            found = Some(entry.name.clone());
+        }
+    })?;
+    found.ok_or(embedded_sdmmc::Error::NotFound)
 }
 
 fn split_parent_name<'a>(components: &'a [&'a str]) -> Result<(Vec<&'a str>, &'a str)> {

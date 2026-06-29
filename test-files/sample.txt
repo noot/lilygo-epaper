@@ -1,0 +1,15 @@
+The Open Road
+
+There is a particular kind of quiet that belongs only to electronic paper. Unlike a glowing screen, it does not hum or flicker or insist on your attention. It simply holds an image, the way a printed page holds ink, and waits. You can set the device down on a table, walk to the other side of the room, and the words remain exactly where you left them, drawing no current at all.
+
+This sample file exists to exercise the reader. It contains several paragraphs of ordinary prose, separated by blank lines, so that the layout engine has something to wrap, paginate, and turn. If you are looking at it on the panel right now, then the path from a file on the SD card, through the parser, through the line-breaker, and onto the display is working end to end.
+
+Word wrapping is the unglamorous heart of any reader. Each line is filled greedily, one word at a time, until the next word would overflow the column, at which point the line is committed and a new one begun. Because the font is monospaced, every character is exactly nine pixels wide, which makes the arithmetic pleasantly exact: the column width divided by the glyph width is the number of characters that fit, with no guessing and no measurement passes.
+
+Occasionally a single token is simply too long to fit on any line. Consider a link such as https://example.com/a/very/long/path/that/keeps/going/and/going/and/refuses/to/break/on/its/own which has no spaces at all. A naive wrapper would either overflow the margin or give up. This one hard-splits the token across as many lines as it needs, so the text never spills past the edge of the page.
+
+Pagination follows naturally once the lines exist. The engine walks down the list of wrapped lines, adding up their heights, and starts a fresh page whenever the next line would cross the bottom margin. Tapping the right side of the screen advances; tapping the left side goes back. Your place is remembered on the card, so closing the book and opening it again returns you to the same page.
+
+The point of all this machinery is to disappear. When it works, you forget that there is a parser or a line-breaker or a pagination loop at all. There is only the text, sitting still on the glass, waiting patiently for you to decide when to turn the page.
+
+So turn it. There should be more than one page here, and the only way to be sure the page-turning works is to try it. Tap the right edge and watch the words advance.

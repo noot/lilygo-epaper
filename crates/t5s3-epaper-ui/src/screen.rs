@@ -8,6 +8,7 @@ pub(crate) enum Screen {
     Info,
     Files,
     Image,
+    Reader,
 }
 
 impl Screen {
@@ -21,6 +22,7 @@ impl Screen {
             Screen::Info => 5,
             Screen::Files => 6,
             Screen::Image => 7,
+            Screen::Reader => 8,
         }
     }
 

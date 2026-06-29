@@ -1,0 +1,22 @@
+[package]
+name = "epub-reader"
+description = "no_std parser turning EPUB/TXT/Markdown bytes into a renderable document model"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+repository = "https://github.com/azw413/lilygo-t5s3paperpro-rs"
+
+[dependencies]
+bitflags = { version = "2.6", default-features = false }
+thiserror = { version = "2.0", default-features = false }
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+xmlparser = { version = "0.13", default-features = false }
+zune-core = { version = "0.5.1", default-features = false }
+zune-jpeg = { version = "0.5.15", default-features = false }
+zune-png = { version = "0.5.2", default-features = false }
+
+# isolate this crate from the embedded repo root so its tests build for the host
+# with a stable toolchain rather than the esp32 target the root .cargo/config
+# forces on everything beneath it. consumed by the firmware as a no_std path
+# dependency; built standalone for host unit tests.
+[workspace]
