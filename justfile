@@ -10,7 +10,7 @@ clock:
 ui:
     # re-touch so the env-baked credentials pick up any .env changes
     touch crates/t5s3-epaper-ui/src/main.rs
-    SSID="$SSID" PASSWORD="$PASSWORD" TZ_OFFSET_HOURS="$TZ_OFFSET_HOURS" cargo run -p t5s3-epaper-ui --features gps
+    SSID="$SSID" PASSWORD="$PASSWORD" TZ_OFFSET_HOURS="$TZ_OFFSET_HOURS" SERVER_HOST="$SERVER_HOST" SERVER_PORT="$SERVER_PORT" SENSOR_ID="$SENSOR_ID" cargo run -p t5s3-epaper-ui --features gps
 
 # flash the ble ⇄ lora bridge example (faster scheduler tick so the radio thread can service advertising)
 ble:

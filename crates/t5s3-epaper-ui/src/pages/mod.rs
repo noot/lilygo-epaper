@@ -1,3 +1,4 @@
+pub(crate) mod environment;
 pub(crate) mod files;
 pub(crate) mod frontlight;
 #[cfg(feature = "gps")]
@@ -5,6 +6,7 @@ pub(crate) mod gps;
 pub(crate) mod home;
 pub(crate) mod info;
 pub(crate) mod lora;
+pub(crate) mod music;
 pub(crate) mod reader;
 pub(crate) mod settings;
 pub(crate) mod sleep;

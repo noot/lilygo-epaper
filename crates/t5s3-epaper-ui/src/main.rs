@@ -58,6 +58,7 @@ use crate::{
     datetime::{status_date, status_time},
     layout::{touch_to_screen, SCREEN_W},
     pages::{
+        environment,
         files::{
             display_row_count,
             draw_file_list,
@@ -110,6 +111,7 @@ use crate::{
             RECV_Y,
             SENT_Y,
         },
+        music,
         reader::{draw as draw_reader, is_reader, load_document, tap_zone, ReaderDoc, Tap},
         settings::{
             draw_settings_screen,
@@ -148,7 +150,7 @@ use crate::{
         draw_statusbar_time,
         statusbar_time_rect,
     },
-    wifi::{set_utc_time, sync_time, RESYNC_INTERVAL_SECS},
+    wifi::{http_get, set_utc_time, sync_time, RESYNC_INTERVAL_SECS},
 };
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -334,6 +336,14 @@ async fn main(_spawner: Spawner) -> ! {
     // why the open failed, shown on the reader screen when `reader_doc` is None.
     let mut reader_status = String::new();
 
+    // music / environment page state: the last fetched view and a flag that a
+    // fresh fetch from noot-server is needed on the next pass (set on entry and
+    // on tap-to-refresh, mirrors `files_dirty`).
+    let mut music_view = music::View::Loading;
+    let mut music_dirty = false;
+    let mut env_view = environment::View::Loading;
+    let mut env_dirty = false;
+
     #[cfg(feature = "gps")]
     let mut gps_refresh: u16 = 0;
     // last good position, kept so a dropped fix shows the previous coordinates
@@ -459,6 +469,8 @@ async fn main(_spawner: Spawner) -> ! {
                     }
                 }
                 Screen::Settings => draw_settings_screen(&mut display, &settings),
+                Screen::Music => music::draw_screen(&mut display, &music_view),
+                Screen::Environment => environment::draw_screen(&mut display, &env_view),
             }
             display.flush(DrawMode::BlackOnWhite).expect("to flush");
             needs_redraw = false;
@@ -556,11 +568,24 @@ async fn main(_spawner: Spawner) -> ! {
                             // the file browser draws only after its listing is
                             // loaded (below), so it sets `files_dirty` instead of
                             // redrawing now with an empty list.
-                            if current_screen == Screen::Files {
-                                files_path = String::from("/");
-                                files_dirty = true;
-                            } else {
-                                needs_redraw = true;
+                            match current_screen {
+                                Screen::Files => {
+                                    files_path = String::from("/");
+                                    files_dirty = true;
+                                }
+                                // the server pages paint a "loading" view now,
+                                // then fetch over wifi on the next pass.
+                                Screen::Music => {
+                                    music_view = music::View::Loading;
+                                    music_dirty = true;
+                                    needs_redraw = true;
+                                }
+                                Screen::Environment => {
+                                    env_view = environment::View::Loading;
+                                    env_dirty = true;
+                                    needs_redraw = true;
+                                }
+                                _ => needs_redraw = true,
                             }
                         }
                     }
@@ -806,6 +831,28 @@ async fn main(_spawner: Spawner) -> ! {
                         }
                         None => {}
                     },
+                    Screen::Music => {
+                        if back_button_hit(sx, sy) {
+                            current_screen = Screen::Home;
+                            needs_redraw = true;
+                        } else {
+                            // a tap anywhere else re-fetches the now-playing data.
+                            music_view = music::View::Loading;
+                            music_dirty = true;
+                            needs_redraw = true;
+                        }
+                    }
+                    Screen::Environment => {
+                        if back_button_hit(sx, sy) {
+                            current_screen = Screen::Home;
+                            needs_redraw = true;
+                        } else {
+                            // a tap anywhere else re-fetches the latest reading.
+                            env_view = environment::View::Loading;
+                            env_dirty = true;
+                            needs_redraw = true;
+                        }
+                    }
                     _ => {
                         if back_button_hit(sx, sy) {
                             current_screen = Screen::Home;
@@ -855,6 +902,35 @@ async fn main(_spawner: Spawner) -> ! {
                     reader_status = msg;
                 }
             }
+            needs_redraw = true;
+        }
+
+        // fetch the now-playing data from noot-server when the music page is
+        // opened or refreshed. the `!needs_redraw` guard lets the "loading" view
+        // paint first, since the wifi bring-up below blocks the loop for several
+        // seconds. (steal WIFI: the previous controller was dropped, so the
+        // peripheral is free to re-init; the radio powers down when http_get
+        // returns.)
+        if current_screen == Screen::Music && music_dirty && !needs_redraw {
+            music_dirty = false;
+            let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
+            let mut buf = [0u8; 1024];
+            music_view = match http_get(wifi, music::PATH, &mut buf).await {
+                Some(n) => music::parse(&buf[..n]),
+                None => music::View::Error,
+            };
+            needs_redraw = true;
+        }
+
+        if current_screen == Screen::Environment && env_dirty && !needs_redraw {
+            env_dirty = false;
+            let path = environment::path();
+            let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
+            let mut buf = [0u8; 512];
+            env_view = match http_get(wifi, path.as_str(), &mut buf).await {
+                Some(n) => environment::parse(&buf[..n]),
+                None => environment::View::Error,
+            };
             needs_redraw = true;
         }
 

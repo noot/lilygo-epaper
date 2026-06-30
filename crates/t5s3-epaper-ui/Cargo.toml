@@ -23,15 +23,19 @@ embedded-storage = { workspace = true }
 esp-radio = { workspace = true }
 esp-rtos = { workspace = true }
 embassy-executor = { workspace = true }
-embassy-net = { workspace = true }
+embassy-net = { workspace = true, features = ["tcp"] }
 embassy-time = { workspace = true }
 embassy-futures = { workspace = true }
 embedded-graphics = { workspace = true }
 embedded-graphics-core = { workspace = true }
+embedded-io-async = { workspace = true }
 u8g2-fonts = { workspace = true }
 esp-backtrace = { workspace = true }
 esp-println = { workspace = true }
 tinybmp = { workspace = true }
+serde = { workspace = true }
+serde-json-core = { workspace = true }
+heapless = { workspace = true }
 nmea = { workspace = true, optional = true }
 
 [features]
