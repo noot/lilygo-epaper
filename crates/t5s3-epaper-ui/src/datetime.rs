@@ -43,6 +43,14 @@ pub(crate) fn status_time(clock: &mut Clock, offset_hours: i8) -> Option<(u32, u
     Some((sod / 3600, (sod % 3600) / 60))
 }
 
+// return (hours, minutes, seconds) of local time, or None before the first NTP
+// sync.
+pub(crate) fn status_time_secs(clock: &mut Clock, offset_hours: i8) -> Option<(u32, u32, u32)> {
+    let local = local_secs(clock, offset_hours)?;
+    let sod = (local % 86_400) as u32;
+    Some((sod / 3600, (sod % 3600) / 60, sod % 60))
+}
+
 // return (day-of-week, year, month, day) of local time, or None before the
 // first NTP sync.
 pub(crate) fn status_date(clock: &mut Clock, offset_hours: i8) -> Option<(usize, i64, u32, u32)> {

@@ -55,7 +55,7 @@ use crate::pages::gps::{
     GPS_REFRESH_TICKS,
 };
 use crate::{
-    datetime::{status_date, status_time},
+    datetime::{status_date, status_time, status_time_secs},
     layout::{touch_to_screen, SCREEN_W},
     pages::{
         environment,
@@ -165,6 +165,23 @@ static mut LAST_SCREEN: u8 = 0;
 // first sync of this power cycle.
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 pub(crate) static mut LAST_SYNC_UNIX: u64 = 0;
+
+// a "[hh:mm:ss] " local-time prefix for a lora log entry, honoring the 12/24h
+// setting. empty before the first clock sync, when there is no wall-clock time.
+fn lora_stamp(clock: &mut Clock, settings: &Settings) -> String {
+    match status_time_secs(clock, settings.tz_offset_hours) {
+        Some((h, m, s)) if settings.time_24h => format!("[{h:02}:{m:02}:{s:02}] "),
+        Some((h, m, s)) => {
+            let suffix = if h < 12 { "am" } else { "pm" };
+            let h12 = match h % 12 {
+                0 => 12,
+                other => other,
+            };
+            format!("[{h12}:{m:02}:{s:02}{suffix}] ")
+        }
+        None => String::new(),
+    }
+}
 
 // after a timezone or time-format change, repaint the status-bar clock so the
 // shown time reflects the new setting immediately; returns the minute now shown
@@ -698,7 +715,10 @@ async fn main(_spawner: Spawner) -> ! {
                                                 esp_println::println!("lora tx: {lora_message}");
                                                 lora_status =
                                                     format!("sent {} bytes", lora_message.len());
-                                                lora_sent.push(lora_message.clone());
+                                                lora_sent.push(format!(
+                                                    "{}{lora_message}",
+                                                    lora_stamp(&mut clock, &settings)
+                                                ));
                                                 if lora_sent.len() > LIST_MAX {
                                                     lora_sent.remove(0);
                                                 }
@@ -1077,7 +1097,8 @@ async fn main(_spawner: Spawner) -> ! {
                     let rssi = r.rssi();
                     let text = core::str::from_utf8(&rx[..n]).unwrap_or("<binary>");
                     esp_println::println!("lora rx: {text} ({rssi} dBm)");
-                    lora_recv.push(String::from(text));
+                    // stamp each entry with its local receive time.
+                    lora_recv.push(format!("{}{text}", lora_stamp(&mut clock, &settings)));
                     if lora_recv.len() > LIST_MAX {
                         lora_recv.remove(0);
                     }
