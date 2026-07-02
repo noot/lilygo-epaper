@@ -193,7 +193,10 @@ pub(crate) fn draw_power_off_screen(display: &mut Display, pct: u16) {
 pub(crate) fn show_wallpaper<'d>(
     display: &mut Display,
     spi: esp_hal::peripherals::SPI2<'d>,
-    pins: t5s3_epaper_core::sdcard::PinConfig<'d>,
+    sclk: esp_hal::peripherals::GPIO14<'d>,
+    mosi: esp_hal::peripherals::GPIO13<'d>,
+    miso: esp_hal::peripherals::GPIO21<'d>,
+    cs: esp_hal::peripherals::GPIO12<'d>,
     lora_cs: esp_hal::peripherals::GPIO46<'d>,
 ) -> bool {
     // the SD card shares the SPI bus (sclk/mosi/miso) with the LoRa SX1262
@@ -202,7 +205,14 @@ pub(crate) fn show_wallpaper<'d>(
     // duration of the SD access below.
     let _lora_cs = Output::new(lora_cs, Level::High, OutputConfig::default());
 
-    let sdcard = match SdCard::new(pins, spi) {
+    let bus = match t5s3_epaper_core::sdcard::shared_bus(spi, sclk, mosi, miso) {
+        Ok(bus) => bus,
+        Err(e) => {
+            esp_println::println!("wallpaper: bus init failed: {e:?}");
+            return false;
+        }
+    };
+    let sdcard = match SdCard::new(cs, &bus) {
         Ok(sdcard) => sdcard,
         Err(e) => {
             esp_println::println!("wallpaper: sd init failed: {e:?}");

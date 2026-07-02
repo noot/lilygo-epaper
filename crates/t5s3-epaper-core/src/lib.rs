@@ -97,6 +97,7 @@
 
 extern crate alloc;
 
+mod bus;
 pub mod display;
 pub mod frontlight;
 pub mod input;
@@ -215,19 +216,6 @@ macro_rules! pin_config {
             touch_int: $name.GPIO3,
             touch_rst: $name.GPIO9,
             boot_btn: $name.GPIO0,
-        }
-    }};
-}
-
-/// Convenience macro to build the SD card pin config struct.
-#[macro_export]
-macro_rules! sdcard_pin_config {
-    ($name:expr) => {{
-        t5s3_epaper_core::sdcard::PinConfig {
-            miso: $name.GPIO21,
-            mosi: $name.GPIO13,
-            sclk: $name.GPIO14,
-            cs: $name.GPIO12,
         }
     }};
 }

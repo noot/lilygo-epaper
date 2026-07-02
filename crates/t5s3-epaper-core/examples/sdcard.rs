@@ -11,7 +11,7 @@ use embedded_graphics::prelude::*;
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use esp_backtrace as _;
 use esp_hal::{delay::Delay, main};
-use t5s3_epaper_core::{pin_config, sdcard_pin_config, Display, DrawMode, SdCard};
+use t5s3_epaper_core::{pin_config, Display, DrawMode, SdCard};
 use u8g2_fonts::FontRenderer;
 
 static FONT: FontRenderer = FontRenderer::new::<u8g2_fonts::fonts::u8g2_font_spleen16x32_mr>();
@@ -42,8 +42,14 @@ fn main() -> ! {
     )
     .expect("to initialize display");
 
-    let sdcard = SdCard::new(sdcard_pin_config!(peripherals), peripherals.SPI2)
-        .expect("to initialize sd card");
+    let bus = t5s3_epaper_core::sdcard::shared_bus(
+        peripherals.SPI2,
+        peripherals.GPIO14,
+        peripherals.GPIO13,
+        peripherals.GPIO21,
+    )
+    .expect("to build sd bus");
+    let sdcard = SdCard::new(peripherals.GPIO12, &bus).expect("to initialize sd card");
     let card_size = sdcard.card_size_bytes();
 
     sdcard

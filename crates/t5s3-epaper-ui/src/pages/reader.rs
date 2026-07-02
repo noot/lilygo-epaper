@@ -1,4 +1,5 @@
 use alloc::{format, string::String, vec, vec::Vec};
+use core::cell::RefCell;
 
 use embedded_graphics::{
     mono_font::{ascii::FONT_9X15, MonoTextStyle},
@@ -8,12 +9,12 @@ use embedded_graphics::{
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use epub_reader::{decode_image, parse_markdown, parse_txt, Block, Document, Epub, Span, Style};
-use esp_hal::gpio::{Level, Output, OutputConfig};
-use t5s3_epaper_core::{
-    sdcard::{Error, PinConfig},
-    Display,
-    SdCard,
+use esp_hal::{
+    gpio::{Level, Output, OutputConfig},
+    spi::master::Spi,
+    Blocking,
 };
+use t5s3_epaper_core::{sdcard::Error, Display, SdCard};
 use u8g2_fonts::{
     fonts,
     types::{FontColor, VerticalPosition},
@@ -262,7 +263,10 @@ impl ReaderDoc {
     // persist the current chapter/page to the book's progress file, keyed by
     // content hash so it survives the file being moved or renamed.
     pub(crate) fn save(&self) {
-        let Ok((_lora_cs, card)) = mount() else {
+        let Ok(bus) = sd_bus() else {
+            return;
+        };
+        let Ok((_lora_cs, card)) = mount(&bus) else {
             return;
         };
         card.create_dir_all(PROGRESS_DIR).ok();
@@ -292,7 +296,8 @@ pub(crate) fn is_reader(name: &str) -> bool {
 // the card the same self-contained way as the file browser. returns a short
 // human-readable message on failure so the caller can show why it failed.
 pub(crate) fn load_document(path: &str, style: ReaderStyle) -> Result<ReaderDoc, String> {
-    let (_lora_cs, card) = mount().map_err(|e| format!("SD init failed: {e:?}"))?;
+    let bus = sd_bus().map_err(|e| format!("SD init failed: {e:?}"))?;
+    let (_lora_cs, card) = mount(&bus).map_err(|e| format!("SD init failed: {e:?}"))?;
     let bytes = card
         .read_file(path)
         .map_err(|e| format!("read failed: {e:?}"))?;
@@ -694,22 +699,28 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-// mount the SD card, mirroring the file browser: steal the shared SPI2 pins and
-// hold the LoRa chip-select high to release MISO. the returned guard must stay
-// alive for the duration of card access.
-fn mount() -> Result<(Output<'static>, SdCard<'static>), Error> {
+// build the shared spi bus for card access. kept as a local by the caller so it
+// outlives the SdCard borrowed from it.
+fn sd_bus() -> Result<RefCell<Spi<'static, Blocking>>, Error> {
+    t5s3_epaper_core::sdcard::shared_bus(
+        unsafe { esp_hal::peripherals::SPI2::steal() },
+        unsafe { esp_hal::peripherals::GPIO14::steal() },
+        unsafe { esp_hal::peripherals::GPIO13::steal() },
+        unsafe { esp_hal::peripherals::GPIO21::steal() },
+    )
+}
+
+// mount the SD card on `bus`, mirroring the file browser: hold the LoRa
+// chip-select high to release MISO for the duration. the returned guard and
+// card must not outlive `bus`.
+fn mount<'a>(
+    bus: &'a RefCell<Spi<'static, Blocking>>,
+) -> Result<(Output<'static>, SdCard<'a, 'static>), Error> {
     let lora_cs = Output::new(
         unsafe { esp_hal::peripherals::GPIO46::steal() },
         Level::High,
         OutputConfig::default(),
     );
-    let pins = PinConfig {
-        miso: unsafe { esp_hal::peripherals::GPIO21::steal() },
-        mosi: unsafe { esp_hal::peripherals::GPIO13::steal() },
-        sclk: unsafe { esp_hal::peripherals::GPIO14::steal() },
-        cs: unsafe { esp_hal::peripherals::GPIO12::steal() },
-    };
-    let spi = unsafe { esp_hal::peripherals::SPI2::steal() };
-    let card = SdCard::new(pins, spi)?;
+    let card = SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, bus)?;
     Ok((lora_cs, card))
 }

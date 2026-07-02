@@ -13,7 +13,7 @@ use embedded_graphics::{
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use esp_hal::gpio::{Level, Output, OutputConfig};
 use t5s3_epaper_core::{
-    sdcard::{DirectoryEntry, Error, PinConfig},
+    sdcard::{DirectoryEntry, Error},
     Display,
     SdCard,
 };
@@ -55,14 +55,13 @@ pub(crate) fn load_dir(path: &str) -> Result<Vec<DirectoryEntry>, Error> {
         Level::High,
         OutputConfig::default(),
     );
-    let pins = PinConfig {
-        miso: unsafe { esp_hal::peripherals::GPIO21::steal() },
-        mosi: unsafe { esp_hal::peripherals::GPIO13::steal() },
-        sclk: unsafe { esp_hal::peripherals::GPIO14::steal() },
-        cs: unsafe { esp_hal::peripherals::GPIO12::steal() },
-    };
-    let spi = unsafe { esp_hal::peripherals::SPI2::steal() };
-    let card = SdCard::new(pins, spi)?;
+    let bus = t5s3_epaper_core::sdcard::shared_bus(
+        unsafe { esp_hal::peripherals::SPI2::steal() },
+        unsafe { esp_hal::peripherals::GPIO14::steal() },
+        unsafe { esp_hal::peripherals::GPIO13::steal() },
+        unsafe { esp_hal::peripherals::GPIO21::steal() },
+    )?;
+    let card = SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus)?;
     let mut entries = card.list_dir(path)?;
     entries.sort_by(|a, b| {
         b.is_directory
@@ -87,14 +86,19 @@ pub(crate) fn view_image(display: &mut Display, path: &str) -> bool {
         Level::High,
         OutputConfig::default(),
     );
-    let pins = PinConfig {
-        miso: unsafe { esp_hal::peripherals::GPIO21::steal() },
-        mosi: unsafe { esp_hal::peripherals::GPIO13::steal() },
-        sclk: unsafe { esp_hal::peripherals::GPIO14::steal() },
-        cs: unsafe { esp_hal::peripherals::GPIO12::steal() },
+    let bus = match t5s3_epaper_core::sdcard::shared_bus(
+        unsafe { esp_hal::peripherals::SPI2::steal() },
+        unsafe { esp_hal::peripherals::GPIO14::steal() },
+        unsafe { esp_hal::peripherals::GPIO13::steal() },
+        unsafe { esp_hal::peripherals::GPIO21::steal() },
+    ) {
+        Ok(bus) => bus,
+        Err(e) => {
+            esp_println::println!("files: view bus init failed: {e:?}");
+            return false;
+        }
     };
-    let spi = unsafe { esp_hal::peripherals::SPI2::steal() };
-    let card = match SdCard::new(pins, spi) {
+    let card = match SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus) {
         Ok(card) => card,
         Err(e) => {
             esp_println::println!("files: view sd init failed: {e:?}");

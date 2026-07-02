@@ -1,6 +1,6 @@
 use alloc::{format, string::String, vec::Vec};
+use core::cell::RefCell;
 
-use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_sdmmc::{
     DirEntry,
     LfnBuffer,
@@ -24,11 +24,10 @@ use esp_hal::{
     Blocking,
 };
 
-type SpiBusType<'d> = Spi<'d, Blocking>;
-type CsPin<'d> = Output<'d>;
-type SpiDevice<'d> = ExclusiveDevice<SpiBusType<'d>, CsPin<'d>, Delay>;
-type BlockDevice<'d> = embedded_sdmmc::SdCard<SpiDevice<'d>, Delay>;
-type VolumeManagerType<'d> = VolumeManager<BlockDevice<'d>, SdTimeSource, 4, 4, 1>;
+use crate::bus::SharedSpiDevice;
+
+type BlockDevice<'a, 'd> = embedded_sdmmc::SdCard<SharedSpiDevice<'a, 'd>, Delay>;
+type VolumeManagerType<'a, 'd> = VolumeManager<BlockDevice<'a, 'd>, SdTimeSource, 4, 4, 1>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectoryEntry {
@@ -85,62 +84,68 @@ pub enum Error {
 
 pub type Result<T> = core::result::Result<T, Error>;
 
-pub struct SdCard<'d> {
+pub struct SdCard<'a, 'd> {
     card_size_bytes: u64,
-    volume_mgr: VolumeManagerType<'d>,
+    volume_mgr: VolumeManagerType<'a, 'd>,
 }
 
-pub struct PinConfig<'d> {
-    pub miso: peripherals::GPIO21<'d>,
-    pub mosi: peripherals::GPIO13<'d>,
-    pub sclk: peripherals::GPIO14<'d>,
-    pub cs: peripherals::GPIO12<'d>,
+/// Build the shared SPI bus the card runs on. The returned `RefCell` must
+/// outlive the [`SdCard`] created from it — keep both in the same scope.
+pub fn shared_bus<'d>(
+    spi: peripherals::SPI2<'d>,
+    sclk: peripherals::GPIO14<'d>,
+    mosi: peripherals::GPIO13<'d>,
+    miso: peripherals::GPIO21<'d>,
+) -> Result<RefCell<Spi<'d, Blocking>>> {
+    let spi = Spi::new(spi, SpiConfig::default().with_mode(SpiMode::_0))
+        .map_err(Error::SpiConfig)?
+        .with_sck(sclk)
+        .with_mosi(mosi)
+        .with_miso(miso);
+    Ok(RefCell::new(spi))
 }
 
-impl<'d> SdCard<'d> {
+impl<'a, 'd> SdCard<'a, 'd> {
     /// Create a new SD card interface using the default fixed timestamp source.
-    pub fn new(pins: PinConfig<'d>, spi: peripherals::SPI2<'d>) -> Result<Self> {
-        Self::new_with_time_source(pins, spi, SdTimeSource::default())
+    pub fn new(cs: peripherals::GPIO12<'d>, bus: &'a RefCell<Spi<'d, Blocking>>) -> Result<Self> {
+        Self::new_with_time_source(cs, bus, SdTimeSource::default())
     }
 
     /// Create a new SD card interface using a caller-provided timestamp source.
     pub fn new_with_time_source(
-        pins: PinConfig<'d>,
-        spi: peripherals::SPI2<'d>,
+        cs: peripherals::GPIO12<'d>,
+        bus: &'a RefCell<Spi<'d, Blocking>>,
         time_source: SdTimeSource,
     ) -> Result<Self> {
-        let sd_bus = Spi::new(
-            spi,
-            SpiConfig::default()
-                .with_frequency(Rate::from_khz(400))
-                .with_mode(SpiMode::_0),
-        )
-        .map_err(Error::SpiConfig)?
-        .with_sck(pins.sclk)
-        .with_mosi(pins.mosi)
-        .with_miso(pins.miso);
+        // acquisition must run at <=400 kHz (SD spec); the clock is raised below
+        // once the card is up.
+        let acquire = SpiConfig::default()
+            .with_frequency(Rate::from_khz(400))
+            .with_mode(SpiMode::_0);
 
-        let sd_cs = Output::new(pins.cs, Level::High, OutputConfig::default());
-        let mut sd_bus = sd_bus;
-        sd_bus.write(&[0xFF; 10]).map_err(Error::Spi)?;
+        // sd wake: >=74 clocks with chip-select de-asserted. done on the bus
+        // directly (a SharedSpiDevice transaction would assert cs), with the sd
+        // cs pin held high.
+        let cs = Output::new(cs, Level::High, OutputConfig::default());
+        {
+            let mut bus = bus.borrow_mut();
+            bus.apply_config(&acquire).map_err(Error::SpiConfig)?;
+            bus.write(&[0xFF; 10]).map_err(Error::Spi)?;
+        }
 
-        let sd_device = ExclusiveDevice::new(sd_bus, sd_cs, Delay::new())
-            .map_err(|_| Error::InvalidPath("failed to create SPI device"))?;
-        let sd_card = embedded_sdmmc::SdCard::new(sd_device, Delay::new());
-        // card acquisition must run at <=400 kHz (SD spec). num_bytes() forces
-        // that acquisition, after which the clock can be raised so data transfer
-        // isn't glacial — a 1.5 MB read at 400 kHz takes ~30s versus well under
+        let device = SharedSpiDevice::new(bus, cs, acquire);
+        let sd_card = embedded_sdmmc::SdCard::new(device, Delay::new());
+        // num_bytes() forces acquisition; after it, raise the clock so transfers
+        // aren't glacial — a 1.5 MB read at 400 kHz takes ~30s versus well under
         // a second at 20 MHz.
         let card_size_bytes = sd_card.num_bytes().map_err(Error::Card)?;
-        sd_card
-            .spi(|device| {
-                device.bus_mut().apply_config(
-                    &SpiConfig::default()
-                        .with_frequency(Rate::from_mhz(20))
-                        .with_mode(SpiMode::_0),
-                )
-            })
-            .map_err(Error::SpiConfig)?;
+        sd_card.spi(|device| {
+            device.set_config(
+                SpiConfig::default()
+                    .with_frequency(Rate::from_mhz(20))
+                    .with_mode(SpiMode::_0),
+            )
+        });
         let volume_mgr = VolumeManager::new(sd_card, time_source);
 
         Ok(Self {
@@ -344,7 +349,7 @@ impl<'d> SdCard<'d> {
 
     fn open_volume0(
         &self,
-    ) -> Result<embedded_sdmmc::Volume<'_, BlockDevice<'d>, SdTimeSource, 4, 4, 1>> {
+    ) -> Result<embedded_sdmmc::Volume<'_, BlockDevice<'a, 'd>, SdTimeSource, 4, 4, 1>> {
         self.volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(Error::Filesystem)

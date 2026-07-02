@@ -37,7 +37,6 @@ use t5s3_epaper_core::{
     lora::Lora,
     pin_config,
     sdcard::DirectoryEntry,
-    sdcard_pin_config,
     Clock,
     Display,
     DrawMode,
@@ -1204,7 +1203,10 @@ async fn main(_spawner: Spawner) -> ! {
     if !show_wallpaper(
         &mut display,
         peripherals.SPI2,
-        sdcard_pin_config!(peripherals),
+        peripherals.GPIO14,
+        peripherals.GPIO13,
+        peripherals.GPIO21,
+        peripherals.GPIO12,
         peripherals.GPIO46,
     ) {
         let pct = display.battery_percentage().unwrap_or(0);
