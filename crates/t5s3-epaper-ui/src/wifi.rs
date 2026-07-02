@@ -160,6 +160,51 @@ pub(crate) async fn http_get(
     }
 }
 
+// bring wifi up, GET `path` from an arbitrary public `host` over plain http,
+// then power the radio back down. mirrors `http_get` but targets a hostname of
+// the caller's choosing (used by the weather page to reach a forecast api)
+// rather than noot-server. returns the response body, or None on any failure.
+pub(crate) async fn http_get_from(
+    wifi: esp_hal::peripherals::WIFI<'static>,
+    host: &str,
+    path: &str,
+) -> Option<Vec<u8>> {
+    let station_config = Config::Station(
+        StationConfig::default()
+            .with_ssid(SSID)
+            .with_password(PASSWORD.into()),
+    );
+    let mut controller = WifiController::new(
+        wifi,
+        ControllerConfig::default().with_initial_config(station_config),
+    )
+    .ok()?;
+
+    let rng = Rng::new();
+    let seed = (rng.random() as u64) << 32 | rng.random() as u64;
+    let mut resources = StackResources::<3>::new();
+    let (stack, mut runner) = embassy_net::new(
+        Interface::station(),
+        embassy_net::Config::dhcpv4(Default::default()),
+        &mut resources,
+        seed,
+    );
+
+    let outcome = select(runner.run(), async {
+        controller.connect_async().await.ok()?;
+        with_timeout(Duration::from_secs(15), stack.wait_config_up())
+            .await
+            .ok()?;
+        request_ext(stack, host, path).await
+    })
+    .await;
+
+    match outcome {
+        Either::First(_) => None,
+        Either::Second(body) => body,
+    }
+}
+
 // the now-playing json plus the raw album-art bytes, fetched together in one
 // wifi session so opening the music page (or hitting a control) costs a single
 // radio bring-up.
@@ -274,6 +319,57 @@ async fn request(stack: Stack<'_>, method: &str, path: &str, max_body: usize) ->
     }
 
     // status line is "HTTP/1.1 NNN ...": the first status digit sits at byte 9.
+    if resp.get(9) != Some(&b'2') {
+        return None;
+    }
+    let split = resp.windows(4).position(|w| w == b"\r\n\r\n")?;
+    Some(resp[split + 4..].to_vec())
+}
+
+// one plain-http GET to `host` on port 80 using HTTP/1.0 and return the
+// response body for a 2xx status. HTTP/1.0 (rather than /1.1) so the response
+// comes back with a plain connection-close body instead of chunked
+// transfer-encoding, which this minimal read-until-close client does not
+// decode. `host` is resolved over DNS (a public weather api, unlike
+// noot-server, lives at a hostname).
+async fn request_ext(stack: Stack<'_>, host: &str, path: &str) -> Option<Vec<u8>> {
+    let addr = match host.parse::<Ipv4Addr>() {
+        Ok(ip) => IpAddress::Ipv4(ip),
+        Err(_) => *stack.dns_query(host, DnsQueryType::A).await.ok()?.first()?,
+    };
+
+    let mut rx = [0u8; 1536];
+    let mut tx = [0u8; 1536];
+    let mut socket = TcpSocket::new(stack, &mut rx, &mut tx);
+    socket.set_timeout(Some(Duration::from_secs(8)));
+    socket.connect(IpEndpoint::new(addr, 80)).await.ok()?;
+
+    let mut req = String::new();
+    write!(
+        req,
+        "GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    socket.write_all(req.as_bytes()).await.ok()?;
+
+    let mut resp = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match socket.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                resp.extend_from_slice(&chunk[..n]);
+                // a forecast response is a few kB; stop well before the heap is at
+                // risk if the server misbehaves.
+                if resp.len() > 16 * 1024 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    // status line is "HTTP/1.x NNN ...": the first status digit sits at byte 9.
     if resp.get(9) != Some(&b'2') {
         return None;
     }

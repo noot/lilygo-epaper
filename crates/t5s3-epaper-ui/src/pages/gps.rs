@@ -27,6 +27,16 @@ pub(crate) struct GpsFix {
     sats: u32,
 }
 
+impl GpsFix {
+    pub(crate) fn lat(&self) -> f64 {
+        self.lat
+    }
+
+    pub(crate) fn lon(&self) -> f64 {
+        self.lng
+    }
+}
+
 // snapshot the current fix, or None if the receiver has no position right now.
 pub(crate) fn current_fix(gps: &Gps<'_>) -> Option<GpsFix> {
     let (lat, lng) = gps.location()?;

@@ -140,6 +140,7 @@ use crate::{
             show_wallpaper,
             sleep_now_hit,
         },
+        weather,
     },
     screen::Screen,
     settings::Settings,
@@ -150,7 +151,7 @@ use crate::{
         draw_statusbar_time,
         statusbar_time_rect,
     },
-    wifi::{http_get, music_session, set_utc_time, sync_time, RESYNC_INTERVAL_SECS},
+    wifi::{http_get, http_get_from, music_session, set_utc_time, sync_time, RESYNC_INTERVAL_SECS},
 };
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -391,6 +392,12 @@ async fn main(_spawner: Spawner) -> ! {
     let mut env_view = environment::View::Loading;
     let mut env_dirty = false;
 
+    // weather page state: mirrors the environment page (last fetched view plus a
+    // flag that a fresh fetch from noot-server is needed on the next pass, set on
+    // entry and on tap-to-refresh).
+    let mut weather_view = weather::View::Loading;
+    let mut weather_dirty = false;
+
     // library (reader shelf) state: the scanned books, the scroll offset into
     // them, and a flag that a fresh scan is needed on the next pass (set on entry
     // and on returning from the reader, mirrors `files_dirty`).
@@ -529,6 +536,7 @@ async fn main(_spawner: Spawner) -> ! {
                 Screen::Settings => draw_settings_screen(&mut display, &settings),
                 Screen::Music => music::draw_screen(&mut display, &music_view, music_status),
                 Screen::Environment => environment::draw_screen(&mut display, &env_view),
+                Screen::Weather => weather::draw_screen(&mut display, &weather_view),
                 Screen::Library => {
                     library::draw_screen(&mut display, &library_view, library_scroll)
                 }
@@ -694,6 +702,11 @@ async fn main(_spawner: Spawner) -> ! {
                                 Screen::Environment => {
                                     env_view = environment::View::Loading;
                                     env_dirty = true;
+                                    needs_redraw = true;
+                                }
+                                Screen::Weather => {
+                                    weather_view = weather::View::Loading;
+                                    weather_dirty = true;
                                     needs_redraw = true;
                                 }
                                 // the shelf paints a "scanning" view now, then
@@ -995,6 +1008,17 @@ async fn main(_spawner: Spawner) -> ! {
                             needs_redraw = true;
                         }
                     }
+                    Screen::Weather => {
+                        if back_button_hit(sx, sy) {
+                            current_screen = Screen::Home;
+                            needs_redraw = true;
+                        } else {
+                            // a tap anywhere else re-fetches the latest forecast.
+                            weather_view = weather::View::Loading;
+                            weather_dirty = true;
+                            needs_redraw = true;
+                        }
+                    }
                     Screen::Library => {
                         if back_button_hit(sx, sy) {
                             current_screen = Screen::Home;
@@ -1141,6 +1165,31 @@ async fn main(_spawner: Spawner) -> ! {
                 Some(body) => environment::parse(&body),
                 None => environment::View::Error,
             };
+            needs_redraw = true;
+        }
+
+        if current_screen == Screen::Weather && weather_dirty && !needs_redraw {
+            weather_dirty = false;
+            // the weather page fetches a public forecast for the device's current
+            // GPS position; without a fix there are no coordinates to query for.
+            #[cfg(feature = "gps")]
+            {
+                weather_view = match last_fix {
+                    Some(fix) => {
+                        let path = weather::path(fix.lat(), fix.lon());
+                        let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
+                        match http_get_from(wifi, weather::HOST, path.as_str()).await {
+                            Some(body) => weather::parse(&body),
+                            None => weather::View::Error,
+                        }
+                    }
+                    None => weather::View::NoFix,
+                };
+            }
+            #[cfg(not(feature = "gps"))]
+            {
+                weather_view = weather::View::NoFix;
+            }
             needs_redraw = true;
         }
 

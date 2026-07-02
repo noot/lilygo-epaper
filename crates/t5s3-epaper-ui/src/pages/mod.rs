@@ -11,3 +11,4 @@ pub(crate) mod music;
 pub(crate) mod reader;
 pub(crate) mod settings;
 pub(crate) mod sleep;
+pub(crate) mod weather;

@@ -13,7 +13,7 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 
 ### medium priority
 
-- [ ] **SPI bus arbitration** — LoRa CS must be held high during SD card access (shared bus)
+- [x] **SPI bus arbitration** — LoRa CS must be held high during SD card access (shared bus)
 - [ ] **BQ25896 full driver** — charge current config, charge status, input power path management (currently shutdown only)
 - [ ] **BQ27220 full driver** — current draw, temperature, state of health, remaining/full capacity (currently voltage + SOC only)
 - [x] LoRa user message (with keyboard) and broadcast
@@ -23,7 +23,7 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 - [x] **WiFi** — via `esp-wifi` crate
 - [ ] **BLE** — via `esp-wifi` crate
 - [ ] **waveform LUT temperature compensation** — use TPS65185 temp sensor to select waveform table at draw time
-- [ ] join wifi network page/setting
+- [ ] join wifi network page/setting, displays current connection if any
 
 ## file handling and management
 - [x] sd card file browser in UI
@@ -53,7 +53,7 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 - [x] customizable fonts/font size
 - [x] customizable timezone
 - [x] pull now playing from music server (see waveshare-epaper repo)
-- [ ] pull weather data and display on ui page
+- [x] pull weather data and display on ui page
 - [x] pull home environment data (temp, humidity, co2)
 
 # bug fixes
@@ -61,3 +61,4 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 - [x] sleep doesn't properly deep sleep - battery still drains quite a lot
 - [ ] battery percentage only refreshes when a new page is loaded
 - [ ] keyboard "send" button is unresponsive at times (lower right corner issue?)
+- [ ] if clock fails to sync it doesn't resync - have button in info to try to sync

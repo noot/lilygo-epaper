@@ -13,6 +13,7 @@ pub(crate) enum Screen {
     Music,
     Environment,
     Library,
+    Weather,
 }
 
 impl Screen {
@@ -31,6 +32,7 @@ impl Screen {
             Screen::Music => 10,
             Screen::Environment => 11,
             Screen::Library => 12,
+            Screen::Weather => 13,
         }
     }
 
@@ -48,6 +50,7 @@ impl Screen {
             10 => Screen::Music,
             11 => Screen::Environment,
             12 => Screen::Library,
+            13 => Screen::Weather,
             _ => Screen::Home,
         }
     }
