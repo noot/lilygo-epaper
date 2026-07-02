@@ -1,4 +1,5 @@
 use alloc::{format, string::String, vec::Vec};
+use core::cell::RefCell;
 
 use embedded_graphics::{
     image::Image,
@@ -11,7 +12,11 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
-use esp_hal::gpio::{Level, Output, OutputConfig};
+use esp_hal::{
+    gpio::{Level, Output, OutputConfig},
+    spi::master::Spi,
+    Blocking,
+};
 use t5s3_epaper_core::{
     sdcard::{DirectoryEntry, Error},
     Display,
@@ -44,24 +49,20 @@ pub(crate) enum Row {
     Entry(usize),
 }
 
-// mount the SD card and list a directory, sorted directories-first then by
-// name. the card shares SPI2 and the sclk/mosi/miso lines with the LoRa radio,
-// so the pins are stolen (mirroring `make_radio`) and the radio chip-select is
-// driven high to release MISO for the duration. the card and the CS guard drop
-// when this returns, freeing the bus for the next access.
-pub(crate) fn load_dir(path: &str) -> Result<Vec<DirectoryEntry>, Error> {
+// mount the SD card on the shared `bus` and list a directory, sorted
+// directories-first then by name. the radio is dropped while off its screen, so
+// its chip-select floats: hold it high so the idle SX1262 releases MISO for the
+// duration. the card and the CS guard drop when this returns.
+pub(crate) fn load_dir(
+    bus: &RefCell<Spi<'static, Blocking>>,
+    path: &str,
+) -> Result<Vec<DirectoryEntry>, Error> {
     let _lora_cs = Output::new(
         unsafe { esp_hal::peripherals::GPIO46::steal() },
         Level::High,
         OutputConfig::default(),
     );
-    let bus = t5s3_epaper_core::sdcard::shared_bus(
-        unsafe { esp_hal::peripherals::SPI2::steal() },
-        unsafe { esp_hal::peripherals::GPIO14::steal() },
-        unsafe { esp_hal::peripherals::GPIO13::steal() },
-        unsafe { esp_hal::peripherals::GPIO21::steal() },
-    )?;
-    let card = SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus)?;
+    let card = SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, bus)?;
     let mut entries = card.list_dir(path)?;
     entries.sort_by(|a, b| {
         b.is_directory
@@ -80,25 +81,17 @@ pub(crate) fn is_bmp(name: &str) -> bool {
 // mounts the card the same self-contained way as `load_dir`. returns false if
 // the card, file, or bitmap is missing or unreadable so the caller can show a
 // message.
-pub(crate) fn view_image(display: &mut Display, path: &str) -> bool {
+pub(crate) fn view_image(
+    bus: &RefCell<Spi<'static, Blocking>>,
+    display: &mut Display,
+    path: &str,
+) -> bool {
     let _lora_cs = Output::new(
         unsafe { esp_hal::peripherals::GPIO46::steal() },
         Level::High,
         OutputConfig::default(),
     );
-    let bus = match t5s3_epaper_core::sdcard::shared_bus(
-        unsafe { esp_hal::peripherals::SPI2::steal() },
-        unsafe { esp_hal::peripherals::GPIO14::steal() },
-        unsafe { esp_hal::peripherals::GPIO13::steal() },
-        unsafe { esp_hal::peripherals::GPIO21::steal() },
-    ) {
-        Ok(bus) => bus,
-        Err(e) => {
-            esp_println::println!("files: view bus init failed: {e:?}");
-            return false;
-        }
-    };
-    let card = match SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus) {
+    let card = match SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, bus) {
         Ok(card) => card,
         Err(e) => {
             esp_println::println!("files: view sd init failed: {e:?}");

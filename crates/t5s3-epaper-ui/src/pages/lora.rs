@@ -1,4 +1,5 @@
 use alloc::{format, string::String, vec::Vec};
+use core::cell::RefCell;
 
 use embedded_graphics::{
     mono_font::{
@@ -10,6 +11,7 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
+use esp_hal::{spi::master::Spi, Blocking};
 use t5s3_epaper_core::{
     lora::{Config as LoraConfig, Lora},
     Display,
@@ -359,17 +361,15 @@ pub(crate) fn keyboard_native_rect() -> t5s3_epaper_core::display::Rectangle {
 // free while this page is open. steal the bus + radio pins (mirroring the wifi
 // re-sync); dropping the returned radio releases them. the 3.3v rail powered up
 // at boot, so no settle delay is needed.
-pub(crate) fn make_radio() -> Result<Lora<'static>, t5s3_epaper_core::lora::Error> {
+pub(crate) fn make_radio<'a>(
+    bus: &'a RefCell<Spi<'static, Blocking>>,
+) -> Result<Lora<'a, 'static>, t5s3_epaper_core::lora::Error> {
     let pins = t5s3_epaper_core::lora::PinConfig {
-        sclk: unsafe { esp_hal::peripherals::GPIO14::steal() },
-        mosi: unsafe { esp_hal::peripherals::GPIO13::steal() },
-        miso: unsafe { esp_hal::peripherals::GPIO21::steal() },
         cs: unsafe { esp_hal::peripherals::GPIO46::steal() },
         rst: unsafe { esp_hal::peripherals::GPIO1::steal() },
         busy: unsafe { esp_hal::peripherals::GPIO47::steal() },
         dio1: unsafe { esp_hal::peripherals::GPIO10::steal() },
     };
-    let spi = unsafe { esp_hal::peripherals::SPI2::steal() };
     // match the t3-s3 receiver, whose Config::default() uses SF7. every other
     // parameter (915 MHz, BW125, CR4/5, preamble 8, private sync word) already
     // agrees; only the spreading factor differed.
@@ -377,5 +377,5 @@ pub(crate) fn make_radio() -> Result<Lora<'static>, t5s3_epaper_core::lora::Erro
         spreading_factor: t5s3_epaper_core::lora::SpreadingFactor::Sf7,
         ..LoraConfig::default()
     };
-    Lora::new(pins, spi, &config)
+    Lora::new(bus, pins, &config)
 }

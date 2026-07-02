@@ -98,15 +98,8 @@ pub(crate) fn is_epub(name: &str) -> bool {
 // scan the card for epubs, resolve each one's metadata + cover thumbnail (from
 // the cache when possible), read its bookmark, and return the shelf sorted with
 // in-progress books first. self-contained mount, mirroring the file browser.
-pub(crate) fn load_library() -> View {
-    let bus = match sd_bus() {
-        Ok(bus) => bus,
-        Err(e) => {
-            esp_println::println!("library: sd init failed: {e:?}");
-            return View::Ready(Vec::new());
-        }
-    };
-    let (_lora_cs, card) = match mount(&bus) {
+pub(crate) fn load_library(bus: &RefCell<Spi<'static, Blocking>>) -> View {
+    let (_lora_cs, card) = match mount(bus) {
         Ok(pair) => pair,
         Err(e) => {
             esp_println::println!("library: sd init failed: {e:?}");
@@ -626,17 +619,6 @@ fn cache_key(path: &str, size: u32) -> u32 {
         mix(b);
     }
     hash as u32
-}
-
-// build the shared spi bus for card access. kept as a local by the caller so it
-// outlives the SdCard borrowed from it.
-fn sd_bus() -> Result<RefCell<Spi<'static, Blocking>>, Error> {
-    t5s3_epaper_core::sdcard::shared_bus(
-        unsafe { esp_hal::peripherals::SPI2::steal() },
-        unsafe { esp_hal::peripherals::GPIO14::steal() },
-        unsafe { esp_hal::peripherals::GPIO13::steal() },
-        unsafe { esp_hal::peripherals::GPIO21::steal() },
-    )
 }
 
 // mount the SD card on `bus`, mirroring the file browser/reader: hold the LoRa

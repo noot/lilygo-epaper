@@ -69,7 +69,14 @@ fn main() -> ! {
     delay.delay_millis(1500);
 
     let config = Config::default();
-    let mut radio = match Lora::new(lora_pin_config!(peripherals), peripherals.SPI2, &config) {
+    let bus = t5s3_epaper_core::sdcard::shared_bus(
+        peripherals.SPI2,
+        peripherals.GPIO14,
+        peripherals.GPIO13,
+        peripherals.GPIO21,
+    )
+    .expect("to build spi bus");
+    let mut radio = match Lora::new(&bus, lora_pin_config!(peripherals), &config) {
         Ok(radio) => radio,
         Err(e) => {
             esp_println::println!("lora init failed: {}", e);

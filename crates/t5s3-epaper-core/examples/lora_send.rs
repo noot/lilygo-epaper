@@ -51,12 +51,15 @@ fn main() -> ! {
     delay.delay_millis(1500);
     display.clear().expect("to clear screen");
 
-    let mut radio = Lora::new(
-        lora_pin_config!(peripherals),
+    let bus = t5s3_epaper_core::sdcard::shared_bus(
         peripherals.SPI2,
-        &Config::default(),
+        peripherals.GPIO14,
+        peripherals.GPIO13,
+        peripherals.GPIO21,
     )
-    .expect("to initialize LoRa radio");
+    .expect("to build spi bus");
+    let mut radio = Lora::new(&bus, lora_pin_config!(peripherals), &Config::default())
+        .expect("to initialize LoRa radio");
 
     let text_area = Rectangle {
         x: 40,

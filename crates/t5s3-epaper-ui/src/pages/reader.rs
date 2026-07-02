@@ -283,11 +283,8 @@ impl ReaderDoc {
     // content hash so it survives the file being moved or renamed. the current
     // section's page count is stored too, so the library can draw a page-refined
     // overall-progress bar without having to paginate the book itself.
-    pub(crate) fn save(&self) {
-        let Ok(bus) = sd_bus() else {
-            return;
-        };
-        let Ok((_lora_cs, card)) = mount(&bus) else {
+    pub(crate) fn save(&self, bus: &RefCell<Spi<'static, Blocking>>) {
+        let Ok((_lora_cs, card)) = mount(bus) else {
             return;
         };
         card.create_dir_all(PROGRESS_DIR).ok();
@@ -316,9 +313,12 @@ pub(crate) fn is_reader(name: &str) -> bool {
 // read a supported file from the card and open it at `chapter`/`page`. mounts
 // the card the same self-contained way as the file browser. returns a short
 // human-readable message on failure so the caller can show why it failed.
-pub(crate) fn load_document(path: &str, style: ReaderStyle) -> Result<ReaderDoc, String> {
-    let bus = sd_bus().map_err(|e| format!("SD init failed: {e:?}"))?;
-    let (_lora_cs, card) = mount(&bus).map_err(|e| format!("SD init failed: {e:?}"))?;
+pub(crate) fn load_document(
+    bus: &RefCell<Spi<'static, Blocking>>,
+    path: &str,
+    style: ReaderStyle,
+) -> Result<ReaderDoc, String> {
+    let (_lora_cs, card) = mount(bus).map_err(|e| format!("SD init failed: {e:?}"))?;
     let bytes = card
         .read_file(path)
         .map_err(|e| format!("read failed: {e:?}"))?;
@@ -755,17 +755,6 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
-}
-
-// build the shared spi bus for card access. kept as a local by the caller so it
-// outlives the SdCard borrowed from it.
-fn sd_bus() -> Result<RefCell<Spi<'static, Blocking>>, Error> {
-    t5s3_epaper_core::sdcard::shared_bus(
-        unsafe { esp_hal::peripherals::SPI2::steal() },
-        unsafe { esp_hal::peripherals::GPIO14::steal() },
-        unsafe { esp_hal::peripherals::GPIO13::steal() },
-        unsafe { esp_hal::peripherals::GPIO21::steal() },
-    )
 }
 
 // mount the SD card on `bus`, mirroring the file browser: hold the LoRa

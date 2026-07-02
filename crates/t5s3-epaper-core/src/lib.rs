@@ -238,9 +238,6 @@ macro_rules! gps_pin_config {
 macro_rules! lora_pin_config {
     ($name:expr) => {{
         t5s3_epaper_core::lora::PinConfig {
-            sclk: $name.GPIO14,
-            mosi: $name.GPIO13,
-            miso: $name.GPIO21,
             cs: $name.GPIO46,
             rst: $name.GPIO1,
             busy: $name.GPIO47,

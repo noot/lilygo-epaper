@@ -247,6 +247,17 @@ async fn main(_spawner: Spawner) -> ! {
     delay.delay_millis(10);
     display.clear().expect("to clear");
 
+    // one SPI2 bus shared by the SD card and the LoRa radio, owned here and lent
+    // out by reference so only a single owner ever exists — no more per-access
+    // steal()s of SPI2 and the sclk/mosi/miso lines.
+    let bus = t5s3_epaper_core::sdcard::shared_bus(
+        peripherals.SPI2,
+        peripherals.GPIO14,
+        peripherals.GPIO13,
+        peripherals.GPIO21,
+    )
+    .expect("to build spi bus");
+
     // detect the GPS module BEFORE bringing up wifi. the L76K probe is a plain
     // UART exchange; doing it first keeps it in the same quiet, no-radio state
     // it was validated in (running it after the ~20s wifi sync was failing to
@@ -329,7 +340,7 @@ async fn main(_spawner: Spawner) -> ! {
     let mut lora_status = String::from("type a message, then SEND");
     let mut lora_sent: Vec<String> = Vec::new();
     let mut lora_recv: Vec<String> = Vec::new();
-    let mut radio: Option<Lora<'static>> = None;
+    let mut radio: Option<Lora<'_, 'static>> = None;
     let mut radio_tried = false;
     let mut kb_symbols = false;
     let mut kb_shift = false;
@@ -479,7 +490,7 @@ async fn main(_spawner: Spawner) -> ! {
                     &files_status,
                 ),
                 Screen::Image => {
-                    if !view_image(&mut display, &image_path) {
+                    if !view_image(&bus, &mut display, &image_path) {
                         Text::with_alignment(
                             "cannot display image",
                             Point::new(SCREEN_W / 2, 400),
@@ -622,7 +633,7 @@ async fn main(_spawner: Spawner) -> ! {
         if input.buttons.home && current_screen != Screen::Home {
             if current_screen == Screen::Reader {
                 if let Some(doc) = &reader_doc {
-                    doc.save();
+                    doc.save(&bus);
                 }
             }
             current_screen = Screen::Home;
@@ -867,7 +878,7 @@ async fn main(_spawner: Spawner) -> ! {
                     Screen::Reader => {
                         if back_button_hit(sx, sy) {
                             if let Some(doc) = &reader_doc {
-                                doc.save();
+                                doc.save(&bus);
                             }
                             // returning to the shelf rescans so the just-read
                             // book's progress is up to date (cache-fast).
@@ -1035,7 +1046,7 @@ async fn main(_spawner: Spawner) -> ! {
         if current_screen == Screen::Files && files_dirty {
             files_dirty = false;
             files_scroll = 0;
-            match load_dir(&files_path) {
+            match load_dir(&bus, &files_path) {
                 Ok(entries) => {
                     files_status = format!("{} items", entries.len());
                     files_entries = entries;
@@ -1055,7 +1066,7 @@ async fn main(_spawner: Spawner) -> ! {
         // the document's length.
         if current_screen == Screen::Reader && reader_dirty {
             reader_dirty = false;
-            match load_document(&reader_path, settings.reader_style()) {
+            match load_document(&bus, &reader_path, settings.reader_style()) {
                 Ok(doc) => {
                     reader_doc = Some(doc);
                     reader_status.clear();
@@ -1140,7 +1151,7 @@ async fn main(_spawner: Spawner) -> ! {
         // so it never conflicts with the radio, which is dropped off-screen.
         if current_screen == Screen::Library && library_dirty && !needs_redraw {
             library_dirty = false;
-            library_view = library::load_library();
+            library_view = library::load_library(&bus);
             needs_redraw = true;
         }
 
@@ -1152,7 +1163,7 @@ async fn main(_spawner: Spawner) -> ! {
         if current_screen == Screen::Lora {
             if radio.is_none() && !radio_tried {
                 radio_tried = true;
-                match make_radio() {
+                match make_radio(&bus) {
                     Ok(mut r) => {
                         if let Err(e) = r.start_receive() {
                             esp_println::println!("lora: start rx failed: {e}");
@@ -1232,7 +1243,7 @@ async fn main(_spawner: Spawner) -> ! {
     // persist reading progress if we slept straight from the reader.
     if current_screen == Screen::Reader {
         if let Some(doc) = &reader_doc {
-            doc.save();
+            doc.save(&bus);
         }
     }
     // persist the user's brightness so it is restored on the next boot.
@@ -1263,15 +1274,7 @@ async fn main(_spawner: Spawner) -> ! {
     display.clear().ok();
     // pick a random wallpaper from the SD card; fall back to the drawn
     // screensaver if the folder is missing or has no usable .bmp files.
-    if !show_wallpaper(
-        &mut display,
-        peripherals.SPI2,
-        peripherals.GPIO14,
-        peripherals.GPIO13,
-        peripherals.GPIO21,
-        peripherals.GPIO12,
-        peripherals.GPIO46,
-    ) {
+    if !show_wallpaper(&mut display, &bus) {
         let pct = display.battery_percentage().unwrap_or(0);
         draw_screensaver(&mut display, pct);
     }

@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use core::fmt::Write as _;
+use core::{cell::RefCell, fmt::Write as _};
 
 use embedded_graphics::{
     image::Image,
@@ -15,7 +15,9 @@ use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use esp_hal::{
     gpio::{Level, Output, OutputConfig},
     rng::Rng,
+    spi::master::Spi,
     time::Instant,
+    Blocking,
 };
 use t5s3_epaper_core::{Display, SdCard};
 use tinybmp::Bmp;
@@ -190,29 +192,17 @@ pub(crate) fn draw_power_off_screen(display: &mut Display, pct: u16) {
 // load the wallpaper bitmap from the SD card and draw it full-screen. returns
 // false if the card, file, or bitmap is missing or unreadable so the caller can
 // fall back to the drawn screensaver.
-pub(crate) fn show_wallpaper<'d>(
-    display: &mut Display,
-    spi: esp_hal::peripherals::SPI2<'d>,
-    sclk: esp_hal::peripherals::GPIO14<'d>,
-    mosi: esp_hal::peripherals::GPIO13<'d>,
-    miso: esp_hal::peripherals::GPIO21<'d>,
-    cs: esp_hal::peripherals::GPIO12<'d>,
-    lora_cs: esp_hal::peripherals::GPIO46<'d>,
-) -> bool {
-    // the SD card shares the SPI bus (sclk/mosi/miso) with the LoRa SX1262
-    // radio. drive the radio's chip-select high so it releases MISO; otherwise
-    // it corrupts SD init and the card comes back as CardNotFound. held for the
-    // duration of the SD access below.
-    let _lora_cs = Output::new(lora_cs, Level::High, OutputConfig::default());
+pub(crate) fn show_wallpaper(display: &mut Display, bus: &RefCell<Spi<'static, Blocking>>) -> bool {
+    // the SD card shares the bus with the LoRa SX1262 radio, which is dropped
+    // while off its screen; its chip-select floats, so hold it high to make the
+    // idle radio release MISO (otherwise SD init returns CardNotFound).
+    let _lora_cs = Output::new(
+        unsafe { esp_hal::peripherals::GPIO46::steal() },
+        Level::High,
+        OutputConfig::default(),
+    );
 
-    let bus = match t5s3_epaper_core::sdcard::shared_bus(spi, sclk, mosi, miso) {
-        Ok(bus) => bus,
-        Err(e) => {
-            esp_println::println!("wallpaper: bus init failed: {e:?}");
-            return false;
-        }
-    };
-    let sdcard = match SdCard::new(cs, &bus) {
+    let sdcard = match SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, bus) {
         Ok(sdcard) => sdcard,
         Err(e) => {
             esp_println::println!("wallpaper: sd init failed: {e:?}");

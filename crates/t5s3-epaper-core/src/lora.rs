@@ -1,4 +1,6 @@
-use embedded_hal::spi::SpiBus as _;
+use core::cell::RefCell;
+
+use embedded_hal::spi::SpiDevice as _;
 use esp_hal::{
     delay::Delay,
     gpio::{Input, InputConfig, Level, Output, OutputConfig, RtcPin},
@@ -11,6 +13,8 @@ use esp_hal::{
     Blocking,
 };
 use log::debug;
+
+use crate::bus::SharedSpiDevice;
 
 const SPI_FREQUENCY_KHZ: u32 = 2000;
 const BUSY_TIMEOUT_ITERS: u32 = 1000;
@@ -169,9 +173,6 @@ impl Default for Config {
 }
 
 pub struct PinConfig<'d> {
-    pub sclk: peripherals::GPIO14<'d>,
-    pub mosi: peripherals::GPIO13<'d>,
-    pub miso: peripherals::GPIO21<'d>,
     pub cs: peripherals::GPIO46<'d>,
     pub rst: peripherals::GPIO1<'d>,
     pub busy: peripherals::GPIO47<'d>,
@@ -184,9 +185,8 @@ pub struct PinConfig<'d> {
 /// select. The GPS/LoRa 3.3 V power rail (PCA9555 IO0_0) is enabled by
 /// `Display::new()`, so the radio is powered for the rest of this power cycle,
 /// until `Display::deep_sleep()` cuts the rail.
-pub struct Lora<'d> {
-    spi: Spi<'d, Blocking>,
-    cs: Output<'d>,
+pub struct Lora<'a, 'd> {
+    device: SharedSpiDevice<'a, 'd>,
     rst: Output<'d>,
     busy: Input<'d>,
     dio1: Input<'d>,
@@ -196,36 +196,33 @@ pub struct Lora<'d> {
     last_snr_db: i16,
 }
 
-impl<'d> Lora<'d> {
+impl<'a, 'd> Lora<'a, 'd> {
     /// Create a new LoRa driver and configure it for transmit/receive.
     ///
-    /// Resets the radio, enables the TCXO, calibrates, and applies the RF and
-    /// modulation settings from `config`, leaving the chip in standby ready to
-    /// transmit.
+    /// Runs on the caller-owned shared SPI bus (`bus`), which must outlive the
+    /// driver. Resets the radio, enables the TCXO, calibrates, and applies the
+    /// RF and modulation settings from `config`, leaving the chip in standby
+    /// ready to transmit.
     pub fn new(
+        bus: &'a RefCell<Spi<'d, Blocking>>,
         pins: PinConfig<'d>,
-        spi: peripherals::SPI2<'d>,
         config: &Config,
     ) -> Result<Self, Error> {
-        let spi = Spi::new(
-            spi,
-            SpiConfig::default()
-                .with_frequency(Rate::from_khz(SPI_FREQUENCY_KHZ))
-                .with_mode(SpiMode::_0),
-        )
-        .map_err(Error::SpiConfig)?
-        .with_sck(pins.sclk)
-        .with_mosi(pins.mosi)
-        .with_miso(pins.miso);
-
         // deep sleep holds RST low to stop the unpowered SX1262 being
         // back-powered through its reset pull-up; release that hold before
         // driving the line again.
         pins.rst.rtcio_pad_hold(false);
 
+        let device = SharedSpiDevice::new(
+            bus,
+            Output::new(pins.cs, Level::High, OutputConfig::default()),
+            SpiConfig::default()
+                .with_frequency(Rate::from_khz(SPI_FREQUENCY_KHZ))
+                .with_mode(SpiMode::_0),
+        );
+
         let mut radio = Self {
-            spi,
-            cs: Output::new(pins.cs, Level::High, OutputConfig::default()),
+            device,
             rst: Output::new(pins.rst, Level::High, OutputConfig::default()),
             busy: Input::new(pins.busy, InputConfig::default()),
             dio1: Input::new(pins.dio1, InputConfig::default()),
@@ -611,18 +608,15 @@ impl<'d> Lora<'d> {
 
     fn write_command(&mut self, buf: &[u8]) -> Result<(), Error> {
         self.wait_busy()?;
-        self.cs.set_low();
-        let result = self.spi.write(buf).map_err(Error::Spi);
-        self.cs.set_high();
-        result
+        // the SpiDevice asserts/deasserts CS and applies the lora clock/mode for
+        // the duration; wait_busy stays before it, since CS must not go low until
+        // the radio is ready.
+        self.device.write(buf).map_err(bus_err)
     }
 
     fn transfer(&mut self, buf: &mut [u8]) -> Result<(), Error> {
         self.wait_busy()?;
-        self.cs.set_low();
-        let result = self.spi.transfer_in_place(buf).map_err(Error::Spi);
-        self.cs.set_high();
-        result
+        self.device.transfer_in_place(buf).map_err(bus_err)
     }
 
     fn wait_busy(&mut self) -> Result<(), Error> {
@@ -635,6 +629,14 @@ impl<'d> Lora<'d> {
             iters += 1;
         }
         Ok(())
+    }
+}
+
+// fold the shared-bus device error into the driver's error type.
+fn bus_err(e: crate::bus::Error) -> Error {
+    match e {
+        crate::bus::Error::Spi(e) => Error::Spi(e),
+        crate::bus::Error::Config(e) => Error::SpiConfig(e),
     }
 }
 
