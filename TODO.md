@@ -29,8 +29,6 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 - [x] sd card file browser in UI
 - [x] open bmp images in file browser
 - [x] epub/txt/markdown reader (lazy per-chapter epub parsing, JPEG/PNG image rendering with dithering, content-hashed resume)
-- [ ] reader: support more scripts — Greek, CJK, Hebrew, etc. currently render as `?` (need additional u8g2 fonts added to `pick_font` fallback chain)
-- [ ] reader: stream epub chapters from SD instead of holding the whole compressed file in PSRAM (for large/image-heavy books)
 
 ## GPS
 - [ ] cached map with location rendering
@@ -43,8 +41,10 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 
 ## reader
 - [x] map auxiliary button to "next page" when in reader
-- [ ] make dedicated reader page that shows currently reading, progress, covers, etc
-- [ ] update chapter numbers to match actual book chapters
+- [x] make dedicated reader page that shows currently reading, progress, covers, etc
+- [x] update chapter numbers to match actual book chapters
+- [ ] support more scripts — Greek, CJK, Hebrew, etc. currently render as `?` (need additional u8g2 fonts added to `pick_font` fallback chain)
+- [ ] stream epub chapters from SD instead of holding the whole compressed file in PSRAM (for large/image-heavy books)
 
 ## other
 - [ ] turn ui into its own library; have a UiBuilder with pluggable components

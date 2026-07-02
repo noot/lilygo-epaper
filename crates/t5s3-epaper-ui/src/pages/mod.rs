@@ -5,6 +5,7 @@ pub(crate) mod frontlight;
 pub(crate) mod gps;
 pub(crate) mod home;
 pub(crate) mod info;
+pub(crate) mod library;
 pub(crate) mod lora;
 pub(crate) mod music;
 pub(crate) mod reader;

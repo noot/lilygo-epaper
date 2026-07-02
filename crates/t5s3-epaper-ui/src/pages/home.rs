@@ -24,17 +24,17 @@ use crate::{
 
 const COLS: usize = 3;
 const ICON_W: u16 = 150;
-const ICON_H: u16 = 220;
+const ICON_H: u16 = 190;
 const GAP_X: u16 = 20;
-const GAP_Y: u16 = 40;
-const GRID_TOP_Y: i32 = STATUS_H + 40;
+const GAP_Y: u16 = 24;
+const GRID_TOP_Y: i32 = STATUS_H + 35;
 
 pub(crate) struct Icon {
     label: &'static str,
     pub(crate) screen: Screen,
 }
 
-pub(crate) const ICONS: [Icon; 9] = [
+pub(crate) const ICONS: [Icon; 10] = [
     Icon {
         label: "GPS",
         screen: Screen::Gps,
@@ -44,8 +44,8 @@ pub(crate) const ICONS: [Icon; 9] = [
         screen: Screen::Lora,
     },
     Icon {
-        label: "Files",
-        screen: Screen::Files,
+        label: "Library",
+        screen: Screen::Library,
     },
     Icon {
         label: "Music",
@@ -62,6 +62,10 @@ pub(crate) const ICONS: [Icon; 9] = [
     Icon {
         label: "Sleep",
         screen: Screen::Sleep,
+    },
+    Icon {
+        label: "Files",
+        screen: Screen::Files,
     },
     Icon {
         label: "Settings",
@@ -114,6 +118,7 @@ macro_rules! icon_set {
             Screen::Environment => {
                 include_bytes!(concat!("../../assets/icons/", $dir, "/environment.bmp"))
             }
+            Screen::Library => include_bytes!(concat!("../../assets/icons/", $dir, "/reader.bmp")),
             Screen::Home | Screen::Image | Screen::Reader => return None,
         }
     };

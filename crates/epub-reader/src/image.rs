@@ -26,6 +26,23 @@ pub struct GrayImage {
 }
 
 impl GrayImage {
+    /// Build a grayscale image from raw row-major luma bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Image`] if `pixels` is not exactly `width * height`
+    /// bytes long.
+    pub fn from_raw(width: u16, height: u16, pixels: Vec<u8>) -> Result<Self, Error> {
+        if pixels.len() != width as usize * height as usize {
+            return Err(Error::Image("pixel buffer does not match dimensions"));
+        }
+        Ok(Self {
+            width,
+            height,
+            pixels,
+        })
+    }
+
     #[must_use]
     pub fn width(&self) -> u16 {
         self.width
@@ -34,6 +51,12 @@ impl GrayImage {
     #[must_use]
     pub fn height(&self) -> u16 {
         self.height
+    }
+
+    /// The row-major luma bytes backing the image.
+    #[must_use]
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
     }
 
     /// Luma at `(x, y)`, clamped to the image bounds.

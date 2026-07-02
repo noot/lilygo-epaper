@@ -8,7 +8,17 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
-use epub_reader::{decode_image, parse_markdown, parse_txt, Block, Document, Epub, Span, Style};
+use epub_reader::{
+    chapter_number,
+    decode_image,
+    parse_markdown,
+    parse_txt,
+    Block,
+    Document,
+    Epub,
+    Span,
+    Style,
+};
 use esp_hal::{
     gpio::{Level, Output, OutputConfig},
     spi::master::Spi,
@@ -196,6 +206,10 @@ pub(crate) struct ReaderDoc {
     key: u32,
     metrics: Metrics,
     chapter_count: usize,
+    // spine indices that begin a real chapter per the book's TOC, used to number
+    // chapters against the actual contents rather than raw spine items. empty for
+    // txt/markdown and epubs without a usable TOC (footer falls back to spine).
+    nav_starts: Vec<usize>,
     chapter: usize,
     lines: Vec<Line>,
     pages: Vec<usize>,
@@ -209,6 +223,10 @@ impl ReaderDoc {
             Source::Memory(doc) => doc.chapters().len().max(1),
             Source::Book(epub) => epub.chapter_count().max(1),
         };
+        let nav_starts = match &source {
+            Source::Book(epub) => epub.nav_starts().to_vec(),
+            Source::Memory(_) => Vec::new(),
+        };
         let chapter = chapter.min(chapter_count.saturating_sub(1));
         let lines = layout_chapter(&source, chapter, &metrics);
         let pages = paginate(&lines, &metrics);
@@ -218,6 +236,7 @@ impl ReaderDoc {
             key,
             metrics,
             chapter_count,
+            nav_starts,
             chapter,
             lines,
             pages,
@@ -261,7 +280,9 @@ impl ReaderDoc {
     }
 
     // persist the current chapter/page to the book's progress file, keyed by
-    // content hash so it survives the file being moved or renamed.
+    // content hash so it survives the file being moved or renamed. the current
+    // section's page count is stored too, so the library can draw a page-refined
+    // overall-progress bar without having to paginate the book itself.
     pub(crate) fn save(&self) {
         let Ok(bus) = sd_bus() else {
             return;
@@ -270,7 +291,7 @@ impl ReaderDoc {
             return;
         };
         card.create_dir_all(PROGRESS_DIR).ok();
-        let body = format!("{} {}", self.chapter, self.page);
+        let body = format!("{} {} {}", self.chapter, self.page, self.pages.len());
         if let Err(e) = card.write_file(&progress_path(self.key), body.as_bytes()) {
             esp_println::println!("reader: save progress failed: {e:?}");
         }
@@ -303,15 +324,21 @@ pub(crate) fn load_document(path: &str, style: ReaderStyle) -> Result<ReaderDoc,
         .map_err(|e| format!("read failed: {e:?}"))?;
 
     // key the bookmark by file contents (not path) so it follows moves/renames.
-    let key = fnv1a(&bytes) as u32;
-    let (chapter, page) = read_progress(&card, key);
+    let key = content_key(&bytes);
+    let Progress { chapter, page, .. } = read_progress(&card, key);
 
     let ext = path.rsplit_once('.').map_or("", |(_, ext)| ext);
     let source = if ext.eq_ignore_ascii_case("epub") {
-        Source::Book(Epub::open(bytes).map_err(|e| {
+        let epub = Epub::open(bytes).map_err(|e| {
             esp_println::println!("reader: open {path} failed: {e}");
             format!("parse failed: {e}")
-        })?)
+        })?;
+        esp_println::println!(
+            "reader: {path} spine={} toc_chapters={}",
+            epub.chapter_count(),
+            epub.nav_starts().len()
+        );
+        Source::Book(epub)
     } else {
         let parsed = if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown") {
             parse_markdown(&bytes)
@@ -355,16 +382,21 @@ pub(crate) fn draw(display: &mut Display, doc: &ReaderDoc) {
         y += line.height(m);
     }
 
-    let footer = if doc.chapter_count > 1 {
-        format!(
-            "< ch {}/{}    p {}/{} >",
-            doc.chapter + 1,
-            doc.chapter_count,
+    let footer = match chapter_number(&doc.nav_starts, doc.chapter) {
+        // real chapters known from the TOC; chapter 0 is front matter.
+        Some((0, _)) => format!("< front matter    p {}/{} >", page + 1, doc.pages.len()),
+        Some((cur, total)) => {
+            format!("< ch {cur}/{total}    p {}/{} >", page + 1, doc.pages.len())
+        }
+        // no usable TOC and many spine items (e.g. a size-split book): the spine
+        // isn't chapters, so show honest overall progress instead of a fake count.
+        None if doc.chapter_count > 1 => format!(
+            "< {}%    p {}/{} >",
+            doc.chapter * 100 / doc.chapter_count,
             page + 1,
             doc.pages.len()
-        )
-    } else {
-        format!("< prev    {} / {}    next >", page + 1, doc.pages.len())
+        ),
+        None => format!("< prev    {} / {}    next >", page + 1, doc.pages.len()),
     };
     Text::with_alignment(
         &footer,
@@ -386,11 +418,32 @@ pub(crate) fn tap_zone(sx: i32, sy: i32) -> Tap {
     }
 }
 
-// read the saved (chapter, page) for `key` using an already-mounted card,
-// defaulting to the start if there is no readable bookmark.
-fn read_progress(card: &SdCard, key: u32) -> (usize, usize) {
+// content-hash key of a file's bytes, used to name its progress file so a
+// bookmark follows the book across moves/renames. shared with the library page
+// so both derive the same key.
+pub(crate) fn content_key(bytes: &[u8]) -> u32 {
+    fnv1a(bytes) as u32
+}
+
+// the saved reading position: the chapter (spine index), the page within it,
+// and that section's page count at save time (0 for older bookmarks that
+// predate the page-count field, or when unknown).
+pub(crate) struct Progress {
+    pub(crate) chapter: usize,
+    pub(crate) page: usize,
+    pub(crate) page_count: usize,
+}
+
+// read the saved position for `key` using an already-mounted card, defaulting
+// to the start if there is no readable bookmark.
+pub(crate) fn read_progress(card: &SdCard, key: u32) -> Progress {
+    let default = Progress {
+        chapter: 0,
+        page: 0,
+        page_count: 0,
+    };
     let Ok(bytes) = card.read_file(&progress_path(key)) else {
-        return (0, 0);
+        return default;
     };
     core::str::from_utf8(&bytes)
         .ok()
@@ -398,9 +451,14 @@ fn read_progress(card: &SdCard, key: u32) -> (usize, usize) {
             let mut parts = text.split_whitespace();
             let chapter = parts.next()?.parse().ok()?;
             let page = parts.next()?.parse().ok()?;
-            Some((chapter, page))
+            let page_count = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            Some(Progress {
+                chapter,
+                page,
+                page_count,
+            })
         })
-        .unwrap_or((0, 0))
+        .unwrap_or(default)
 }
 
 fn draw_segments(

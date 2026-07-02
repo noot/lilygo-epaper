@@ -1,5 +1,6 @@
 mod container;
 mod opf;
+mod toc;
 mod xhtml;
 mod zip;
 
@@ -17,6 +18,12 @@ pub struct Epub {
     bytes: Vec<u8>,
     spine: Vec<String>,
     meta: Meta,
+    // full archive path of the cover image, if one was identified in the OPF.
+    cover_href: Option<String>,
+    // spine indices that begin a real chapter per the table of contents, sorted
+    // and deduplicated. empty when the book has no usable TOC, in which case the
+    // caller falls back to numbering raw spine items.
+    nav_starts: Vec<usize>,
 }
 
 impl Epub {
@@ -27,20 +34,40 @@ impl Epub {
     /// Returns an [`Error`] if the archive, its container, or its OPF package
     /// cannot be read.
     pub fn open(bytes: Vec<u8>) -> Result<Self, Error> {
-        let (spine, meta) = {
+        let (spine, meta, cover_href, nav_starts) = {
             let archive = zip::Archive::open(&bytes)?;
             let container = archive.read("META-INF/container.xml")?;
             let opf_path = container::opf_path(&container)?;
             let package = opf::parse(&archive.read(&opf_path)?)?;
             let base = dir_of(&opf_path);
-            let spine = package
+            let spine: Vec<String> = package
                 .spine_hrefs
                 .iter()
                 .map(|href| resolve(base, href))
                 .collect();
-            (spine, Meta::new(package.title, package.author))
+            let nav_starts = resolve_nav_starts(&archive, base, &package, &spine);
+            let cover_href = package.cover_href.map(|href| resolve(base, &href));
+            (
+                spine,
+                Meta::new(package.title, package.author),
+                cover_href,
+                nav_starts,
+            )
         };
-        Ok(Self { bytes, spine, meta })
+        Ok(Self {
+            bytes,
+            spine,
+            meta,
+            cover_href,
+            nav_starts,
+        })
+    }
+
+    /// Spine indices that begin a real chapter per the table of contents,
+    /// sorted and deduplicated. Empty when the book has no usable TOC.
+    #[must_use]
+    pub fn nav_starts(&self) -> &[usize] {
+        &self.nav_starts
     }
 
     #[must_use]
@@ -85,6 +112,20 @@ impl Epub {
     pub fn read_resource(&self, path: &str) -> Result<Vec<u8>, Error> {
         zip::Archive::open(&self.bytes)?.read(path)
     }
+
+    /// The raw (undecoded) bytes of the cover image, if the OPF identified one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MissingEntry`] if no cover was identified, or a read
+    /// error if the identified entry cannot be inflated.
+    pub fn cover(&self) -> Result<Vec<u8>, Error> {
+        let href = self
+            .cover_href
+            .as_deref()
+            .ok_or_else(|| Error::MissingEntry(String::from("cover image")))?;
+        self.read_resource(href)
+    }
 }
 
 /// Parse the bytes of an `.epub` file into a [`Document`], one chapter per
@@ -110,6 +151,59 @@ pub fn parse(bytes: &[u8]) -> Result<Document, Error> {
         return Err(Error::Empty);
     }
     Ok(Document::new(epub.meta().clone(), chapters))
+}
+
+/// Map a reader's current spine index to a real chapter number using the
+/// chapter-start indices from [`Epub::nav_starts`].
+///
+/// Returns `(chapter, total)` where `chapter` is the 1-based real-chapter
+/// number and `total` the real-chapter count; a `chapter` of `0` means the
+/// position is in front matter, before the first real chapter. Returns `None`
+/// when `nav_starts` is empty (no usable TOC), signalling the caller to number
+/// raw spine items instead.
+#[must_use]
+pub fn chapter_number(nav_starts: &[usize], spine_index: usize) -> Option<(usize, usize)> {
+    if nav_starts.is_empty() {
+        return None;
+    }
+    let chapter = nav_starts.partition_point(|&start| start <= spine_index);
+    Some((chapter, nav_starts.len()))
+}
+
+// read and parse the TOC document, mapping each of its content targets to a
+// spine index to yield the sorted, deduplicated set of chapter-start indices.
+// an absent/unreadable TOC or one that resolves to fewer than two spine items
+// yields an empty set, so the caller falls back to raw spine numbering.
+fn resolve_nav_starts(
+    archive: &zip::Archive,
+    base: &str,
+    package: &opf::Package,
+    spine: &[String],
+) -> Vec<usize> {
+    let Some(toc_href) = package.toc_href.as_deref() else {
+        return Vec::new();
+    };
+    let toc_path = resolve(base, toc_href);
+    let Ok(bytes) = archive.read(&toc_path) else {
+        return Vec::new();
+    };
+    let toc_base = dir_of(&toc_path);
+
+    let mut starts: Vec<usize> = toc::targets(&bytes, package.toc_is_ncx)
+        .iter()
+        .filter_map(|target| {
+            let abs = resolve(toc_base, target);
+            spine.iter().position(|href| href == &abs)
+        })
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+
+    if starts.len() >= 2 {
+        starts
+    } else {
+        Vec::new()
+    }
 }
 
 fn dir_of(path: &str) -> &str {

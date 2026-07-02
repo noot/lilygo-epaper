@@ -91,6 +91,7 @@ use crate::{
             read_info,
             INFO_REFRESH_TICKS,
         },
+        library,
         lora::{
             draw_keyboard,
             draw_list,
@@ -379,6 +380,17 @@ async fn main(_spawner: Spawner) -> ! {
     let mut env_view = environment::View::Loading;
     let mut env_dirty = false;
 
+    // library (reader shelf) state: the scanned books, the scroll offset into
+    // them, and a flag that a fresh scan is needed on the next pass (set on entry
+    // and on returning from the reader, mirrors `files_dirty`).
+    let mut library_view = library::View::Loading;
+    let mut library_scroll: usize = 0;
+    let mut library_dirty = false;
+
+    // the screen the reader returns to on Back: the file browser or the library,
+    // depending on where the book was opened from.
+    let mut reader_return = Screen::Files;
+
     #[cfg(feature = "gps")]
     let mut gps_refresh: u16 = 0;
     // last good position, kept so a dropped fix shows the previous coordinates
@@ -506,6 +518,9 @@ async fn main(_spawner: Spawner) -> ! {
                 Screen::Settings => draw_settings_screen(&mut display, &settings),
                 Screen::Music => music::draw_screen(&mut display, &music_view, music_status),
                 Screen::Environment => environment::draw_screen(&mut display, &env_view),
+                Screen::Library => {
+                    library::draw_screen(&mut display, &library_view, library_scroll)
+                }
             }
             // a transient flush error shouldn't reboot the ui mid-session; log
             // it and carry on (the next redraw will try again).
@@ -670,6 +685,14 @@ async fn main(_spawner: Spawner) -> ! {
                                     env_dirty = true;
                                     needs_redraw = true;
                                 }
+                                // the shelf paints a "scanning" view now, then
+                                // scans the card on the next pass.
+                                Screen::Library => {
+                                    library_view = library::View::Loading;
+                                    library_scroll = 0;
+                                    library_dirty = true;
+                                    needs_redraw = true;
+                                }
                                 _ => needs_redraw = true,
                             }
                         }
@@ -821,6 +844,7 @@ async fn main(_spawner: Spawner) -> ! {
                                         } else if is_reader(&entry.name) {
                                             reader_path = entry.path.clone();
                                             reader_dirty = true;
+                                            reader_return = Screen::Files;
                                             current_screen = Screen::Reader;
                                         } else {
                                             files_status =
@@ -845,7 +869,10 @@ async fn main(_spawner: Spawner) -> ! {
                             if let Some(doc) = &reader_doc {
                                 doc.save();
                             }
-                            current_screen = Screen::Files;
+                            // returning to the shelf rescans so the just-read
+                            // book's progress is up to date (cache-fast).
+                            library_dirty = reader_return == Screen::Library;
+                            current_screen = reader_return;
                             needs_redraw = true;
                         } else if let Some(doc) = &mut reader_doc {
                             let changed = match tap_zone(sx, sy) {
@@ -955,6 +982,31 @@ async fn main(_spawner: Spawner) -> ! {
                             env_view = environment::View::Loading;
                             env_dirty = true;
                             needs_redraw = true;
+                        }
+                    }
+                    Screen::Library => {
+                        if back_button_hit(sx, sy) {
+                            current_screen = Screen::Home;
+                            needs_redraw = true;
+                        } else if let library::View::Ready(books) = &library_view {
+                            if library::scroll_up_hit(sx, sy) {
+                                if library_scroll >= library::VISIBLE {
+                                    library_scroll -= library::VISIBLE;
+                                    needs_redraw = true;
+                                }
+                            } else if library::scroll_down_hit(sx, sy) {
+                                if library_scroll + library::VISIBLE < books.len() {
+                                    library_scroll += library::VISIBLE;
+                                    needs_redraw = true;
+                                }
+                            } else if let Some(idx) =
+                                library::card_hit(sx, sy, library_scroll, books.len())
+                            {
+                                reader_path = String::from(books[idx].path());
+                                reader_dirty = true;
+                                reader_return = Screen::Library;
+                                current_screen = Screen::Reader;
+                            }
                         }
                     }
                     _ => {
@@ -1078,6 +1130,17 @@ async fn main(_spawner: Spawner) -> ! {
                 Some(body) => environment::parse(&body),
                 None => environment::View::Error,
             };
+            needs_redraw = true;
+        }
+
+        // scan the SD card for the book shelf when the library is opened (or
+        // re-entered from the reader). the `!needs_redraw` guard lets the
+        // "scanning" view paint first, since the scan can be slow on first run
+        // (it parses each new epub and decodes its cover). self-contained mount,
+        // so it never conflicts with the radio, which is dropped off-screen.
+        if current_screen == Screen::Library && library_dirty && !needs_redraw {
+            library_dirty = false;
+            library_view = library::load_library();
             needs_redraw = true;
         }
 
