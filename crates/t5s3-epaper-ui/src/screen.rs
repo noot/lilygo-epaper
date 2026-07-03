@@ -14,6 +14,9 @@ pub(crate) enum Screen {
     Environment,
     Library,
     Weather,
+    SettingsSystem,
+    SettingsReader,
+    SettingsWifi,
 }
 
 impl Screen {
@@ -33,6 +36,9 @@ impl Screen {
             Screen::Environment => 11,
             Screen::Library => 12,
             Screen::Weather => 13,
+            Screen::SettingsSystem => 14,
+            Screen::SettingsReader => 15,
+            Screen::SettingsWifi => 16,
         }
     }
 
@@ -51,6 +57,9 @@ impl Screen {
             11 => Screen::Environment,
             12 => Screen::Library,
             13 => Screen::Weather,
+            14 => Screen::SettingsSystem,
+            15 => Screen::SettingsReader,
+            16 => Screen::SettingsWifi,
             _ => Screen::Home,
         }
     }

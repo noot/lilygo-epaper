@@ -23,7 +23,7 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 - [x] **WiFi** — via `esp-wifi` crate
 - [ ] **BLE** — via `esp-wifi` crate
 - [ ] **waveform LUT temperature compensation** — use TPS65185 temp sensor to select waveform table at draw time
-- [ ] join wifi network page/setting, displays current connection if any
+- [x] join wifi network page/setting, displays current connection if any
 
 ## file handling and management
 - [x] sd card file browser in UI
