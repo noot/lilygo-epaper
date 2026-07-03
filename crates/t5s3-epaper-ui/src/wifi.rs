@@ -119,10 +119,12 @@ pub(crate) async fn sync_time(wifi: esp_hal::peripherals::WIFI<'static>) -> Opti
 // mirrors `sync_time`: it drives the network stack alongside the request work
 // via `select`, so everything drops when the request finishes and
 // WifiController's Drop deinitialises the radio. returns the response body, or
-// None on any failure. used by the environment page for its small json fetch.
+// None on any failure. `max_body` caps how much body is buffered: a few kB for
+// the environment page's json, much larger for the gps page's map image.
 pub(crate) async fn http_get(
     wifi: esp_hal::peripherals::WIFI<'static>,
     path: &str,
+    max_body: usize,
 ) -> Option<Vec<u8>> {
     let station_config = Config::Station(
         StationConfig::default()
@@ -150,7 +152,7 @@ pub(crate) async fn http_get(
         with_timeout(Duration::from_secs(15), stack.wait_config_up())
             .await
             .ok()?;
-        request(stack, "GET", path, 8192).await
+        request(stack, "GET", path, max_body).await
     })
     .await;
 

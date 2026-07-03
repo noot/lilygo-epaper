@@ -18,6 +18,10 @@ use crate::{
     layout::{screen_to_native_rect, SCREEN_W, STATUS_H},
 };
 
+// loop passes between status-bar battery refreshes. the charge changes slowly,
+// so a coarse interval keeps the indicator current without frequent partials.
+pub(crate) const BATTERY_REFRESH_TICKS: u16 = 600;
+
 fn draw_battery_icon(display: &mut Display, x: i32, y: i32, pct: u16) {
     let body_w: u32 = 30;
     let body_h: u32 = 20;
@@ -61,20 +65,7 @@ pub(crate) fn draw_status_bar(
     time: Option<(u32, u32)>,
     time_24h: bool,
 ) {
-    let status_font = MonoTextStyle::new(&FONT_9X15, Gray4::BLACK);
-
-    let mut buf = FmtBuf::<8>::new();
-    write!(buf, "{}%", pct.min(100)).ok();
-    Text::with_alignment(
-        buf.as_str(),
-        Point::new(491, 35),
-        status_font,
-        Alignment::Right,
-    )
-    .draw(display)
-    .ok();
-
-    draw_battery_icon(display, 497, 20, pct);
+    draw_statusbar_battery(display, pct);
     draw_statusbar_time(display, time, time_24h);
 
     Rectangle::new(Point::new(0, STATUS_H - 2), Size::new(SCREEN_W as u32, 2))
@@ -112,6 +103,32 @@ pub(crate) fn draw_statusbar_time(display: &mut Display, time: Option<(u32, u32)
 
 pub(crate) fn statusbar_time_rect() -> t5s3_epaper_core::display::Rectangle {
     screen_to_native_rect(210, 18, 120, 30)
+}
+
+// the battery percentage and icon at the right of the status bar. drawn over a
+// white fill so the periodic partial refresh cleanly replaces the previous
+// value as the charge changes.
+pub(crate) fn draw_statusbar_battery(display: &mut Display, pct: u16) {
+    Rectangle::new(Point::new(448, 18), Size::new(90, 26))
+        .into_styled(PrimitiveStyle::with_fill(Gray4::WHITE))
+        .draw(display)
+        .ok();
+    let status_font = MonoTextStyle::new(&FONT_9X15, Gray4::BLACK);
+    let mut buf = FmtBuf::<8>::new();
+    write!(buf, "{}%", pct.min(100)).ok();
+    Text::with_alignment(
+        buf.as_str(),
+        Point::new(491, 35),
+        status_font,
+        Alignment::Right,
+    )
+    .draw(display)
+    .ok();
+    draw_battery_icon(display, 497, 20, pct);
+}
+
+pub(crate) fn statusbar_battery_rect() -> t5s3_epaper_core::display::Rectangle {
+    screen_to_native_rect(448, 18, 90, 26)
 }
 
 pub(crate) fn draw_back_button(display: &mut Display) {

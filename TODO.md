@@ -31,7 +31,7 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 - [x] epub/txt/markdown reader (lazy per-chapter epub parsing, JPEG/PNG image rendering with dithering, content-hashed resume)
 
 ## GPS
-- [ ] cached map with location rendering
+- [x] cached map with location rendering
 
 ## LoRa
 - [ ] define message types (protos?)

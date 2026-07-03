@@ -3,13 +3,14 @@ use core::fmt::Write as _;
 use embedded_graphics::{
     mono_font::{ascii::FONT_6X10, MonoTextStyle},
     prelude::*,
-    primitives::{PrimitiveStyle, Rectangle},
-    text::Text,
+    primitives::{Circle, PrimitiveStyle, Rectangle},
+    text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
+use epub_reader::{decode_image, GrayImage};
 use t5s3_epaper_core::{gps::Gps, Display};
 
-use crate::{fmt::FmtBuf, layout::screen_to_native_rect};
+use crate::{fmt::FmtBuf, layout::screen_to_native_rect, widgets::draw_image_fit};
 
 // loop ticks between GPS readout refreshes (~50ms per tick)
 pub(crate) const GPS_REFRESH_TICKS: u16 = 30;
@@ -181,4 +182,94 @@ pub(crate) fn draw_gps_data(display: &mut Display, gps: &Gps<'_>, last_fix: Opti
 
 pub(crate) fn gps_data_native_rect() -> t5s3_epaper_core::display::Rectangle {
     screen_to_native_rect(30, 170, 480, 300)
+}
+
+// the map panel below the readout: a static, grayscale map centered on the
+// current fix, fetched from noot-server (the device speaks plain http only, so
+// it cannot reach a tile server directly; the server renders and downscales).
+const MAP_X: i32 = 30;
+const MAP_Y: i32 = 500;
+const MAP_W: u32 = 480;
+const MAP_H: u32 = 400;
+// street-level zoom for the requested map.
+const MAP_ZOOM: u8 = 15;
+// upper bound on the map image body buffered over http. a downscaled grayscale
+// jpeg for this panel is well under this; larger responses are dropped.
+pub(crate) const MAP_MAX_BYTES: usize = 256 * 1024;
+
+// what the map panel is currently showing.
+pub(crate) enum MapView {
+    Loading,
+    // no GPS position yet, so there is no center to request a map for.
+    NoFix,
+    Ready(GrayImage),
+    Error,
+}
+
+// the noot-server request path for a map centered on a position, sized to the
+// panel so the server renders it at the right resolution.
+pub(crate) fn map_path(lat: f64, lon: f64) -> FmtBuf<96> {
+    let mut buf = FmtBuf::<96>::new();
+    write!(
+        buf,
+        "/api/map?lat={lat:.5}&lon={lon:.5}&zoom={MAP_ZOOM}&w={MAP_W}&h={MAP_H}"
+    )
+    .ok();
+    buf
+}
+
+// decode a map image response body into a view.
+pub(crate) fn parse_map(body: &[u8]) -> MapView {
+    match decode_image(body) {
+        Ok(img) => MapView::Ready(img),
+        Err(_) => MapView::Error,
+    }
+}
+
+pub(crate) fn draw_map(display: &mut Display, view: &MapView) {
+    Rectangle::new(Point::new(MAP_X, MAP_Y), Size::new(MAP_W, MAP_H))
+        .into_styled(PrimitiveStyle::with_stroke(Gray4::BLACK, 2))
+        .draw(display)
+        .ok();
+
+    match view {
+        MapView::Loading => map_label(display, "loading map..."),
+        MapView::NoFix => map_label(display, "waiting for GPS fix..."),
+        MapView::Error => map_label(display, "map unavailable"),
+        MapView::Ready(img) => {
+            draw_image_fit(display, img, MAP_X, MAP_Y, MAP_W, MAP_H);
+            draw_marker(display, MAP_X + MAP_W as i32 / 2, MAP_Y + MAP_H as i32 / 2);
+        }
+    }
+}
+
+// a "you are here" dot at the map center. the white halo and black ring keep it
+// visible over any map tone the panel renders underneath.
+fn draw_marker(display: &mut Display, cx: i32, cy: i32) {
+    let halo = 9;
+    Circle::new(Point::new(cx - halo, cy - halo), (halo * 2) as u32)
+        .into_styled(PrimitiveStyle::with_fill(Gray4::WHITE))
+        .draw(display)
+        .ok();
+    Circle::new(Point::new(cx - halo, cy - halo), (halo * 2) as u32)
+        .into_styled(PrimitiveStyle::with_stroke(Gray4::BLACK, 2))
+        .draw(display)
+        .ok();
+    let dot = 4;
+    Circle::new(Point::new(cx - dot, cy - dot), (dot * 2) as u32)
+        .into_styled(PrimitiveStyle::with_fill(Gray4::BLACK))
+        .draw(display)
+        .ok();
+}
+
+fn map_label(display: &mut Display, text: &str) {
+    let style = MonoTextStyle::new(&FONT_6X10, Gray4::new(4));
+    Text::with_alignment(
+        text,
+        Point::new(MAP_X + MAP_W as i32 / 2, MAP_Y + MAP_H as i32 / 2),
+        style,
+        Alignment::Center,
+    )
+    .draw(display)
+    .ok();
 }

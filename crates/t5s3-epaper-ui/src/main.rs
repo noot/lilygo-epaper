@@ -49,9 +49,14 @@ use t5s3_epaper_core::{gps::Gps, gps_pin_config};
 use crate::pages::gps::{
     current_fix,
     draw_gps_data,
+    draw_map,
     gps_data_native_rect,
+    map_path,
+    parse_map,
     GpsFix,
+    MapView,
     GPS_REFRESH_TICKS,
+    MAP_MAX_BYTES,
 };
 use crate::{
     datetime::{status_date, status_time, status_time_secs},
@@ -148,8 +153,11 @@ use crate::{
         back_button_hit,
         draw_back_button,
         draw_status_bar,
+        draw_statusbar_battery,
         draw_statusbar_time,
+        statusbar_battery_rect,
         statusbar_time_rect,
+        BATTERY_REFRESH_TICKS,
     },
     wifi::{http_get, http_get_from, music_session, set_utc_time, sync_time, RESYNC_INTERVAL_SECS},
 };
@@ -347,6 +355,8 @@ async fn main(_spawner: Spawner) -> ! {
     let mut kb_shift = false;
     // ticks since the info page was last refreshed (uptime/temp/voltage).
     let mut info_refresh: u16 = 0;
+    // ticks since the status-bar battery indicator was last refreshed.
+    let mut battery_refresh: u16 = 0;
 
     // sd-card browser state: the directory being viewed, its (sorted) listing, a
     // scroll offset into that listing, a footer status/detail line, and a flag
@@ -416,6 +426,13 @@ async fn main(_spawner: Spawner) -> ! {
     #[cfg(feature = "gps")]
     let mut last_fix: Option<GpsFix> = None;
 
+    // the gps page's map panel: the last fetched view plus a flag that a fresh
+    // fetch is needed on the next pass (set on entry and on tap-to-refresh).
+    #[cfg(feature = "gps")]
+    let mut gps_map = MapView::Loading;
+    #[cfg(feature = "gps")]
+    let mut gps_map_dirty = false;
+
     loop {
         if needs_redraw {
             let pct = display.battery_percentage().unwrap_or(0);
@@ -447,7 +464,10 @@ async fn main(_spawner: Spawner) -> ! {
 
                     #[cfg(feature = "gps")]
                     match &gps {
-                        Some(g) => draw_gps_data(&mut display, g, last_fix),
+                        Some(g) => {
+                            draw_gps_data(&mut display, g, last_fix);
+                            draw_map(&mut display, &gps_map);
+                        }
                         None => {
                             let small = MonoTextStyle::new(&FONT_6X10, Gray4::new(4));
                             Text::with_alignment(
@@ -549,6 +569,7 @@ async fn main(_spawner: Spawner) -> ! {
             needs_redraw = false;
             last_status_minute = now.map_or(60, |(_, m)| m);
             info_refresh = 0;
+            battery_refresh = 0;
 
             #[cfg(feature = "gps")]
             {
@@ -564,6 +585,19 @@ async fn main(_spawner: Spawner) -> ! {
                     draw_statusbar_time(&mut display, Some((h, m)), settings.time_24h);
                     display.flush_partial_fast(statusbar_time_rect()).ok();
                 }
+            }
+        }
+
+        // refresh the status-bar battery indicator periodically so the charge
+        // stays current without switching pages. the image viewer hides the
+        // status bar, so skip it there.
+        if !needs_redraw && current_screen != Screen::Image {
+            battery_refresh += 1;
+            if battery_refresh >= BATTERY_REFRESH_TICKS {
+                battery_refresh = 0;
+                let pct = display.battery_percentage().unwrap_or(0);
+                draw_statusbar_battery(&mut display, pct);
+                display.flush_partial_fast(statusbar_battery_rect()).ok();
             }
         }
 
@@ -715,6 +749,14 @@ async fn main(_spawner: Spawner) -> ! {
                                     library_view = library::View::Loading;
                                     library_scroll = 0;
                                     library_dirty = true;
+                                    needs_redraw = true;
+                                }
+                                // the gps page paints its map panel as "loading"
+                                // now, then fetches over wifi on the next pass.
+                                #[cfg(feature = "gps")]
+                                Screen::Gps => {
+                                    gps_map = MapView::Loading;
+                                    gps_map_dirty = true;
                                     needs_redraw = true;
                                 }
                                 _ => needs_redraw = true,
@@ -1044,6 +1086,18 @@ async fn main(_spawner: Spawner) -> ! {
                             }
                         }
                     }
+                    #[cfg(feature = "gps")]
+                    Screen::Gps => {
+                        if back_button_hit(sx, sy) {
+                            current_screen = Screen::Home;
+                            needs_redraw = true;
+                        } else {
+                            // a tap anywhere else re-fetches the map.
+                            gps_map = MapView::Loading;
+                            gps_map_dirty = true;
+                            needs_redraw = true;
+                        }
+                    }
                     _ => {
                         if back_button_hit(sx, sy) {
                             current_screen = Screen::Home;
@@ -1161,9 +1215,28 @@ async fn main(_spawner: Spawner) -> ! {
             env_dirty = false;
             let path = environment::path();
             let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-            env_view = match http_get(wifi, path.as_str()).await {
+            env_view = match http_get(wifi, path.as_str(), 8192).await {
                 Some(body) => environment::parse(&body),
                 None => environment::View::Error,
+            };
+            needs_redraw = true;
+        }
+
+        // fetch the map for the gps page's current fix. mirrors the weather
+        // fetch: without a fix there is no center to request a map for.
+        #[cfg(feature = "gps")]
+        if current_screen == Screen::Gps && gps_map_dirty && !needs_redraw {
+            gps_map_dirty = false;
+            gps_map = match last_fix {
+                Some(fix) => {
+                    let path = map_path(fix.lat(), fix.lon());
+                    let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
+                    match http_get(wifi, path.as_str(), MAP_MAX_BYTES).await {
+                        Some(body) => parse_map(&body),
+                        None => MapView::Error,
+                    }
+                }
+                None => MapView::NoFix,
             };
             needs_redraw = true;
         }
