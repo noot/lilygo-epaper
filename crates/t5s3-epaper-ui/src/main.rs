@@ -422,6 +422,10 @@ async fn main(_spawner: Spawner) -> ! {
     let mut wifi_pw_mode = false;
     let mut wifi_pw_ssid = String::new();
     let mut wifi_pw_buf = String::new();
+    // set when the pending join is a reconnect to the already-saved network using
+    // its stored password: on failure we fall back to the password keyboard so
+    // stale credentials can be re-entered, rather than reporting a plain error.
+    let mut wifi_reconnect = false;
 
     // the screen the reader returns to on Back: the file browser or the library,
     // depending on where the book was opened from.
@@ -1166,13 +1170,18 @@ async fn main(_spawner: Spawner) -> ! {
                                 Some(settings_page::wifi::Hit::Network(i)) => {
                                     if let Some(entry) = wifi_networks.get(i) {
                                         if entry.ssid == settings.wifi_ssid() {
-                                            // already the saved network: don't
-                                            // re-prompt, just say so.
-                                            wifi_status = format!("already using {}", entry.ssid);
-                                            needs_redraw = true;
+                                            // already the saved network: reconnect
+                                            // with the stored password instead of
+                                            // re-prompting.
+                                            wifi_pw_ssid = entry.ssid.clone();
+                                            wifi_pw_buf = String::from(settings.wifi_password());
+                                            wifi_reconnect = true;
+                                            wifi_join_dirty = true;
+                                            wifi_status = String::from("reconnecting...");
                                         } else {
                                             wifi_pw_ssid = entry.ssid.clone();
                                             wifi_pw_buf.clear();
+                                            wifi_reconnect = false;
                                             if entry.secured {
                                                 // secured: collect the passphrase first.
                                                 kb_symbols = false;
@@ -1183,8 +1192,8 @@ async fn main(_spawner: Spawner) -> ! {
                                                 wifi_join_dirty = true;
                                                 wifi_status = String::from("connecting...");
                                             }
-                                            needs_redraw = true;
                                         }
+                                        needs_redraw = true;
                                     }
                                 }
                                 None => {}
@@ -1512,11 +1521,20 @@ async fn main(_spawner: Spawner) -> ! {
         // guard so the "connecting..." view paints before the blocking join.
         if current_screen == Screen::SettingsWifi && wifi_join_dirty && !needs_redraw {
             wifi_join_dirty = false;
+            let reconnect = wifi_reconnect;
+            wifi_reconnect = false;
             let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
             if try_connect(wifi, &wifi_pw_ssid, &wifi_pw_buf).await {
                 settings.set_wifi(&wifi_pw_ssid, &wifi_pw_buf);
                 settings_dirty = true;
                 wifi_status = format!("connected: {wifi_pw_ssid}");
+            } else if reconnect {
+                // the saved password no longer works: drop into the keyboard
+                // (pre-filled with it) so the user can correct it.
+                kb_symbols = false;
+                kb_shift = false;
+                wifi_pw_mode = true;
+                wifi_status = String::from("reconnect failed - re-enter password");
             } else {
                 wifi_status = String::from("join failed - check password");
             }
