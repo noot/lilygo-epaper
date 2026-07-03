@@ -61,8 +61,25 @@ pub(crate) fn draw_status_bar(
     time: Option<(u32, u32)>,
     time_24h: bool,
 ) {
-    let status_font = MonoTextStyle::new(&FONT_9X15, Gray4::BLACK);
+    draw_statusbar_battery(display, pct);
+    draw_statusbar_time(display, time, time_24h);
 
+    Rectangle::new(Point::new(0, STATUS_H - 2), Size::new(SCREEN_W as u32, 2))
+        .into_styled(PrimitiveStyle::with_fill(Gray4::new(8)))
+        .draw(display)
+        .ok();
+}
+
+// the battery readout (percentage + icon) at the right of the status bar, drawn
+// over a white fill so the once-a-minute partial refresh cleanly replaces the
+// previous value.
+pub(crate) fn draw_statusbar_battery(display: &mut Display, pct: u16) {
+    Rectangle::new(Point::new(450, 15), Size::new(84, 28))
+        .into_styled(PrimitiveStyle::with_fill(Gray4::WHITE))
+        .draw(display)
+        .ok();
+
+    let status_font = MonoTextStyle::new(&FONT_9X15, Gray4::BLACK);
     let mut buf = FmtBuf::<8>::new();
     write!(buf, "{}%", pct.min(100)).ok();
     Text::with_alignment(
@@ -75,12 +92,10 @@ pub(crate) fn draw_status_bar(
     .ok();
 
     draw_battery_icon(display, 497, 20, pct);
-    draw_statusbar_time(display, time, time_24h);
+}
 
-    Rectangle::new(Point::new(0, STATUS_H - 2), Size::new(SCREEN_W as u32, 2))
-        .into_styled(PrimitiveStyle::with_fill(Gray4::new(8)))
-        .draw(display)
-        .ok();
+pub(crate) fn statusbar_battery_rect() -> t5s3_epaper_core::display::Rectangle {
+    screen_to_native_rect(450, 15, 84, 28)
 }
 
 // the clock shown centered in the status bar (24-hour HH:MM, 12-hour h:MM with

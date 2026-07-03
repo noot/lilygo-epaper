@@ -148,7 +148,9 @@ use crate::{
         back_button_hit,
         draw_back_button,
         draw_status_bar,
+        draw_statusbar_battery,
         draw_statusbar_time,
+        statusbar_battery_rect,
         statusbar_time_rect,
     },
     wifi::{http_get, http_get_from, music_session, set_utc_time, sync_time, RESYNC_INTERVAL_SECS},
@@ -556,13 +558,18 @@ async fn main(_spawner: Spawner) -> ! {
             }
         }
 
-        // tick the status-bar clock once a minute via a fast partial refresh.
+        // tick the status-bar clock and battery once a minute via fast partial
+        // refreshes.
         if !needs_redraw {
             if let Some((h, m)) = status_time(&mut clock, settings.tz_offset_hours) {
                 if m != last_status_minute {
                     last_status_minute = m;
                     draw_statusbar_time(&mut display, Some((h, m)), settings.time_24h);
                     display.flush_partial_fast(statusbar_time_rect()).ok();
+
+                    let pct = display.battery_percentage().unwrap_or(0);
+                    draw_statusbar_battery(&mut display, pct);
+                    display.flush_partial_fast(statusbar_battery_rect()).ok();
                 }
             }
         }

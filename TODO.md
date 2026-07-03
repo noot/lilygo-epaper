@@ -59,6 +59,6 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 # bug fixes
 
 - [x] sleep doesn't properly deep sleep - battery still drains quite a lot
-- [ ] battery percentage only refreshes when a new page is loaded
+- [x] battery percentage only refreshes when a new page is loaded
 - [ ] keyboard "send" button is unresponsive at times (lower right corner issue?)
 - [ ] if clock fails to sync it doesn't resync - have button in info to try to sync
