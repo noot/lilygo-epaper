@@ -126,7 +126,12 @@ macro_rules! icon_set {
                 include_bytes!(concat!("../../assets/icons/", $dir, "/weather.bmp"))
             }
             Screen::Library => include_bytes!(concat!("../../assets/icons/", $dir, "/reader.bmp")),
-            Screen::Home | Screen::Image | Screen::Reader => return None,
+            Screen::Home
+            | Screen::Image
+            | Screen::Reader
+            | Screen::SettingsSystem
+            | Screen::SettingsReader
+            | Screen::SettingsWifi => return None,
         }
     };
 }

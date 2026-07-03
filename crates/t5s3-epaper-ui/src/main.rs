@@ -6,6 +6,7 @@ extern crate t5s3_epaper_core;
 
 mod datetime;
 mod fmt;
+mod keyboard;
 mod layout;
 mod pages;
 mod screen;
@@ -60,6 +61,7 @@ use crate::pages::gps::{
 };
 use crate::{
     datetime::{status_date, status_time, status_time_secs},
+    keyboard::Key,
     layout::{touch_to_screen, SCREEN_W},
     pages::{
         environment,
@@ -98,19 +100,15 @@ use crate::{
         },
         library,
         lora::{
-            draw_keyboard,
             draw_list,
             draw_lora_screen,
             draw_lora_status,
             draw_message,
-            kb_hit,
-            keyboard_native_rect,
             lora_status_native_rect,
             make_radio,
             message_box_native_rect,
             received_native_rect,
             sent_native_rect,
-            Key,
             LIST_MAX,
             MSG_MAX,
             RECV_Y,
@@ -118,25 +116,7 @@ use crate::{
         },
         music,
         reader::{draw as draw_reader, is_reader, load_document, tap_zone, ReaderDoc, Tap},
-        settings::{
-            draw_settings_screen,
-            family_button_rect,
-            font_size_button_rect,
-            format_button_rect,
-            hit_test as settings_hit,
-            icon_size_button_rect,
-            icons_button_rect,
-            redraw_family,
-            redraw_font_size,
-            redraw_format,
-            redraw_icon_size,
-            redraw_icons,
-            redraw_spacing,
-            redraw_tz,
-            spacing_button_rect,
-            tz_value_rect,
-            Hit as SettingsHit,
-        },
+        settings::{self as settings_page, MenuHit},
         sleep::{
             draw_power_off_screen,
             draw_screensaver,
@@ -159,7 +139,17 @@ use crate::{
         statusbar_time_rect,
         BATTERY_REFRESH_TICKS,
     },
-    wifi::{http_get, http_get_from, music_session, set_utc_time, sync_time, RESYNC_INTERVAL_SECS},
+    wifi::{
+        http_get,
+        http_get_from,
+        music_session,
+        scan as wifi_scan,
+        set_utc_time,
+        sync_time,
+        try_connect,
+        ScanEntry,
+        RESYNC_INTERVAL_SECS,
+    },
 };
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -312,7 +302,13 @@ async fn main(_spawner: Spawner) -> ! {
         .ok();
         display.flush(DrawMode::BlackOnWhite).expect("to flush");
 
-        match sync_time(peripherals.WIFI).await {
+        match sync_time(
+            peripherals.WIFI,
+            settings.wifi_ssid(),
+            settings.wifi_password(),
+        )
+        .await
+        {
             Some(unix) => set_utc_time(&mut clock, unix),
             None => esp_println::println!("clock: wifi/ntp sync failed, time unavailable"),
         }
@@ -414,6 +410,18 @@ async fn main(_spawner: Spawner) -> ! {
     let mut library_view = library::View::Loading;
     let mut library_scroll: usize = 0;
     let mut library_dirty = false;
+
+    // wifi settings page state: the last scan results, a status line, and flags
+    // that a scan or a join should run on the next pass (mirrors env/weather).
+    // `pw_mode` swaps the page to the password keyboard for the network being
+    // joined (`pw_ssid`), accumulating the typed passphrase in `pw_buf`.
+    let mut wifi_networks: Vec<ScanEntry> = Vec::new();
+    let mut wifi_status = String::from("tap Scan to find networks");
+    let mut wifi_scan_dirty = false;
+    let mut wifi_join_dirty = false;
+    let mut wifi_pw_mode = false;
+    let mut wifi_pw_ssid = String::new();
+    let mut wifi_pw_buf = String::new();
 
     // the screen the reader returns to on Back: the file browser or the library,
     // depending on where the book was opened from.
@@ -553,7 +561,27 @@ async fn main(_spawner: Spawner) -> ! {
                         }
                     }
                 }
-                Screen::Settings => draw_settings_screen(&mut display, &settings),
+                Screen::Settings => settings_page::draw_menu(&mut display),
+                Screen::SettingsSystem => settings_page::system::draw(&mut display, &settings),
+                Screen::SettingsReader => settings_page::reader::draw(&mut display, &settings),
+                Screen::SettingsWifi => {
+                    if wifi_pw_mode {
+                        settings_page::wifi::draw_password(
+                            &mut display,
+                            &wifi_pw_ssid,
+                            &wifi_pw_buf,
+                            kb_symbols,
+                            kb_shift,
+                        );
+                    } else {
+                        settings_page::wifi::draw_status(
+                            &mut display,
+                            settings.wifi_ssid(),
+                            &wifi_status,
+                            &wifi_networks,
+                        );
+                    }
+                }
                 Screen::Music => music::draw_screen(&mut display, &music_view, music_status),
                 Screen::Environment => environment::draw_screen(&mut display, &env_view),
                 Screen::Weather => weather::draw_screen(&mut display, &weather_view),
@@ -577,13 +605,18 @@ async fn main(_spawner: Spawner) -> ! {
             }
         }
 
-        // tick the status-bar clock once a minute via a fast partial refresh.
+        // tick the status-bar clock and battery once a minute via fast partial
+        // refreshes.
         if !needs_redraw {
             if let Some((h, m)) = status_time(&mut clock, settings.tz_offset_hours) {
                 if m != last_status_minute {
                     last_status_minute = m;
                     draw_statusbar_time(&mut display, Some((h, m)), settings.time_24h);
                     display.flush_partial_fast(statusbar_time_rect()).ok();
+
+                    let pct = display.battery_percentage().unwrap_or(0);
+                    draw_statusbar_battery(&mut display, pct);
+                    display.flush_partial_fast(statusbar_battery_rect()).ok();
                 }
             }
         }
@@ -653,7 +686,9 @@ async fn main(_spawner: Spawner) -> ! {
         if clock.now_us() / 1_000_000 >= last_resync_secs + RESYNC_INTERVAL_SECS {
             esp_println::println!("clock: periodic re-sync");
             let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-            if let Some(unix) = sync_time(wifi).await {
+            if let Some(unix) =
+                sync_time(wifi, settings.wifi_ssid(), settings.wifi_password()).await
+            {
                 set_utc_time(&mut clock, unix);
             }
             last_resync_secs = clock.now_us() / 1_000_000;
@@ -797,19 +832,19 @@ async fn main(_spawner: Spawner) -> ! {
                         if back_button_hit(sx, sy) {
                             current_screen = Screen::Home;
                             needs_redraw = true;
-                        } else if let Some(key) = kb_hit(sx, sy, kb_symbols, kb_shift) {
+                        } else if let Some(key) = keyboard::hit(sx, sy, kb_symbols, kb_shift) {
                             match key {
                                 Key::Shift => {
                                     kb_shift = !kb_shift;
-                                    draw_keyboard(&mut display, kb_symbols, kb_shift);
-                                    display.flush_partial_fast(keyboard_native_rect()).ok();
+                                    keyboard::draw(&mut display, kb_symbols, kb_shift, "SEND");
+                                    display.flush_partial_fast(keyboard::native_rect()).ok();
                                 }
                                 Key::Symbols => {
                                     kb_symbols = !kb_symbols;
-                                    draw_keyboard(&mut display, kb_symbols, kb_shift);
-                                    display.flush_partial_fast(keyboard_native_rect()).ok();
+                                    keyboard::draw(&mut display, kb_symbols, kb_shift, "SEND");
+                                    display.flush_partial_fast(keyboard::native_rect()).ok();
                                 }
-                                Key::Send => {
+                                Key::Enter => {
                                     if lora_message.is_empty() {
                                         lora_status = String::from("nothing to send");
                                     } else if let Some(r) = &mut radio {
@@ -951,67 +986,211 @@ async fn main(_spawner: Spawner) -> ! {
                             }
                         }
                     }
-                    Screen::Settings => match settings_hit(sx, sy) {
-                        Some(SettingsHit::Back) => {
+                    Screen::Settings => match settings_page::menu_hit(sx, sy) {
+                        Some(MenuHit::Back) => {
                             current_screen = Screen::Home;
                             needs_redraw = true;
                         }
-                        Some(SettingsHit::TzMinus) => {
-                            settings.tz_offset_hours = (settings.tz_offset_hours - 1).max(-12);
-                            settings_dirty = true;
-                            redraw_tz(&mut display, settings.tz_offset_hours);
-                            display.flush_partial_fast(tz_value_rect()).ok();
-                            last_status_minute =
-                                refresh_statusbar_clock(&mut display, &mut clock, &settings);
+                        Some(MenuHit::System) => {
+                            current_screen = Screen::SettingsSystem;
+                            needs_redraw = true;
                         }
-                        Some(SettingsHit::TzPlus) => {
-                            settings.tz_offset_hours = (settings.tz_offset_hours + 1).min(14);
-                            settings_dirty = true;
-                            redraw_tz(&mut display, settings.tz_offset_hours);
-                            display.flush_partial_fast(tz_value_rect()).ok();
-                            last_status_minute =
-                                refresh_statusbar_clock(&mut display, &mut clock, &settings);
+                        Some(MenuHit::Reader) => {
+                            current_screen = Screen::SettingsReader;
+                            needs_redraw = true;
                         }
-                        Some(SettingsHit::ToggleFormat) => {
-                            settings.time_24h = !settings.time_24h;
-                            settings_dirty = true;
-                            redraw_format(&mut display, settings.time_24h);
-                            display.flush_partial_fast(format_button_rect()).ok();
-                            last_status_minute =
-                                refresh_statusbar_clock(&mut display, &mut clock, &settings);
-                        }
-                        Some(SettingsHit::CycleIcons) => {
-                            settings.icon_style = settings.icon_style.next();
-                            settings_dirty = true;
-                            redraw_icons(&mut display, &settings);
-                            display.flush_partial_fast(icons_button_rect()).ok();
-                        }
-                        Some(SettingsHit::CycleIconSize) => {
-                            settings.icon_size = settings.icon_size.next();
-                            settings_dirty = true;
-                            redraw_icon_size(&mut display, &settings);
-                            display.flush_partial_fast(icon_size_button_rect()).ok();
-                        }
-                        Some(SettingsHit::CycleFontSize) => {
-                            settings.reader_font_size = settings.reader_font_size.next();
-                            settings_dirty = true;
-                            redraw_font_size(&mut display, &settings);
-                            display.flush_partial_fast(font_size_button_rect()).ok();
-                        }
-                        Some(SettingsHit::CycleFontFamily) => {
-                            settings.reader_font_family = settings.reader_font_family.next();
-                            settings_dirty = true;
-                            redraw_family(&mut display, &settings);
-                            display.flush_partial_fast(family_button_rect()).ok();
-                        }
-                        Some(SettingsHit::CycleSpacing) => {
-                            settings.reader_line_spacing = settings.reader_line_spacing.next();
-                            settings_dirty = true;
-                            redraw_spacing(&mut display, &settings);
-                            display.flush_partial_fast(spacing_button_rect()).ok();
+                        Some(MenuHit::Wifi) => {
+                            wifi_pw_mode = false;
+                            // keep the previous scan list (and its status) cached;
+                            // only prompt to scan when there is nothing to show.
+                            if wifi_networks.is_empty() {
+                                wifi_status = String::from("tap Scan to find networks");
+                            }
+                            current_screen = Screen::SettingsWifi;
+                            needs_redraw = true;
                         }
                         None => {}
                     },
+                    Screen::SettingsSystem => match settings_page::system::hit_test(sx, sy) {
+                        Some(settings_page::system::Hit::Back) => {
+                            current_screen = Screen::Settings;
+                            needs_redraw = true;
+                        }
+                        Some(settings_page::system::Hit::TzMinus) => {
+                            settings.tz_offset_hours = (settings.tz_offset_hours - 1).max(-12);
+                            settings_dirty = true;
+                            settings_page::system::redraw_tz(
+                                &mut display,
+                                settings.tz_offset_hours,
+                            );
+                            display
+                                .flush_partial_fast(settings_page::system::tz_value_rect())
+                                .ok();
+                            last_status_minute =
+                                refresh_statusbar_clock(&mut display, &mut clock, &settings);
+                        }
+                        Some(settings_page::system::Hit::TzPlus) => {
+                            settings.tz_offset_hours = (settings.tz_offset_hours + 1).min(14);
+                            settings_dirty = true;
+                            settings_page::system::redraw_tz(
+                                &mut display,
+                                settings.tz_offset_hours,
+                            );
+                            display
+                                .flush_partial_fast(settings_page::system::tz_value_rect())
+                                .ok();
+                            last_status_minute =
+                                refresh_statusbar_clock(&mut display, &mut clock, &settings);
+                        }
+                        Some(settings_page::system::Hit::ToggleFormat) => {
+                            settings.time_24h = !settings.time_24h;
+                            settings_dirty = true;
+                            settings_page::system::redraw_format(&mut display, settings.time_24h);
+                            display
+                                .flush_partial_fast(settings_page::system::format_button_rect())
+                                .ok();
+                            last_status_minute =
+                                refresh_statusbar_clock(&mut display, &mut clock, &settings);
+                        }
+                        Some(settings_page::system::Hit::CycleIcons) => {
+                            settings.icon_style = settings.icon_style.next();
+                            settings_dirty = true;
+                            settings_page::system::redraw_icons(&mut display, &settings);
+                            display
+                                .flush_partial_fast(settings_page::system::icons_button_rect())
+                                .ok();
+                        }
+                        Some(settings_page::system::Hit::CycleIconSize) => {
+                            settings.icon_size = settings.icon_size.next();
+                            settings_dirty = true;
+                            settings_page::system::redraw_icon_size(&mut display, &settings);
+                            display
+                                .flush_partial_fast(settings_page::system::icon_size_button_rect())
+                                .ok();
+                        }
+                        None => {}
+                    },
+                    Screen::SettingsReader => match settings_page::reader::hit_test(sx, sy) {
+                        Some(settings_page::reader::Hit::Back) => {
+                            current_screen = Screen::Settings;
+                            needs_redraw = true;
+                        }
+                        Some(settings_page::reader::Hit::CycleFontSize) => {
+                            settings.reader_font_size = settings.reader_font_size.next();
+                            settings_dirty = true;
+                            settings_page::reader::redraw_font_size(&mut display, &settings);
+                            display
+                                .flush_partial_fast(settings_page::reader::font_size_button_rect())
+                                .ok();
+                        }
+                        Some(settings_page::reader::Hit::CycleFontFamily) => {
+                            settings.reader_font_family = settings.reader_font_family.next();
+                            settings_dirty = true;
+                            settings_page::reader::redraw_family(&mut display, &settings);
+                            display
+                                .flush_partial_fast(settings_page::reader::family_button_rect())
+                                .ok();
+                        }
+                        Some(settings_page::reader::Hit::CycleSpacing) => {
+                            settings.reader_line_spacing = settings.reader_line_spacing.next();
+                            settings_dirty = true;
+                            settings_page::reader::redraw_spacing(&mut display, &settings);
+                            display
+                                .flush_partial_fast(settings_page::reader::spacing_button_rect())
+                                .ok();
+                        }
+                        None => {}
+                    },
+                    Screen::SettingsWifi => {
+                        if wifi_pw_mode {
+                            if back_button_hit(sx, sy) {
+                                // cancel password entry, back to the status view.
+                                wifi_pw_mode = false;
+                                needs_redraw = true;
+                            } else if let Some(key) = keyboard::hit(sx, sy, kb_symbols, kb_shift) {
+                                match key {
+                                    Key::Shift => {
+                                        kb_shift = !kb_shift;
+                                        keyboard::draw(&mut display, kb_symbols, kb_shift, "SAVE");
+                                        display.flush_partial_fast(keyboard::native_rect()).ok();
+                                    }
+                                    Key::Symbols => {
+                                        kb_symbols = !kb_symbols;
+                                        keyboard::draw(&mut display, kb_symbols, kb_shift, "SAVE");
+                                        display.flush_partial_fast(keyboard::native_rect()).ok();
+                                    }
+                                    Key::Enter => {
+                                        // leave the keyboard and attempt the join on
+                                        // the next pass (so "connecting..." paints).
+                                        wifi_pw_mode = false;
+                                        wifi_join_dirty = true;
+                                        wifi_status = String::from("connecting...");
+                                        needs_redraw = true;
+                                    }
+                                    other => {
+                                        match other {
+                                            Key::Char(c) if wifi_pw_buf.len() < 63 => {
+                                                wifi_pw_buf.push(c)
+                                            }
+                                            Key::Space if wifi_pw_buf.len() < 63 => {
+                                                wifi_pw_buf.push(' ')
+                                            }
+                                            Key::Backspace => {
+                                                wifi_pw_buf.pop();
+                                            }
+                                            _ => {}
+                                        }
+                                        settings_page::wifi::redraw_password(
+                                            &mut display,
+                                            &wifi_pw_buf,
+                                        );
+                                        display
+                                            .flush_partial_fast(
+                                                settings_page::wifi::password_box_rect(),
+                                            )
+                                            .ok();
+                                    }
+                                }
+                            }
+                        } else {
+                            match settings_page::wifi::status_hit(sx, sy, wifi_networks.len()) {
+                                Some(settings_page::wifi::Hit::Back) => {
+                                    current_screen = Screen::Settings;
+                                    needs_redraw = true;
+                                }
+                                Some(settings_page::wifi::Hit::Scan) => {
+                                    wifi_status = String::from("scanning...");
+                                    wifi_scan_dirty = true;
+                                    needs_redraw = true;
+                                }
+                                Some(settings_page::wifi::Hit::Network(i)) => {
+                                    if let Some(entry) = wifi_networks.get(i) {
+                                        if entry.ssid == settings.wifi_ssid() {
+                                            // already the saved network: don't
+                                            // re-prompt, just say so.
+                                            wifi_status = format!("already using {}", entry.ssid);
+                                            needs_redraw = true;
+                                        } else {
+                                            wifi_pw_ssid = entry.ssid.clone();
+                                            wifi_pw_buf.clear();
+                                            if entry.secured {
+                                                // secured: collect the passphrase first.
+                                                kb_symbols = false;
+                                                kb_shift = false;
+                                                wifi_pw_mode = true;
+                                            } else {
+                                                // open network: join straight away.
+                                                wifi_join_dirty = true;
+                                                wifi_status = String::from("connecting...");
+                                            }
+                                            needs_redraw = true;
+                                        }
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
+                    }
                     Screen::Music => {
                         if back_button_hit(sx, sy) {
                             current_screen = Screen::Home;
@@ -1110,9 +1289,18 @@ async fn main(_spawner: Spawner) -> ! {
             None => touch_active = false,
         }
 
-        // persist any settings change once, after leaving the settings screen,
-        // instead of writing flash on every tap (flash wear).
-        if settings_dirty && current_screen != Screen::Settings {
+        // persist any settings change once, after leaving the settings screens
+        // (menu or any sub-page), instead of writing flash on every tap or on
+        // navigation between the sub-pages (flash wear).
+        if settings_dirty
+            && !matches!(
+                current_screen,
+                Screen::Settings
+                    | Screen::SettingsSystem
+                    | Screen::SettingsReader
+                    | Screen::SettingsWifi
+            )
+        {
             settings.save();
             settings_dirty = false;
         }
@@ -1169,7 +1357,13 @@ async fn main(_spawner: Spawner) -> ! {
             let inline = music_inline;
             music_inline = false;
             let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-            let snapshot = music_session(wifi, command.map(music::Button::command)).await;
+            let snapshot = music_session(
+                wifi,
+                settings.wifi_ssid(),
+                settings.wifi_password(),
+                command.map(music::Button::command),
+            )
+            .await;
             match snapshot {
                 Some(snap) => {
                     music_view = music::build_view(&snap.json, snap.cover.as_deref());
@@ -1215,7 +1409,15 @@ async fn main(_spawner: Spawner) -> ! {
             env_dirty = false;
             let path = environment::path();
             let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-            env_view = match http_get(wifi, path.as_str(), 8192).await {
+            env_view = match http_get(
+                wifi,
+                settings.wifi_ssid(),
+                settings.wifi_password(),
+                path.as_str(),
+                8192,
+            )
+            .await
+            {
                 Some(body) => environment::parse(&body),
                 None => environment::View::Error,
             };
@@ -1231,7 +1433,15 @@ async fn main(_spawner: Spawner) -> ! {
                 Some(fix) => {
                     let path = map_path(fix.lat(), fix.lon());
                     let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-                    match http_get(wifi, path.as_str(), MAP_MAX_BYTES).await {
+                    match http_get(
+                        wifi,
+                        settings.wifi_ssid(),
+                        settings.wifi_password(),
+                        path.as_str(),
+                        MAP_MAX_BYTES,
+                    )
+                    .await
+                    {
                         Some(body) => parse_map(&body),
                         None => MapView::Error,
                     }
@@ -1251,7 +1461,15 @@ async fn main(_spawner: Spawner) -> ! {
                     Some(fix) => {
                         let path = weather::path(fix.lat(), fix.lon());
                         let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-                        match http_get_from(wifi, weather::HOST, path.as_str()).await {
+                        match http_get_from(
+                            wifi,
+                            settings.wifi_ssid(),
+                            settings.wifi_password(),
+                            weather::HOST,
+                            path.as_str(),
+                        )
+                        .await
+                        {
                             Some(body) => weather::parse(&body),
                             None => weather::View::Error,
                         }
@@ -1262,6 +1480,45 @@ async fn main(_spawner: Spawner) -> ! {
             #[cfg(not(feature = "gps"))]
             {
                 weather_view = weather::View::NoFix;
+            }
+            needs_redraw = true;
+        }
+
+        // scan for nearby access points when Scan is tapped on the wifi settings
+        // page. the `!needs_redraw` guard lets the "scanning..." view paint first,
+        // since the scan brings wifi up and blocks the loop for a few seconds.
+        // (steal WIFI: any previous controller was dropped, so the peripheral is
+        // free; the radio powers down when `wifi_scan` returns.)
+        if current_screen == Screen::SettingsWifi && wifi_scan_dirty && !needs_redraw {
+            wifi_scan_dirty = false;
+            let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
+            match wifi_scan(wifi).await {
+                Some(nets) => {
+                    wifi_status = if nets.is_empty() {
+                        String::from("no networks found")
+                    } else {
+                        format!("{} networks - tap one to join", nets.len())
+                    };
+                    wifi_networks = nets;
+                }
+                None => wifi_status = String::from("scan failed"),
+            }
+            needs_redraw = true;
+        }
+
+        // attempt to join the selected network with the entered credentials, then
+        // power the radio down. only persists the credentials on a successful
+        // connect so a wrong passphrase is never saved. same `!needs_redraw`
+        // guard so the "connecting..." view paints before the blocking join.
+        if current_screen == Screen::SettingsWifi && wifi_join_dirty && !needs_redraw {
+            wifi_join_dirty = false;
+            let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
+            if try_connect(wifi, &wifi_pw_ssid, &wifi_pw_buf).await {
+                settings.set_wifi(&wifi_pw_ssid, &wifi_pw_buf);
+                settings_dirty = true;
+                wifi_status = format!("connected: {wifi_pw_ssid}");
+            } else {
+                wifi_status = String::from("join failed - check password");
             }
             needs_redraw = true;
         }

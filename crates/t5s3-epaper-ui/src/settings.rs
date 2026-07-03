@@ -267,6 +267,32 @@ const fn konst_parse_i8(s: &str) -> Option<i8> {
     Some(acc as i8)
 }
 
+// wifi credentials baked in at build time from the SSID/PASSWORD env (see
+// .env), used only as the first-boot default before the user has joined a
+// network from the wifi settings page and saved their own credentials to flash.
+const DEFAULT_SSID: &str = match option_env!("SSID") {
+    Some(s) => s,
+    None => "",
+};
+const DEFAULT_PASSWORD: &str = match option_env!("PASSWORD") {
+    Some(s) => s,
+    None => "",
+};
+
+// wifi credential capacities: a 32-byte SSID and a 63-byte WPA passphrase are
+// the 802.11 maxima; the password array carries one extra byte for a round
+// size.
+const SSID_CAP: usize = 32;
+const PASSWORD_CAP: usize = 64;
+
+// copy `src` into `dst`, truncating to the array's capacity, and return the
+// number of bytes written.
+fn copy_str(dst: &mut [u8], src: &str) -> u8 {
+    let n = src.len().min(dst.len());
+    dst[..n].copy_from_slice(&src.as_bytes()[..n]);
+    n as u8
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Settings {
     pub(crate) tz_offset_hours: i8,
@@ -277,10 +303,18 @@ pub(crate) struct Settings {
     pub(crate) reader_line_spacing: LineSpacing,
     pub(crate) icon_style: IconStyle,
     pub(crate) icon_size: IconSize,
+    wifi_ssid: [u8; SSID_CAP],
+    wifi_ssid_len: u8,
+    wifi_password: [u8; PASSWORD_CAP],
+    wifi_password_len: u8,
 }
 
 impl Default for Settings {
     fn default() -> Self {
+        let mut wifi_ssid = [0u8; SSID_CAP];
+        let wifi_ssid_len = copy_str(&mut wifi_ssid, DEFAULT_SSID);
+        let mut wifi_password = [0u8; PASSWORD_CAP];
+        let wifi_password_len = copy_str(&mut wifi_password, DEFAULT_PASSWORD);
         Self {
             tz_offset_hours: DEFAULT_TZ_OFFSET,
             time_24h: true,
@@ -290,6 +324,10 @@ impl Default for Settings {
             reader_line_spacing: LineSpacing::Normal,
             icon_style: IconStyle::Lucide,
             icon_size: IconSize::Regular,
+            wifi_ssid,
+            wifi_ssid_len,
+            wifi_password,
+            wifi_password_len,
         }
     }
 }
@@ -298,8 +336,14 @@ impl Default for Settings {
 // checksum over the preceding bytes. anything that doesn't validate (blank
 // flash, older/newer layout, corruption) falls back to defaults.
 const MAGIC: [u8; 2] = [0x54, 0x35];
-const VERSION: u8 = 4;
-const BLOB_LEN: usize = 12;
+const VERSION: u8 = 5;
+// 11 scalar bytes, then the SSID (len + 32) and password (len + 64), then a
+// trailing xor checksum.
+const SSID_OFF: usize = 12;
+const PASSWORD_LEN_OFF: usize = SSID_OFF + SSID_CAP;
+const PASSWORD_OFF: usize = PASSWORD_LEN_OFF + 1;
+const CHECKSUM_OFF: usize = PASSWORD_OFF + PASSWORD_CAP;
+const BLOB_LEN: usize = CHECKSUM_OFF + 1;
 
 // the flash peripheral is a singleton held by `esp_hal::init`; settings access
 // is brief and self-contained, so steal it here the same way the SD card and
@@ -322,7 +366,11 @@ impl Settings {
         buf[8] = self.reader_line_spacing.to_byte();
         buf[9] = self.icon_style.to_byte();
         buf[10] = self.icon_size.to_byte();
-        buf[11] = buf[0..11].iter().fold(0u8, |acc, &b| acc ^ b);
+        buf[11] = self.wifi_ssid_len.min(SSID_CAP as u8);
+        buf[SSID_OFF..PASSWORD_LEN_OFF].copy_from_slice(&self.wifi_ssid);
+        buf[PASSWORD_LEN_OFF] = self.wifi_password_len.min(PASSWORD_CAP as u8);
+        buf[PASSWORD_OFF..CHECKSUM_OFF].copy_from_slice(&self.wifi_password);
+        buf[CHECKSUM_OFF] = buf[0..CHECKSUM_OFF].iter().fold(0u8, |acc, &b| acc ^ b);
         buf
     }
 
@@ -330,10 +378,14 @@ impl Settings {
         if buf[0..2] != MAGIC || buf[2] != VERSION {
             return None;
         }
-        let checksum = buf[0..11].iter().fold(0u8, |acc, &b| acc ^ b);
-        if checksum != buf[11] {
+        let checksum = buf[0..CHECKSUM_OFF].iter().fold(0u8, |acc, &b| acc ^ b);
+        if checksum != buf[CHECKSUM_OFF] {
             return None;
         }
+        let mut wifi_ssid = [0u8; SSID_CAP];
+        wifi_ssid.copy_from_slice(&buf[SSID_OFF..PASSWORD_LEN_OFF]);
+        let mut wifi_password = [0u8; PASSWORD_CAP];
+        wifi_password.copy_from_slice(&buf[PASSWORD_OFF..CHECKSUM_OFF]);
         Some(Self {
             tz_offset_hours: buf[3] as i8,
             time_24h: buf[4] != 0,
@@ -343,7 +395,31 @@ impl Settings {
             reader_line_spacing: LineSpacing::from_byte(buf[8]),
             icon_style: IconStyle::from_byte(buf[9]),
             icon_size: IconSize::from_byte(buf[10]),
+            wifi_ssid,
+            wifi_ssid_len: buf[11].min(SSID_CAP as u8),
+            wifi_password,
+            wifi_password_len: buf[PASSWORD_LEN_OFF].min(PASSWORD_CAP as u8),
         })
+    }
+
+    // the saved SSID as a string, or "" if none is configured (or the stored
+    // bytes are not valid utf-8).
+    pub(crate) fn wifi_ssid(&self) -> &str {
+        let len = (self.wifi_ssid_len as usize).min(SSID_CAP);
+        core::str::from_utf8(&self.wifi_ssid[..len]).unwrap_or("")
+    }
+
+    pub(crate) fn wifi_password(&self) -> &str {
+        let len = (self.wifi_password_len as usize).min(PASSWORD_CAP);
+        core::str::from_utf8(&self.wifi_password[..len]).unwrap_or("")
+    }
+
+    // replace the saved wifi credentials, truncating to the field capacities.
+    pub(crate) fn set_wifi(&mut self, ssid: &str, password: &str) {
+        self.wifi_ssid = [0u8; SSID_CAP];
+        self.wifi_ssid_len = copy_str(&mut self.wifi_ssid, ssid);
+        self.wifi_password = [0u8; PASSWORD_CAP];
+        self.wifi_password_len = copy_str(&mut self.wifi_password, password);
     }
 
     pub(crate) fn reader_style(&self) -> ReaderStyle {

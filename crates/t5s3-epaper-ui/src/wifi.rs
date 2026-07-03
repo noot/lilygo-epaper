@@ -14,18 +14,17 @@ use embassy_net::{
 use embassy_time::{with_timeout, Duration, Timer};
 use embedded_io_async::Write as _;
 use esp_hal::rng::Rng;
-use esp_radio::wifi::{sta::StationConfig, Config, ControllerConfig, Interface, WifiController};
+use esp_radio::wifi::{
+    scan::ScanConfig,
+    sta::StationConfig,
+    AuthenticationMethod,
+    Config,
+    ControllerConfig,
+    Interface,
+    WifiController,
+};
 use t5s3_epaper_core::Clock;
 
-// ── wifi / ntp config (from .env at build time; see the justfile) ────
-const SSID: &str = match option_env!("SSID") {
-    Some(s) => s,
-    None => "changeme",
-};
-const PASSWORD: &str = match option_env!("PASSWORD") {
-    Some(s) => s,
-    None => "changeme",
-};
 // noot-server address (from .env at build time; see the justfile). the music
 // and environment pages fetch JSON from it over http.
 const SERVER_HOST: &str = match option_env!("SERVER_HOST") {
@@ -71,17 +70,111 @@ pub(crate) const RESYNC_INTERVAL_SECS: u64 = 4 * 3600;
 // here drops — and WifiController's Drop deinitialises wifi (radio off), which
 // frees the 2.4 GHz band for gps and saves power. returns UTC unix seconds, or
 // None on timeout. re-callable for periodic re-sync (steal WIFI again).
-pub(crate) async fn sync_time(wifi: esp_hal::peripherals::WIFI<'static>) -> Option<u64> {
+// build a station-mode controller for the given credentials. shared by every
+// wifi session below; dropping the returned controller deinitialises wifi
+// (radio off). `WifiController::new` starts the driver in station mode, so a
+// scan or connect can follow immediately.
+fn station_controller(
+    wifi: esp_hal::peripherals::WIFI<'static>,
+    ssid: &str,
+    password: &str,
+) -> Option<WifiController<'static>> {
     let station_config = Config::Station(
         StationConfig::default()
-            .with_ssid(SSID)
-            .with_password(PASSWORD.into()),
+            .with_ssid(ssid)
+            .with_password(password.into()),
     );
-    let mut controller = WifiController::new(
+    WifiController::new(
         wifi,
         ControllerConfig::default().with_initial_config(station_config),
     )
-    .ok()?;
+    .ok()
+}
+
+// one detected access point, surfaced to the wifi settings page's scan list.
+pub(crate) struct ScanEntry {
+    pub(crate) ssid: String,
+    pub(crate) rssi: i8,
+    pub(crate) secured: bool,
+}
+
+// bring wifi up in station mode, scan for nearby access points, then power the
+// radio back down. named networks are deduplicated (keeping the strongest
+// signal) and hidden/unnamed APs dropped. returns None on timeout or scan
+// error.
+pub(crate) async fn scan(wifi: esp_hal::peripherals::WIFI<'static>) -> Option<Vec<ScanEntry>> {
+    let mut controller = station_controller(wifi, "", "")?;
+
+    let config = ScanConfig::default().with_max(20);
+    let results = with_timeout(Duration::from_secs(15), controller.scan_async(&config))
+        .await
+        .ok()?
+        .ok()?;
+
+    let mut entries: Vec<ScanEntry> = results
+        .into_iter()
+        .filter(|ap| !ap.ssid.is_empty())
+        .map(|ap| ScanEntry {
+            ssid: ap.ssid.as_str().into(),
+            rssi: ap.signal_strength,
+            secured: !matches!(ap.auth_method, None | Some(AuthenticationMethod::None)),
+        })
+        .collect();
+
+    // strongest first, then drop duplicate SSIDs (multiple bands/APs).
+    entries.sort_by_key(|e| core::cmp::Reverse(e.rssi));
+    let mut seen: Vec<String> = Vec::new();
+    entries.retain(|e| {
+        if seen.iter().any(|s| s == &e.ssid) {
+            false
+        } else {
+            seen.push(e.ssid.clone());
+            true
+        }
+    });
+    Some(entries)
+}
+
+// bring wifi up with the given credentials and confirm a connection + DHCP
+// lease come up, then power the radio back down. used by the wifi settings page
+// to verify newly entered credentials. returns whether the join succeeded.
+pub(crate) async fn try_connect(
+    wifi: esp_hal::peripherals::WIFI<'static>,
+    ssid: &str,
+    password: &str,
+) -> bool {
+    let Some(mut controller) = station_controller(wifi, ssid, password) else {
+        return false;
+    };
+
+    let rng = Rng::new();
+    let seed = (rng.random() as u64) << 32 | rng.random() as u64;
+    let mut resources = StackResources::<3>::new();
+    let (stack, mut runner) = embassy_net::new(
+        Interface::station(),
+        embassy_net::Config::dhcpv4(Default::default()),
+        &mut resources,
+        seed,
+    );
+
+    let outcome = select(runner.run(), async {
+        controller.connect_async().await.ok()?;
+        with_timeout(Duration::from_secs(15), stack.wait_config_up())
+            .await
+            .ok()?;
+        Some(())
+    })
+    .await;
+
+    matches!(outcome, Either::Second(Some(())))
+}
+
+pub(crate) async fn sync_time(
+    wifi: esp_hal::peripherals::WIFI<'static>,
+    ssid: &str,
+    password: &str,
+) -> Option<u64> {
+    let mut controller = station_controller(wifi, ssid, password)?;
 
     let rng = Rng::new();
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
@@ -123,19 +216,12 @@ pub(crate) async fn sync_time(wifi: esp_hal::peripherals::WIFI<'static>) -> Opti
 // the environment page's json, much larger for the gps page's map image.
 pub(crate) async fn http_get(
     wifi: esp_hal::peripherals::WIFI<'static>,
+    ssid: &str,
+    password: &str,
     path: &str,
     max_body: usize,
 ) -> Option<Vec<u8>> {
-    let station_config = Config::Station(
-        StationConfig::default()
-            .with_ssid(SSID)
-            .with_password(PASSWORD.into()),
-    );
-    let mut controller = WifiController::new(
-        wifi,
-        ControllerConfig::default().with_initial_config(station_config),
-    )
-    .ok()?;
+    let mut controller = station_controller(wifi, ssid, password)?;
 
     let rng = Rng::new();
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
@@ -168,19 +254,12 @@ pub(crate) async fn http_get(
 // rather than noot-server. returns the response body, or None on any failure.
 pub(crate) async fn http_get_from(
     wifi: esp_hal::peripherals::WIFI<'static>,
+    ssid: &str,
+    password: &str,
     host: &str,
     path: &str,
 ) -> Option<Vec<u8>> {
-    let station_config = Config::Station(
-        StationConfig::default()
-            .with_ssid(SSID)
-            .with_password(PASSWORD.into()),
-    );
-    let mut controller = WifiController::new(
-        wifi,
-        ControllerConfig::default().with_initial_config(station_config),
-    )
-    .ok()?;
+    let mut controller = station_controller(wifi, ssid, password)?;
 
     let rng = Rng::new();
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
@@ -226,18 +305,11 @@ const MAX_COVER_BYTES: usize = 512 * 1024;
 // bring-up per refresh. returns None if wifi never came up.
 pub(crate) async fn music_session(
     wifi: esp_hal::peripherals::WIFI<'static>,
+    ssid: &str,
+    password: &str,
     command: Option<&str>,
 ) -> Option<MusicSnapshot> {
-    let station_config = Config::Station(
-        StationConfig::default()
-            .with_ssid(SSID)
-            .with_password(PASSWORD.into()),
-    );
-    let mut controller = WifiController::new(
-        wifi,
-        ControllerConfig::default().with_initial_config(station_config),
-    )
-    .ok()?;
+    let mut controller = station_controller(wifi, ssid, password)?;
 
     let rng = Rng::new();
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
