@@ -42,22 +42,33 @@ use t5s3_epaper_core::{
     Display,
     DrawMode,
     FrontLight,
+    SdCard,
 };
 #[cfg(feature = "gps")]
 use t5s3_epaper_core::{gps::Gps, gps_pin_config};
 
 #[cfg(feature = "gps")]
 use crate::pages::gps::{
+    area_km2,
     current_fix,
+    download_button_hit,
     draw_gps_data,
     draw_map,
     gps_data_native_rect,
-    map_path,
+    map_area_tiles,
+    map_cache_path,
+    map_cell,
+    map_request_path,
     parse_map,
+    refresh_map_panel,
     GpsFix,
     MapView,
+    DOWNLOAD_RADIUS,
     GPS_REFRESH_TICKS,
+    MAP_CACHE_DIR,
     MAP_MAX_BYTES,
+    MARKER_MOVE_PX,
+    MARKER_REFRESH_TICKS,
 };
 use crate::{
     datetime::{status_date, status_time, status_time_secs},
@@ -140,6 +151,7 @@ use crate::{
         BATTERY_REFRESH_TICKS,
     },
     wifi::{
+        download_maps,
         http_get,
         http_get_from,
         music_session,
@@ -444,6 +456,19 @@ async fn main(_spawner: Spawner) -> ! {
     let mut gps_map = MapView::Loading;
     #[cfg(feature = "gps")]
     let mut gps_map_dirty = false;
+    // set when the "save area" button is tapped: pre-download the cells around
+    // the current fix into the sd cache on the next pass.
+    #[cfg(feature = "gps")]
+    let mut gps_download = false;
+    // the map cell currently drawn and the marker offset last drawn for it, used
+    // to follow the fix: reload on a tile crossing, nudge the marker within a
+    // tile. None until the first map is drawn.
+    #[cfg(feature = "gps")]
+    let mut gps_shown_cell: Option<u32> = None;
+    #[cfg(feature = "gps")]
+    let mut gps_shown_offset = (0i32, 0i32);
+    #[cfg(feature = "gps")]
+    let mut gps_marker_ticks: u16 = 0;
 
     loop {
         if needs_redraw {
@@ -1279,11 +1304,15 @@ async fn main(_spawner: Spawner) -> ! {
                         if back_button_hit(sx, sy) {
                             current_screen = Screen::Home;
                             needs_redraw = true;
+                        } else if download_button_hit(sx, sy) {
+                            // pre-download the surrounding area on the next pass.
+                            gps_download = true;
                         } else {
-                            // a tap anywhere else re-fetches the map.
-                            gps_map = MapView::Loading;
+                            // a tap anywhere else forces a map refresh for the
+                            // current fix. panel-only (no full-page redraw): the
+                            // fetch block below reloads the cell and repaints just
+                            // the panel.
                             gps_map_dirty = true;
-                            needs_redraw = true;
                         }
                     }
                     _ => {
@@ -1433,31 +1462,125 @@ async fn main(_spawner: Spawner) -> ! {
             needs_redraw = true;
         }
 
-        // fetch the map for the gps page's current fix. mirrors the weather
-        // fetch: without a fix there is no center to request a map for.
+        // load the map for the gps page's current fix. cache-first: the cell the
+        // fix falls in is read straight off the sd card (no wifi) when present,
+        // and only fetched over wifi + cached on a miss. without a fix there is
+        // no center to request a map for.
         #[cfg(feature = "gps")]
         if current_screen == Screen::Gps && gps_map_dirty && !needs_redraw {
             gps_map_dirty = false;
             gps_map = match last_fix {
                 Some(fix) => {
-                    let path = map_path(fix.lat(), fix.lon());
-                    let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-                    match http_get(
-                        wifi,
-                        settings.wifi_ssid(),
-                        settings.wifi_password(),
-                        path.as_str(),
-                        MAP_MAX_BYTES,
-                    )
-                    .await
-                    {
-                        Some(body) => parse_map(&body),
-                        None => MapView::Error,
+                    let cell = map_cell(fix.lat(), fix.lon());
+                    let cache_path = map_cache_path(cell.key());
+                    let card =
+                        SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus).ok();
+                    let cached = card
+                        .as_ref()
+                        .and_then(|c| c.read_file(cache_path.as_str()).ok());
+                    match cached {
+                        Some(body) => parse_map(&body, cell.dx(), cell.dy()),
+                        None => {
+                            let path = map_request_path(cell.key());
+                            let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
+                            match http_get(
+                                wifi,
+                                settings.wifi_ssid(),
+                                settings.wifi_password(),
+                                path.as_str(),
+                                MAP_MAX_BYTES,
+                            )
+                            .await
+                            {
+                                Some(body) => {
+                                    if let Some(c) = &card {
+                                        c.create_dir_all(MAP_CACHE_DIR).ok();
+                                        if let Err(e) = c.write_file(cache_path.as_str(), &body) {
+                                            esp_println::println!("gps: cache map failed: {e:?}");
+                                        }
+                                    }
+                                    parse_map(&body, cell.dx(), cell.dy())
+                                }
+                                None => MapView::Error,
+                            }
+                        }
                     }
                 }
                 None => MapView::NoFix,
             };
-            needs_redraw = true;
+            // refresh just the map panel (grayscale, panel-only) rather than a
+            // full page redraw, so following the fix flashes only the panel.
+            refresh_map_panel(&mut display, &gps_map);
+            gps_marker_ticks = 0;
+            match last_fix {
+                Some(fix) => {
+                    let cell = map_cell(fix.lat(), fix.lon());
+                    gps_shown_cell = Some(cell.key());
+                    gps_shown_offset = (cell.dx(), cell.dy());
+                }
+                None => gps_shown_cell = None,
+            }
+        }
+
+        // pre-download the cells around the current fix into the sd cache so the
+        // map keeps working offline while moving. the whole block is fetched in a
+        // single wifi session rather than one bring-up per tile.
+        #[cfg(feature = "gps")]
+        if current_screen == Screen::Gps && gps_download {
+            gps_download = false;
+            if let Some(fix) = last_fix {
+                let card = SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus).ok();
+                // keep only the cells not already cached.
+                let missing: Vec<(u32, String)> = match &card {
+                    Some(c) => {
+                        c.create_dir_all(MAP_CACHE_DIR).ok();
+                        map_area_tiles(fix.lat(), fix.lon(), DOWNLOAD_RADIUS)
+                            .into_iter()
+                            .filter(|(key, _)| {
+                                !c.exists(map_cache_path(*key).as_str()).unwrap_or(false)
+                            })
+                            .collect()
+                    }
+                    None => Vec::new(),
+                };
+
+                if let Some(c) = &card {
+                    if !missing.is_empty() {
+                        let total = missing.len();
+                        // show progress before the (blocking) download.
+                        gps_map = MapView::Downloading(total);
+                        refresh_map_panel(&mut display, &gps_map);
+
+                        let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
+                        let saved = download_maps(
+                            wifi,
+                            settings.wifi_ssid(),
+                            settings.wifi_password(),
+                            &missing,
+                            MAP_MAX_BYTES,
+                            |key, body| {
+                                if let Err(e) = c.write_file(map_cache_path(key).as_str(), body) {
+                                    esp_println::println!(
+                                        "gps: cache tile {key:08X} failed: {e:?}"
+                                    );
+                                }
+                            },
+                        )
+                        .await;
+                        esp_println::println!("gps: area download saved {saved}/{total} tiles");
+                    }
+
+                    // report the area now cached around the fix, then reload the map.
+                    let km2 = area_km2(fix.lat(), DOWNLOAD_RADIUS);
+                    esp_println::println!("gps: {km2:.0} sq km cached around fix");
+                    gps_map = MapView::Saved(km2);
+                    refresh_map_panel(&mut display, &gps_map);
+                    delay.delay_millis(1500);
+                }
+
+                // reload the current cell (now cached) on the next pass.
+                gps_map_dirty = true;
+            }
         }
 
         if current_screen == Screen::Weather && weather_dirty && !needs_redraw {
@@ -1620,6 +1743,35 @@ async fn main(_spawner: Spawner) -> ! {
                     gps_refresh = 0;
                     draw_gps_data(&mut display, g, last_fix);
                     display.flush_partial_fast(gps_data_native_rect()).ok();
+                }
+
+                // follow the fix on the map: reload when it crosses into a new
+                // tile, otherwise nudge the marker within the current tile on a
+                // slow cadence so the grayscale panel isn't constantly flashing.
+                if let Some(fix) = last_fix {
+                    let cell = map_cell(fix.lat(), fix.lon());
+                    match gps_shown_cell {
+                        Some(shown) if shown != cell.key() => {
+                            // crossed a tile boundary: reload (cache-first) on the
+                            // next pass via the map fetch block above.
+                            gps_map_dirty = true;
+                        }
+                        Some(_) => {
+                            gps_marker_ticks = gps_marker_ticks.saturating_add(1);
+                            let moved = (cell.dx() - gps_shown_offset.0).abs()
+                                + (cell.dy() - gps_shown_offset.1).abs();
+                            if gps_marker_ticks >= MARKER_REFRESH_TICKS && moved >= MARKER_MOVE_PX {
+                                gps_marker_ticks = 0;
+                                if let MapView::Ready { dx, dy, .. } = &mut gps_map {
+                                    *dx = cell.dx();
+                                    *dy = cell.dy();
+                                }
+                                refresh_map_panel(&mut display, &gps_map);
+                                gps_shown_offset = (cell.dx(), cell.dy());
+                            }
+                        }
+                        None => {}
+                    }
                 }
             }
         }

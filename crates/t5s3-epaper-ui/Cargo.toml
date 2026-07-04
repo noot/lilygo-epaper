@@ -36,6 +36,7 @@ tinybmp = { workspace = true }
 serde = { workspace = true }
 serde-json-core = { workspace = true }
 heapless = { workspace = true }
+libm = { workspace = true }
 nmea = { workspace = true, optional = true }
 
 [features]

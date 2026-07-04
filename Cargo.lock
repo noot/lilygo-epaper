@@ -2193,6 +2193,7 @@ dependencies = [
  "esp-rtos",
  "esp-storage",
  "heapless 0.8.0",
+ "libm",
  "nmea",
  "serde",
  "serde-json-core",

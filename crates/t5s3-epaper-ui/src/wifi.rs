@@ -286,6 +286,59 @@ pub(crate) async fn http_get_from(
     }
 }
 
+// bring wifi up, GET each map path in one session, then power the radio back
+// down. doing a whole area in one bring-up (rather than one per tile) keeps a
+// bulk download to a single ~20s radio start. each fetched tile is handed to
+// `on_tile(key, body)` so the caller can write it to the sd cache as it
+// arrives, keeping only one tile body resident at a time. returns the number of
+// tiles fetched.
+pub(crate) async fn download_maps<F>(
+    wifi: esp_hal::peripherals::WIFI<'static>,
+    ssid: &str,
+    password: &str,
+    tiles: &[(u32, String)],
+    max_body: usize,
+    mut on_tile: F,
+) -> usize
+where
+    F: FnMut(u32, &[u8]),
+{
+    let Some(mut controller) = station_controller(wifi, ssid, password) else {
+        return 0;
+    };
+
+    let rng = Rng::new();
+    let seed = (rng.random() as u64) << 32 | rng.random() as u64;
+    let mut resources = StackResources::<3>::new();
+    let (stack, mut runner) = embassy_net::new(
+        Interface::station(),
+        embassy_net::Config::dhcpv4(Default::default()),
+        &mut resources,
+        seed,
+    );
+
+    let outcome = select(runner.run(), async {
+        controller.connect_async().await.ok()?;
+        with_timeout(Duration::from_secs(15), stack.wait_config_up())
+            .await
+            .ok()?;
+        let mut fetched = 0usize;
+        for (key, path) in tiles {
+            if let Some(body) = request(stack, "GET", path, max_body).await {
+                on_tile(*key, &body);
+                fetched += 1;
+            }
+        }
+        Some(fetched)
+    })
+    .await;
+
+    match outcome {
+        Either::First(_) => 0,
+        Either::Second(n) => n.unwrap_or(0),
+    }
+}
+
 // the now-playing json plus the raw album-art bytes, fetched together in one
 // wifi session so opening the music page (or hitting a control) costs a single
 // radio bring-up.

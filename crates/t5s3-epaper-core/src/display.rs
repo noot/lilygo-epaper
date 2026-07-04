@@ -324,6 +324,28 @@ impl<'a> Display<'a> {
         Ok(())
     }
 
+    /// Partial grayscale update limited to `area`.
+    ///
+    /// Like [`Display::flush`] this uses the full grayscale waveform, but it
+    /// only writes rows that were drawn (which the caller must keep within
+    /// `area`) and only updates the diff state for `area`, so the rest of the
+    /// panel is left untouched — no whole-screen flash. Use this for a
+    /// grayscale region (e.g. an image panel) that must refresh on its own
+    /// without redrawing the whole page.
+    pub fn flush_partial(&mut self, area: Rectangle, mode: DrawMode) -> Result<()> {
+        let area = self.clip_rectangle(area);
+        if area.width == 0 || area.height == 0 {
+            return Ok(());
+        }
+
+        debug!("display flush partial");
+        self.draw(mode)?;
+        copy_rect(&mut self.previous_framebuffer, &self.framebuffer, area);
+        self.framebuffer.fill(0xFF);
+        self.tainted_rows.fill(0);
+        Ok(())
+    }
+
     /// Fast partial monochrome update using the panel's direct-update waveform.
     ///
     /// This is intended for small text/UI regions where reduced flicker matters
