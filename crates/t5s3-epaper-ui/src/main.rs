@@ -168,6 +168,7 @@ use crate::{
         try_connect,
         ScanEntry,
         RESYNC_INTERVAL_SECS,
+        RETRY_INTERVAL_SECS,
     },
 };
 
@@ -307,6 +308,11 @@ async fn main(_spawner: Spawner) -> ! {
         }
     }
 
+    // whether the clock currently holds a real synced time: kept in the RTC
+    // across a deep-sleep wake, otherwise only true once wifi/ntp succeeds. drives
+    // the fast-retry cadence below until the first success.
+    let mut clock_synced = woke;
+
     // on a cold boot, sync the clock over wifi (best effort, with a timeout so
     // it still boots when offline), then the radio powers down. on wake the RTC
     // already holds the time, so we skip wifi for a fast resume.
@@ -328,7 +334,10 @@ async fn main(_spawner: Spawner) -> ! {
         )
         .await
         {
-            Some(unix) => set_utc_time(&mut clock, unix),
+            Some(unix) => {
+                set_utc_time(&mut clock, unix);
+                clock_synced = true;
+            }
             None => esp_println::println!("clock: wifi/ntp sync failed, time unavailable"),
         }
     }
@@ -734,16 +743,22 @@ async fn main(_spawner: Spawner) -> ! {
         // powers down again. correct against RTC drift without leaving the radio
         // on to interfere with gps. (steal WIFI: the previous controller was
         // dropped, so the peripheral is free to re-init.)
-        if clock.now_us() / 1_000_000 >= last_resync_secs + RESYNC_INTERVAL_SECS {
+        let resync_interval = if clock_synced {
+            RESYNC_INTERVAL_SECS
+        } else {
+            RETRY_INTERVAL_SECS
+        };
+        if clock.now_us() / 1_000_000 >= last_resync_secs + resync_interval {
             esp_println::println!("clock: periodic re-sync");
             let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
             if let Some(unix) =
                 sync_time(wifi, settings.wifi_ssid(), settings.wifi_password()).await
             {
                 set_utc_time(&mut clock, unix);
+                clock_synced = true;
+                needs_redraw = true;
             }
             last_resync_secs = clock.now_us() / 1_000_000;
-            needs_redraw = true;
         }
 
         // poll touch/buttons every pass so input stays responsive. the GPS

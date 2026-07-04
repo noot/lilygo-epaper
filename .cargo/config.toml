@@ -6,7 +6,8 @@ runner = "espflash flash --monitor --chip esp32s3"
 # default everything to info so the verbose esp dependencies (esp-rtos scheduler,
 # esp-hal DMA, esp-radio, embedded-sdmmc) don't flood the serial port; keep this
 # crate's own logs at debug. app examples log via println!, which always shows.
-ESP_LOG = "info,t5s3_epaper_core=debug"
+#ESP_LOG = "info,t5s3_epaper_core=debug"
+ESP_LOG = "info"
 
 [build]
 rustflags = [

@@ -63,6 +63,10 @@ const NTP_UNIX_DELTA: u64 = 2_208_988_800;
 // re-sync the clock over wifi this often. wifi is powered down between syncs so
 // it doesn't interfere with gps reception; the RTC only drifts seconds per day.
 pub(crate) const RESYNC_INTERVAL_SECS: u64 = 4 * 3600;
+// how often to retry while the clock has never synced (e.g. wifi was down at
+// boot), so it recovers within minutes rather than waiting a full re-sync
+// interval. wifi still powers down between attempts.
+pub(crate) const RETRY_INTERVAL_SECS: u64 = 120;
 
 // connect to wifi, fetch the current unix time via SNTP, then power the radio
 // back down. self-contained: it drives the network stack (`runner`) alongside
@@ -89,6 +93,43 @@ fn station_controller(
         ControllerConfig::default().with_initial_config(station_config),
     )
     .ok()
+}
+
+// connect can report a transient failure (commonly AuthenticationExpired at low
+// signal) on the first attempt, so retry a few times before giving up.
+const CONNECT_ATTEMPTS: u8 = 4;
+
+// bring the association up, retrying transient connect failures, then wait for
+// a dhcp lease. must be polled alongside the network stack's `runner` (via the
+// `select` in each caller). returns whether the stack came up.
+async fn bring_up(controller: &mut WifiController<'static>, stack: Stack<'_>) -> bool {
+    let mut connected = false;
+    for attempt in 1..=CONNECT_ATTEMPTS {
+        match controller.connect_async().await {
+            Ok(_) => {
+                connected = true;
+                break;
+            }
+            Err(e) => {
+                esp_println::println!("wifi: connect attempt {attempt} failed: {e:?}");
+                if attempt < CONNECT_ATTEMPTS {
+                    Timer::after(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
+    if !connected {
+        return false;
+    }
+    if with_timeout(Duration::from_secs(15), stack.wait_config_up())
+        .await
+        .is_err()
+    {
+        esp_println::println!("wifi: dhcp/config-up timed out");
+        return false;
+    }
+    esp_println::println!("wifi: connected");
+    true
 }
 
 // one detected access point, surfaced to the wifi settings page's scan list.
@@ -143,7 +184,9 @@ pub(crate) async fn try_connect(
     ssid: &str,
     password: &str,
 ) -> bool {
+    esp_println::println!("wifi: try_connect ssid={ssid:?} pw_len={}", password.len());
     let Some(mut controller) = station_controller(wifi, ssid, password) else {
+        esp_println::println!("wifi: controller init failed");
         return false;
     };
 
@@ -158,11 +201,7 @@ pub(crate) async fn try_connect(
     );
 
     let outcome = select(runner.run(), async {
-        controller.connect_async().await.ok()?;
-        with_timeout(Duration::from_secs(15), stack.wait_config_up())
-            .await
-            .ok()?;
-        Some(())
+        bring_up(&mut controller, stack).await.then_some(())
     })
     .await;
 
@@ -174,6 +213,7 @@ pub(crate) async fn sync_time(
     ssid: &str,
     password: &str,
 ) -> Option<u64> {
+    esp_println::println!("wifi: sync_time ssid={ssid:?} pw_len={}", password.len());
     let mut controller = station_controller(wifi, ssid, password)?;
 
     let rng = Rng::new();
@@ -187,15 +227,14 @@ pub(crate) async fn sync_time(
     );
 
     let outcome = select(runner.run(), async {
-        controller.connect_async().await.ok()?;
-        with_timeout(Duration::from_secs(15), stack.wait_config_up())
-            .await
-            .ok()?;
-        esp_println::println!("wifi: connected");
+        if !bring_up(&mut controller, stack).await {
+            return None;
+        }
         for _ in 0..3 {
             if let Some(unix) = sntp_unix_time(stack).await {
                 return Some(unix);
             }
+            esp_println::println!("wifi: ntp query failed, retrying");
             Timer::after(Duration::from_secs(2)).await;
         }
         None
@@ -234,10 +273,9 @@ pub(crate) async fn http_get(
     );
 
     let outcome = select(runner.run(), async {
-        controller.connect_async().await.ok()?;
-        with_timeout(Duration::from_secs(15), stack.wait_config_up())
-            .await
-            .ok()?;
+        if !bring_up(&mut controller, stack).await {
+            return None;
+        }
         request(stack, "GET", path, max_body).await
     })
     .await;
@@ -272,10 +310,9 @@ pub(crate) async fn http_get_from(
     );
 
     let outcome = select(runner.run(), async {
-        controller.connect_async().await.ok()?;
-        with_timeout(Duration::from_secs(15), stack.wait_config_up())
-            .await
-            .ok()?;
+        if !bring_up(&mut controller, stack).await {
+            return None;
+        }
         request_ext(stack, host, path).await
     })
     .await;
@@ -375,10 +412,9 @@ pub(crate) async fn music_session(
     );
 
     let outcome = select(runner.run(), async {
-        controller.connect_async().await.ok()?;
-        with_timeout(Duration::from_secs(15), stack.wait_config_up())
-            .await
-            .ok()?;
+        if !bring_up(&mut controller, stack).await {
+            return None;
+        }
         // best-effort: a failed control still lets us refresh the display.
         if let Some(command) = command {
             request(stack, "POST", command, 256).await;
