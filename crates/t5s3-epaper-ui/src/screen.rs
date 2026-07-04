@@ -17,6 +17,7 @@ pub(crate) enum Screen {
     SettingsSystem,
     SettingsReader,
     SettingsWifi,
+    MapFull,
 }
 
 impl Screen {
@@ -39,6 +40,9 @@ impl Screen {
             Screen::SettingsSystem => 14,
             Screen::SettingsReader => 15,
             Screen::SettingsWifi => 16,
+            // fullscreen map is a transient view of the gps page; it is not
+            // restored on wake (from_index maps it back to Home).
+            Screen::MapFull => 17,
         }
     }
 

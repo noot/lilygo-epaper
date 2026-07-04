@@ -2,16 +2,23 @@ use alloc::{string::String, vec::Vec};
 use core::{f64::consts::PI, fmt::Write as _};
 
 use embedded_graphics::{
-    mono_font::{ascii::FONT_6X10, MonoTextStyle},
+    mono_font::{
+        ascii::{FONT_6X10, FONT_9X18_BOLD},
+        MonoTextStyle,
+    },
     prelude::*,
     primitives::{Circle, PrimitiveStyle, Rectangle},
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use epub_reader::{decode_image, GrayImage};
-use t5s3_epaper_core::{display::DrawMode, gps::Gps, Display};
+use t5s3_epaper_core::{display::DrawMode, gps::Gps, Display, SdCard};
 
-use crate::{fmt::FmtBuf, layout::screen_to_native_rect, widgets::draw_image_fit};
+use crate::{
+    fmt::FmtBuf,
+    layout::{screen_to_native_rect, SCREEN_W},
+    widgets::{draw_image_fit, draw_image_scaled},
+};
 
 // loop ticks between GPS readout refreshes (~50ms per tick)
 pub(crate) const GPS_REFRESH_TICKS: u16 = 30;
@@ -225,6 +232,12 @@ const DL_BTN_H: u32 = 40;
 const DL_BTN_X: i32 = MAP_X + MAP_W as i32 - DL_BTN_W as i32 - 10;
 const DL_BTN_Y: i32 = MAP_Y + 10;
 
+// the "full screen" button overlaid on the top-left of the map panel.
+const FS_BTN_W: u32 = 150;
+const FS_BTN_H: u32 = 40;
+const FS_BTN_X: i32 = MAP_X + 10;
+const FS_BTN_Y: i32 = MAP_Y + 10;
+
 // what the map panel is currently showing.
 pub(crate) enum MapView {
     Loading,
@@ -232,8 +245,9 @@ pub(crate) enum MapView {
     NoFix,
     // pre-downloading an area: the number of not-yet-cached tiles being fetched.
     Downloading(usize),
-    // finished pre-downloading: the square kilometres now cached around the fix.
-    Saved(f32),
+    // finished pre-downloading: the square kilometres now cached around the fix,
+    // and how many tiles were newly fetched (0 = the area was already cached).
+    Saved { km2: f32, new_tiles: usize },
     // a decoded map plus the marker offset (in panel pixels) from the panel
     // center to the fix, since the map is centered on its cell, not the fix.
     Ready { img: GrayImage, dx: i32, dy: i32 },
@@ -410,15 +424,54 @@ pub(crate) fn draw_map(display: &mut Display, view: &MapView) {
             write!(buf, "saving area: {n} tiles...").ok();
             map_label(display, buf.as_str());
         }
-        MapView::Saved(km2) => {
-            let mut buf = FmtBuf::<32>::new();
-            write!(buf, "area saved: {km2:.0} sq km").ok();
+        MapView::Saved { km2, new_tiles } => {
+            let mut buf = FmtBuf::<40>::new();
+            if *new_tiles == 0 {
+                write!(buf, "area already saved: {km2:.0} sq km").ok();
+            } else {
+                write!(buf, "area saved: {km2:.0} sq km ({new_tiles} new)").ok();
+            }
             map_label(display, buf.as_str());
         }
         MapView::Ready { .. } => {}
     }
 
     draw_download_button(display);
+    draw_fullscreen_button(display);
+}
+
+// the "full screen" button overlaid on the panel, over a white fill so it stays
+// legible on top of the map.
+fn draw_fullscreen_button(display: &mut Display) {
+    let rect = Rectangle::new(
+        Point::new(FS_BTN_X, FS_BTN_Y),
+        Size::new(FS_BTN_W, FS_BTN_H),
+    );
+    rect.into_styled(PrimitiveStyle::with_fill(Gray4::WHITE))
+        .draw(display)
+        .ok();
+    rect.into_styled(PrimitiveStyle::with_stroke(Gray4::BLACK, 2))
+        .draw(display)
+        .ok();
+    let style = MonoTextStyle::new(&FONT_6X10, Gray4::BLACK);
+    Text::with_alignment(
+        "full screen",
+        Point::new(
+            FS_BTN_X + FS_BTN_W as i32 / 2,
+            FS_BTN_Y + FS_BTN_H as i32 / 2 + 4,
+        ),
+        style,
+        Alignment::Center,
+    )
+    .draw(display)
+    .ok();
+}
+
+pub(crate) fn fullscreen_button_hit(sx: i32, sy: i32) -> bool {
+    sx >= FS_BTN_X
+        && sx < FS_BTN_X + FS_BTN_W as i32
+        && sy >= FS_BTN_Y
+        && sy < FS_BTN_Y + FS_BTN_H as i32
 }
 
 // clear the panel then redraw and flush it in grayscale. the physical clear
@@ -471,6 +524,194 @@ pub(crate) fn download_button_hit(sx: i32, sy: i32) -> bool {
 // refreshes of just the panel.
 fn map_panel_native_rect() -> t5s3_epaper_core::display::Rectangle {
     screen_to_native_rect(MAP_X, MAP_Y, MAP_W as i32, MAP_H as i32)
+}
+
+// fullscreen map view -------------------------------------------------------
+
+// the screen is 960 px tall in the rotated ui coordinate space.
+const SCREEN_H: i32 = 960;
+// the fullscreen map fills the screen above a bottom control bar. it is
+// stitched from cached zoom-15 tiles (no wifi), so it works offline over
+// whatever area has been cached or pre-downloaded; uncached tiles are left
+// blank.
+const FULL_MAP_X: i32 = 0;
+const FULL_MAP_Y: i32 = 0;
+const FULL_MAP_W: i32 = SCREEN_W;
+const FULL_CTRL_H: i32 = 84;
+const FULL_MAP_H: i32 = SCREEN_H - FULL_CTRL_H;
+// bottom control bar: three equal buttons across its width.
+const FULL_BTN_Y: i32 = FULL_MAP_H;
+const FULL_BTN_W: i32 = SCREEN_W / 3;
+// digital zoom range in powers of two of world-pixels-per-screen-pixel:
+// negative magnifies cached tiles (blocky), positive stitches more tiles in
+// (more area). bounded so a zoom-out doesn't decode an unreasonable number of
+// tiles.
+pub(crate) const FULL_ZOOM_MIN: i32 = -1;
+pub(crate) const FULL_ZOOM_MAX: i32 = 2;
+
+// which fullscreen control a tap landed on.
+pub(crate) enum FullAction {
+    ZoomOut,
+    ZoomIn,
+    Back,
+    // a tap on the map itself re-centers on the current fix.
+    Recenter,
+}
+
+pub(crate) fn full_touch(sx: i32, sy: i32) -> FullAction {
+    if sy < FULL_BTN_Y {
+        FullAction::Recenter
+    } else if sx < FULL_BTN_W {
+        FullAction::ZoomOut
+    } else if sx < FULL_BTN_W * 2 {
+        FullAction::ZoomIn
+    } else {
+        FullAction::Back
+    }
+}
+
+// stitch the cached tiles overlapping the viewport (centered on the fix) into
+// the map area at the requested digital zoom. the caller clears the screen
+// first, so uncached tiles simply stay blank.
+pub(crate) fn render_full_map(
+    display: &mut Display,
+    card: Option<&SdCard>,
+    fix: Option<GpsFix>,
+    zoom_step: i32,
+) {
+    let center = Point::new(FULL_MAP_X + FULL_MAP_W / 2, FULL_MAP_Y + FULL_MAP_H / 2);
+    let (Some(fix), Some(card)) = (fix, card) else {
+        let msg = if fix.is_none() {
+            "waiting for GPS fix..."
+        } else {
+            "no SD card"
+        };
+        Text::with_alignment(
+            msg,
+            center,
+            MonoTextStyle::new(&FONT_6X10, Gray4::new(4)),
+            Alignment::Center,
+        )
+        .draw(display)
+        .ok();
+        return;
+    };
+
+    // world pixels per screen pixel, as the ratio num/den.
+    let (num, den): (f64, f64) = if zoom_step >= 0 {
+        ((1i64 << zoom_step) as f64, 1.0)
+    } else {
+        (1.0, (1i64 << (-zoom_step)) as f64)
+    };
+    let (fpx, fpy) = project(fix.lat(), fix.lon());
+    let view_w = f64::from(FULL_MAP_W) * num / den;
+    let view_h = f64::from(FULL_MAP_H) * num / den;
+    let vx0 = fpx - view_w / 2.0;
+    let vy0 = fpy - view_h / 2.0;
+
+    // world px -> screen px (den/num is screen pixels per world pixel).
+    let to_sx = |wx: f64| FULL_MAP_X + libm::round((wx - vx0) * den / num) as i32;
+    let to_sy = |wy: f64| FULL_MAP_Y + libm::round((wy - vy0) * den / num) as i32;
+
+    let clip = Rectangle::new(
+        Point::new(FULL_MAP_X, FULL_MAP_Y),
+        Size::new(FULL_MAP_W as u32, FULL_MAP_H as u32),
+    );
+    let cx0 = libm::floor(vx0 / f64::from(MAP_W)) as i64;
+    let cx1 = libm::floor((vx0 + view_w) / f64::from(MAP_W)) as i64;
+    let cy0 = libm::floor(vy0 / f64::from(MAP_H)) as i64;
+    let cy1 = libm::floor((vy0 + view_h) / f64::from(MAP_H)) as i64;
+    for cy in cy0..=cy1 {
+        for cx in cx0..=cx1 {
+            let Ok(bytes) = card.read_file(map_cache_path(cell_key(cx, cy)).as_str()) else {
+                continue;
+            };
+            let Ok(img) = decode_image(&bytes) else {
+                continue;
+            };
+            // derive each tile's screen rect from its world corners so
+            // neighbours share an edge with no seam.
+            let dx0 = to_sx(cx as f64 * f64::from(MAP_W));
+            let dx1 = to_sx((cx + 1) as f64 * f64::from(MAP_W));
+            let dy0 = to_sy(cy as f64 * f64::from(MAP_H));
+            let dy1 = to_sy((cy + 1) as f64 * f64::from(MAP_H));
+            draw_image_scaled(
+                display,
+                &img,
+                dx0,
+                dy0,
+                (dx1 - dx0).max(1) as u32,
+                (dy1 - dy0).max(1) as u32,
+                clip,
+            );
+        }
+    }
+
+    // the fix sits at the viewport center.
+    draw_marker(display, center.x, center.y);
+}
+
+// the bottom control bar (zoom out / zoom in / back) plus a zoom-factor readout
+// overlaid on the top-left of the map.
+pub(crate) fn draw_full_controls(display: &mut Display, zoom_step: i32) {
+    Rectangle::new(
+        Point::new(0, FULL_BTN_Y),
+        Size::new(SCREEN_W as u32, FULL_CTRL_H as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(Gray4::WHITE))
+    .draw(display)
+    .ok();
+    Rectangle::new(Point::new(0, FULL_BTN_Y), Size::new(SCREEN_W as u32, 2))
+        .into_styled(PrimitiveStyle::with_fill(Gray4::BLACK))
+        .draw(display)
+        .ok();
+    for i in 1..3 {
+        Rectangle::new(
+            Point::new(FULL_BTN_W * i, FULL_BTN_Y),
+            Size::new(2, FULL_CTRL_H as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(Gray4::BLACK))
+        .draw(display)
+        .ok();
+    }
+
+    let bold = MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK);
+    let ty = FULL_BTN_Y + FULL_CTRL_H / 2 + 6;
+    for (i, text) in ["zoom -", "zoom +", "back"].iter().enumerate() {
+        Text::with_alignment(
+            text,
+            Point::new(FULL_BTN_W * i as i32 + FULL_BTN_W / 2, ty),
+            bold,
+            Alignment::Center,
+        )
+        .draw(display)
+        .ok();
+    }
+
+    // zoom-factor readout over the top-left of the map.
+    let mut buf = FmtBuf::<16>::new();
+    match zoom_step {
+        0 => {
+            write!(buf, "1x").ok();
+        }
+        s if s > 0 => {
+            write!(buf, "out {}x", 1 << s).ok();
+        }
+        s => {
+            write!(buf, "in {}x", 1 << (-s)).ok();
+        }
+    }
+    Rectangle::new(Point::new(FULL_MAP_X, FULL_MAP_Y), Size::new(90, 26))
+        .into_styled(PrimitiveStyle::with_fill(Gray4::WHITE))
+        .draw(display)
+        .ok();
+    Text::new(
+        buf.as_str(),
+        Point::new(FULL_MAP_X + 8, FULL_MAP_Y + 17),
+        MonoTextStyle::new(&FONT_6X10, Gray4::BLACK),
+    )
+    .draw(display)
+    .ok();
 }
 
 // a "you are here" dot at the map center. the white halo and black ring keep it

@@ -52,8 +52,11 @@ use crate::pages::gps::{
     area_km2,
     current_fix,
     download_button_hit,
+    draw_full_controls,
     draw_gps_data,
     draw_map,
+    full_touch,
+    fullscreen_button_hit,
     gps_data_native_rect,
     map_area_tiles,
     map_cache_path,
@@ -61,9 +64,13 @@ use crate::pages::gps::{
     map_request_path,
     parse_map,
     refresh_map_panel,
+    render_full_map,
+    FullAction,
     GpsFix,
     MapView,
     DOWNLOAD_RADIUS,
+    FULL_ZOOM_MAX,
+    FULL_ZOOM_MIN,
     GPS_REFRESH_TICKS,
     MAP_CACHE_DIR,
     MAP_MAX_BYTES,
@@ -469,6 +476,9 @@ async fn main(_spawner: Spawner) -> ! {
     let mut gps_shown_offset = (0i32, 0i32);
     #[cfg(feature = "gps")]
     let mut gps_marker_ticks: u16 = 0;
+    // digital zoom step for the fullscreen map view (0 = native zoom-15).
+    #[cfg(feature = "gps")]
+    let mut full_zoom: i32 = 0;
 
     loop {
         if needs_redraw {
@@ -476,8 +486,9 @@ async fn main(_spawner: Spawner) -> ! {
             let now = status_time(&mut clock, settings.tz_offset_hours);
 
             display.clear().ok();
-            // the image viewer paints full-screen, so it skips the status bar.
-            if current_screen != Screen::Image {
+            // the image viewer and fullscreen map paint full-screen, so they
+            // skip the status bar.
+            if current_screen != Screen::Image && current_screen != Screen::MapFull {
                 draw_status_bar(&mut display, pct, now, settings.time_24h);
             }
             match current_screen {
@@ -617,6 +628,17 @@ async fn main(_spawner: Spawner) -> ! {
                 Screen::Library => {
                     library::draw_screen(&mut display, &library_view, library_scroll)
                 }
+                #[cfg(feature = "gps")]
+                Screen::MapFull => {
+                    // stitch the fullscreen map from cached tiles (offline) and
+                    // draw the zoom/back controls over it.
+                    let card =
+                        SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus).ok();
+                    render_full_map(&mut display, card.as_ref(), last_fix, full_zoom);
+                    draw_full_controls(&mut display, full_zoom);
+                }
+                #[cfg(not(feature = "gps"))]
+                Screen::MapFull => {}
             }
             // a transient flush error shouldn't reboot the ui mid-session; log
             // it and carry on (the next redraw will try again).
@@ -651,9 +673,9 @@ async fn main(_spawner: Spawner) -> ! {
         }
 
         // refresh the status-bar battery indicator periodically so the charge
-        // stays current without switching pages. the image viewer hides the
-        // status bar, so skip it there.
-        if !needs_redraw && current_screen != Screen::Image {
+        // stays current without switching pages. the image viewer and
+        // fullscreen map hide the status bar, so skip it there.
+        if !needs_redraw && current_screen != Screen::Image && current_screen != Screen::MapFull {
             battery_refresh += 1;
             if battery_refresh >= BATTERY_REFRESH_TICKS {
                 battery_refresh = 0;
@@ -1307,6 +1329,11 @@ async fn main(_spawner: Spawner) -> ! {
                         } else if download_button_hit(sx, sy) {
                             // pre-download the surrounding area on the next pass.
                             gps_download = true;
+                        } else if fullscreen_button_hit(sx, sy) {
+                            // open the fullscreen map at native zoom.
+                            full_zoom = 0;
+                            current_screen = Screen::MapFull;
+                            needs_redraw = true;
                         } else {
                             // a tap anywhere else forces a map refresh for the
                             // current fix. panel-only (no full-page redraw): the
@@ -1315,6 +1342,27 @@ async fn main(_spawner: Spawner) -> ! {
                             gps_map_dirty = true;
                         }
                     }
+                    #[cfg(feature = "gps")]
+                    Screen::MapFull => match full_touch(sx, sy) {
+                        FullAction::Back => {
+                            current_screen = Screen::Gps;
+                            needs_redraw = true;
+                        }
+                        FullAction::ZoomOut => {
+                            if full_zoom < FULL_ZOOM_MAX {
+                                full_zoom += 1;
+                                needs_redraw = true;
+                            }
+                        }
+                        FullAction::ZoomIn => {
+                            if full_zoom > FULL_ZOOM_MIN {
+                                full_zoom -= 1;
+                                needs_redraw = true;
+                            }
+                        }
+                        // re-center on the current fix (re-render at same zoom).
+                        FullAction::Recenter => needs_redraw = true,
+                    },
                     _ => {
                         if back_button_hit(sx, sy) {
                             current_screen = Screen::Home;
@@ -1545,7 +1593,12 @@ async fn main(_spawner: Spawner) -> ! {
                 };
 
                 if let Some(c) = &card {
-                    if !missing.is_empty() {
+                    // download only the not-yet-cached cells; skip the wifi
+                    // session entirely when the whole area is already saved.
+                    let new_tiles = if missing.is_empty() {
+                        esp_println::println!("gps: area already cached, nothing to download");
+                        0
+                    } else {
                         let total = missing.len();
                         // show progress before the (blocking) download.
                         gps_map = MapView::Downloading(total);
@@ -1568,12 +1621,12 @@ async fn main(_spawner: Spawner) -> ! {
                         )
                         .await;
                         esp_println::println!("gps: area download saved {saved}/{total} tiles");
-                    }
+                        saved
+                    };
 
                     // report the area now cached around the fix, then reload the map.
                     let km2 = area_km2(fix.lat(), DOWNLOAD_RADIUS);
-                    esp_println::println!("gps: {km2:.0} sq km cached around fix");
-                    gps_map = MapView::Saved(km2);
+                    gps_map = MapView::Saved { km2, new_tiles };
                     refresh_map_panel(&mut display, &gps_map);
                     delay.delay_millis(1500);
                 }

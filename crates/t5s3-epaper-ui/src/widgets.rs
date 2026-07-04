@@ -178,6 +178,51 @@ pub(crate) fn draw_image_fit(
     display.fill_contiguous(&area, colors).ok();
 }
 
+// blit `image` scaled into the destination rectangle at (dst_x, dst_y) sized
+// dst_w x dst_h, clipped to `clip`, with ordered dithering. unlike
+// `draw_image_fit` the destination is positioned and sized by the caller (not
+// centered), so tiles can be stitched into a larger view. dithering uses screen
+// coordinates so the pattern stays seamless across adjacent tiles.
+pub(crate) fn draw_image_scaled(
+    display: &mut Display,
+    image: &GrayImage,
+    dst_x: i32,
+    dst_y: i32,
+    dst_w: u32,
+    dst_h: u32,
+    clip: Rectangle,
+) {
+    if dst_w == 0 || dst_h == 0 {
+        return;
+    }
+    let src_w = u32::from(image.width()).max(1);
+    let src_h = u32::from(image.height()).max(1);
+
+    // the destination rectangle intersected with the clip region.
+    let clip_x1 = clip.top_left.x + clip.size.width as i32;
+    let clip_y1 = clip.top_left.y + clip.size.height as i32;
+    let x0 = dst_x.max(clip.top_left.x);
+    let y0 = dst_y.max(clip.top_left.y);
+    let x1 = (dst_x + dst_w as i32).min(clip_x1);
+    let y1 = (dst_y + dst_h as i32).min(clip_y1);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+
+    let area = Rectangle::new(
+        Point::new(x0, y0),
+        Size::new((x1 - x0) as u32, (y1 - y0) as u32),
+    );
+    let colors = (y0..y1).flat_map(move |py| {
+        (x0..x1).map(move |px| {
+            let sx = ((px - dst_x) as u32 * src_w / dst_w).min(src_w - 1) as u16;
+            let sy = ((py - dst_y) as u32 * src_h / dst_h).min(src_h - 1) as u16;
+            Gray4::new(dither(image.sample(sx, sy), px as u32, py as u32))
+        })
+    });
+    display.fill_contiguous(&area, colors).ok();
+}
+
 // 4x4 ordered (Bayer) dithering of an 8-bit luma value to a 0..=15 gray level.
 fn dither(luma: u8, x: u32, y: u32) -> u8 {
     const BAYER: [[u32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];

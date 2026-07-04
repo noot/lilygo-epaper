@@ -128,6 +128,7 @@ macro_rules! icon_set {
             Screen::Library => include_bytes!(concat!("../../assets/icons/", $dir, "/reader.bmp")),
             Screen::Home
             | Screen::Image
+            | Screen::MapFull
             | Screen::Reader
             | Screen::SettingsSystem
             | Screen::SettingsReader
