@@ -642,7 +642,13 @@ async fn main(_spawner: Spawner) -> ! {
                     // stitch the fullscreen map from cached tiles (offline) and
                     // draw the zoom/back controls over it.
                     let card =
-                        SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus).ok();
+                        match SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus) {
+                            Ok(c) => Some(c),
+                            Err(e) => {
+                                esp_println::println!("gps: fullscreen sd init failed: {e:?}");
+                                None
+                            }
+                        };
                     render_full_map(&mut display, card.as_ref(), last_fix, full_zoom);
                     draw_full_controls(&mut display, full_zoom);
                 }
@@ -1592,7 +1598,14 @@ async fn main(_spawner: Spawner) -> ! {
         if current_screen == Screen::Gps && gps_download {
             gps_download = false;
             if let Some(fix) = last_fix {
-                let card = SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus).ok();
+                let card = match SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus)
+                {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        esp_println::println!("gps: save-area sd init failed: {e:?}");
+                        None
+                    }
+                };
                 // keep only the cells not already cached.
                 let missing: Vec<(u32, String)> = match &card {
                     Some(c) => {
