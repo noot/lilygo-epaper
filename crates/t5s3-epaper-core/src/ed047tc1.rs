@@ -54,9 +54,6 @@ const TPS_REG_VCOM2: u8 = 0x04;
 const TPS_REG_TMST1: u8 = 0x0D;
 const TPS_REG_PG: u8 = 0x0F;
 const TPS_TMST1_READ_THERM: u8 = 1 << 7;
-const BQ27220_ADDR: u8 = 0x55;
-const BQ27220_REG_VOLTAGE: u8 = 0x08;
-const BQ27220_REG_STATE_OF_CHARGE: u8 = 0x2C;
 const GT911_ADDR_LOW: u8 = 0x5D;
 const GT911_ADDR_HIGH: u8 = 0x14;
 const GT911_PRODUCT_ID: u16 = 0x8140;
@@ -287,14 +284,6 @@ impl<'a> ConfigWriter<'a> {
         Ok(value[0])
     }
 
-    fn read_register_u16(&mut self, device: u8, reg: u8) -> crate::Result<u16> {
-        let mut value = [0u8; 2];
-        self.i2c
-            .write_read(device, &[reg], &mut value)
-            .map_err(crate::Error::I2c)?;
-        Ok(u16::from_le_bytes(value))
-    }
-
     fn write_register(&mut self, device: u8, payload: &[u8]) -> crate::Result<()> {
         self.i2c.write(device, payload).map_err(crate::Error::I2c)
     }
@@ -318,11 +307,27 @@ impl<'a> ConfigWriter<'a> {
     }
 
     fn battery_voltage_mv(&mut self) -> crate::Result<u16> {
-        self.read_register_u16(BQ27220_ADDR, BQ27220_REG_VOLTAGE)
+        crate::bq27220::voltage_mv(&mut self.i2c)
     }
 
     fn battery_state_of_charge(&mut self) -> crate::Result<u16> {
-        self.read_register_u16(BQ27220_ADDR, BQ27220_REG_STATE_OF_CHARGE)
+        crate::bq27220::state_of_charge(&mut self.i2c)
+    }
+
+    fn battery_time_to_full_minutes(&mut self) -> crate::Result<Option<u16>> {
+        crate::bq27220::time_to_full_minutes(&mut self.i2c)
+    }
+
+    fn fuel_gauge_diagnostics(&mut self) -> crate::Result<crate::bq27220::Diagnostics> {
+        crate::bq27220::diagnostics(&mut self.i2c)
+    }
+
+    fn fuel_gauge_exit_config_update(&mut self) -> crate::Result<()> {
+        crate::bq27220::exit_config_update(&mut self.i2c)
+    }
+
+    fn fuel_gauge_program_capacity(&mut self, capacity_mah: u16) -> crate::Result<()> {
+        crate::bq27220::program_capacity(&mut self.i2c, capacity_mah)
     }
 
     fn shutdown(&mut self) -> crate::Result<()> {
@@ -682,6 +687,22 @@ impl<'a> ED047TC1<'a> {
 
     pub(crate) fn charger_status(&mut self) -> crate::Result<crate::bq25896::Status> {
         self.cfg_writer.charger_status()
+    }
+
+    pub(crate) fn battery_time_to_full_minutes(&mut self) -> crate::Result<Option<u16>> {
+        self.cfg_writer.battery_time_to_full_minutes()
+    }
+
+    pub(crate) fn fuel_gauge_diagnostics(&mut self) -> crate::Result<crate::bq27220::Diagnostics> {
+        self.cfg_writer.fuel_gauge_diagnostics()
+    }
+
+    pub(crate) fn fuel_gauge_exit_config_update(&mut self) -> crate::Result<()> {
+        self.cfg_writer.fuel_gauge_exit_config_update()
+    }
+
+    pub(crate) fn fuel_gauge_program_capacity(&mut self, capacity_mah: u16) -> crate::Result<()> {
+        self.cfg_writer.fuel_gauge_program_capacity(capacity_mah)
     }
 
     pub(crate) fn panel_temperature(&mut self) -> crate::Result<i8> {

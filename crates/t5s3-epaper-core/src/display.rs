@@ -218,6 +218,41 @@ impl<'a> Display<'a> {
         self.epd.charger_status()
     }
 
+    /// Read the predicted time until the battery is fully charged from the
+    /// on-board BQ27220 fuel gauge. Returns `None` when the battery is not
+    /// being charged.
+    pub fn battery_time_to_full(&mut self) -> Result<Option<Duration>> {
+        Ok(self
+            .epd
+            .battery_time_to_full_minutes()?
+            .map(|minutes| Duration::from_secs(u64::from(minutes) * 60)))
+    }
+
+    /// Read a diagnostic snapshot of the BQ27220 fuel gauge's capacity
+    /// accounting.
+    pub fn fuel_gauge_diagnostics(&mut self) -> Result<crate::bq27220::Diagnostics> {
+        self.epd.fuel_gauge_diagnostics()
+    }
+
+    /// Tell the BQ27220 fuel gauge to leave config-update mode (which
+    /// suspends gauging) and re-initialize its charge estimate.
+    pub fn fuel_gauge_exit_config_update(&mut self) -> Result<()> {
+        self.epd.fuel_gauge_exit_config_update()
+    }
+
+    /// Program the BQ27220 fuel gauge's full-charge and design capacity to
+    /// the real battery pack in mAh.
+    ///
+    /// The gauge's profile defaults to 3000 mAh and lives in RAM, so this
+    /// should be re-applied whenever [`bq27220::Diagnostics::design_mah`]
+    /// differs from the pack. Blocks for a few seconds while the gauge
+    /// passes through config-update mode and re-initializes.
+    ///
+    /// [`bq27220::Diagnostics::design_mah`]: crate::bq27220::Diagnostics
+    pub fn fuel_gauge_program_capacity(&mut self, capacity_mah: u16) -> Result<()> {
+        self.epd.fuel_gauge_program_capacity(capacity_mah)
+    }
+
     /// Return the touchscreen resolution reported by the GT911 controller.
     pub fn touch_resolution(&self) -> (u16, u16) {
         self.epd.touch_resolution()

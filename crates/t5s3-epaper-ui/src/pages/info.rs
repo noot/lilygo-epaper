@@ -1,5 +1,5 @@
 use alloc::{format, string::String};
-use core::fmt::Write as _;
+use core::{fmt::Write as _, time::Duration};
 
 use embedded_graphics::{
     mono_font::{
@@ -12,7 +12,7 @@ use embedded_graphics::{
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use esp_hal::time::Instant;
-use t5s3_epaper_core::{bq25896, Clock, Display};
+use t5s3_epaper_core::{bq25896, bq27220, Clock, Display};
 
 use crate::{
     fmt::FmtBuf,
@@ -21,7 +21,7 @@ use crate::{
 };
 
 const INFO_TOP: i32 = 210;
-const INFO_H: u32 = 400;
+const INFO_H: u32 = 480;
 
 // shown on the info page.
 const MODEL_NAME: &str = "LilyGo T5 S3 Paper Pro";
@@ -48,6 +48,10 @@ pub(crate) struct Info {
     since_sync: Option<u64>,
     // None when the charger read failed; its rows then show "-".
     charger: Option<bq25896::Status>,
+    // None when the battery is not charging (or the read failed).
+    full_in: Option<Duration>,
+    // None when the fuel gauge read failed; its row then shows "-".
+    gauge: Option<bq27220::Diagnostics>,
 }
 
 // read the live system stats for the info page: battery voltage, panel
@@ -71,12 +75,28 @@ pub(crate) fn read_info(display: &mut Display, clock: &mut Clock) -> Info {
             None
         }
     };
+    let full_in = match display.battery_time_to_full() {
+        Ok(time) => time,
+        Err(e) => {
+            esp_println::println!("info: time-to-full read failed: {e}");
+            None
+        }
+    };
+    let gauge = match display.fuel_gauge_diagnostics() {
+        Ok(diagnostics) => Some(diagnostics),
+        Err(e) => {
+            esp_println::println!("info: fuel gauge read failed: {e}");
+            None
+        }
+    };
     Info {
         voltage,
         temp,
         uptime,
         since_sync,
         charger,
+        full_in,
+        gauge,
     }
 }
 
@@ -146,6 +166,16 @@ pub(crate) fn draw_info_values(display: &mut Display, info: &Info) {
         }
     };
 
+    let full_in = match info.full_in {
+        Some(d) => format_duration(d.as_secs()),
+        None => String::from("-"),
+    };
+    let mut capacity = FmtBuf::<24>::new();
+    match &info.gauge {
+        Some(g) => write!(capacity, "{}/{} mAh", g.remaining_mah, g.full_charge_mah).ok(),
+        None => write!(capacity, "-").ok(),
+    };
+
     let rows = [
         ("Model", MODEL_NAME),
         ("Battery", volt.as_str()),
@@ -155,6 +185,8 @@ pub(crate) fn draw_info_values(display: &mut Display, info: &Info) {
         ("Charge", charge),
         ("Input", input.as_str()),
         ("Current", current.as_str()),
+        ("Full in", full_in.as_str()),
+        ("Capacity", capacity.as_str()),
     ];
     let mut y = INFO_TOP + 36;
     for (name, val) in rows {
