@@ -179,6 +179,12 @@ use crate::{
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
+// the real battery pack capacity in mAh, measured as the gauge's coulomb count
+// at charge termination. the BQ27220's profile defaults to 3000 mAh, which
+// made the percentage top out at ~54%; the boot block below (re)programs the
+// gauge whenever its stored design capacity differs. adjust for a new pack.
+const BATTERY_MAH: u16 = 1620;
+
 // last visited screen, stored in RTC fast memory so it survives the reset that
 // deep sleep performs. zeroed (Home) on first boot, then retained across sleep.
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
@@ -311,6 +317,37 @@ async fn main(_spawner: Spawner) -> ! {
             g.update().ok();
             delay.delay_millis(20);
         }
+    }
+
+    // log the fuel gauge's capacity accounting once per boot: a full-charge
+    // capacity far from the real pack shows up as a battery percentage that
+    // tops out early, and a gauge stranded in config-update mode stops
+    // gauging entirely (percentage frozen) — recover from the latter here.
+    // this runs after the gps probe: the probe's timing is fragile (see the
+    // comment above) and the capacity programming below can block for a few
+    // seconds when it has to run.
+    match display.fuel_gauge_diagnostics() {
+        Ok(d) => {
+            esp_println::println!("fuel gauge: {d:?}");
+            if d.config_update {
+                match display.fuel_gauge_exit_config_update() {
+                    Ok(()) => esp_println::println!("fuel gauge: exited config-update mode"),
+                    Err(e) => esp_println::println!("fuel gauge: config-update exit failed: {e}"),
+                }
+            }
+            // the gauge's capacity profile is RAM-backed (reset to the 3000
+            // mAh default only if the pack is ever unplugged), so re-program
+            // the real pack capacity whenever the stored value differs.
+            if d.design_mah != BATTERY_MAH {
+                match display.fuel_gauge_program_capacity(BATTERY_MAH) {
+                    Ok(()) => {
+                        esp_println::println!("fuel gauge: programmed {BATTERY_MAH} mAh capacity")
+                    }
+                    Err(e) => esp_println::println!("fuel gauge: capacity programming failed: {e}"),
+                }
+            }
+        }
+        Err(e) => esp_println::println!("fuel gauge: diagnostics read failed: {e}"),
     }
 
     // whether the clock currently holds a real synced time: kept in the RTC
@@ -589,8 +626,8 @@ async fn main(_spawner: Spawner) -> ! {
                 Screen::Frontlight => draw_frontlight_screen(&mut display, brightness),
                 Screen::Sleep => draw_sleep_screen(&mut display),
                 Screen::Info => {
-                    let (voltage, temp, uptime, since_sync) = read_info(&mut display, &mut clock);
-                    draw_info_screen(&mut display, voltage, temp, uptime, since_sync);
+                    let info = read_info(&mut display, &mut clock);
+                    draw_info_screen(&mut display, &info);
                 }
                 Screen::Files => draw_files_screen(
                     &mut display,
@@ -746,8 +783,8 @@ async fn main(_spawner: Spawner) -> ! {
             info_refresh += 1;
             if info_refresh >= INFO_REFRESH_TICKS {
                 info_refresh = 0;
-                let (voltage, temp, uptime, since_sync) = read_info(&mut display, &mut clock);
-                draw_info_values(&mut display, voltage, temp, uptime, since_sync);
+                let info = read_info(&mut display, &mut clock);
+                draw_info_values(&mut display, &info);
                 display.flush_partial_fast(info_values_rect()).ok();
             }
         }
