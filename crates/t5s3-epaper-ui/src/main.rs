@@ -566,8 +566,8 @@ async fn main(_spawner: Spawner) -> ! {
                 Screen::Frontlight => draw_frontlight_screen(&mut display, brightness),
                 Screen::Sleep => draw_sleep_screen(&mut display),
                 Screen::Info => {
-                    let (voltage, temp, uptime, since_sync) = read_info(&mut display, &mut clock);
-                    draw_info_screen(&mut display, voltage, temp, uptime, since_sync);
+                    let info = read_info(&mut display, &mut clock);
+                    draw_info_screen(&mut display, &info);
                 }
                 Screen::Files => draw_files_screen(
                     &mut display,
@@ -708,8 +708,8 @@ async fn main(_spawner: Spawner) -> ! {
             info_refresh += 1;
             if info_refresh >= INFO_REFRESH_TICKS {
                 info_refresh = 0;
-                let (voltage, temp, uptime, since_sync) = read_info(&mut display, &mut clock);
-                draw_info_values(&mut display, voltage, temp, uptime, since_sync);
+                let info = read_info(&mut display, &mut clock);
+                draw_info_values(&mut display, &info);
                 display.flush_partial_fast(info_values_rect()).ok();
             }
         }

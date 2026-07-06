@@ -12,7 +12,7 @@ use embedded_graphics::{
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use esp_hal::time::Instant;
-use t5s3_epaper_core::{Clock, Display};
+use t5s3_epaper_core::{bq25896, Clock, Display};
 
 use crate::{
     fmt::FmtBuf,
@@ -21,7 +21,7 @@ use crate::{
 };
 
 const INFO_TOP: i32 = 210;
-const INFO_H: u32 = 320;
+const INFO_H: u32 = 400;
 
 // shown on the info page.
 const MODEL_NAME: &str = "LilyGo T5 S3 Paper Pro";
@@ -40,10 +40,20 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
+// the live system stats shown on the info page.
+pub(crate) struct Info {
+    voltage: f32,
+    temp: i8,
+    uptime: u64,
+    since_sync: Option<u64>,
+    // None when the charger read failed; its rows then show "-".
+    charger: Option<bq25896::Status>,
+}
+
 // read the live system stats for the info page: battery voltage, panel
-// temperature, uptime since boot, and time since the last clock sync (None if
-// it has not synced this power cycle).
-pub(crate) fn read_info(display: &mut Display, clock: &mut Clock) -> (f32, i8, u64, Option<u64>) {
+// temperature, uptime since boot, time since the last clock sync (None if
+// it has not synced this power cycle), and the BQ25896 charger status.
+pub(crate) fn read_info(display: &mut Display, clock: &mut Clock) -> Info {
     let voltage = display.battery_voltage().unwrap_or(0.0);
     let temp = display.panel_temperature().unwrap_or(0);
     let uptime = Instant::now().duration_since_epoch().as_micros() / 1_000_000;
@@ -54,18 +64,25 @@ pub(crate) fn read_info(display: &mut Display, clock: &mut Clock) -> (f32, i8, u
     } else {
         None
     };
-    (voltage, temp, uptime, since_sync)
+    let charger = match display.charger_status() {
+        Ok(status) => Some(status),
+        Err(e) => {
+            esp_println::println!("info: charger status read failed: {e}");
+            None
+        }
+    };
+    Info {
+        voltage,
+        temp,
+        uptime,
+        since_sync,
+        charger,
+    }
 }
 
 // the label/value rows, drawn over a white fill so the periodic refresh cleanly
 // replaces the previous values.
-pub(crate) fn draw_info_values(
-    display: &mut Display,
-    voltage: f32,
-    temp: i8,
-    uptime: u64,
-    since_sync: Option<u64>,
-) {
+pub(crate) fn draw_info_values(display: &mut Display, info: &Info) {
     Rectangle::new(Point::new(40, INFO_TOP), Size::new(460, INFO_H))
         .into_styled(PrimitiveStyle::with_fill(Gray4::WHITE))
         .draw(display)
@@ -76,15 +93,15 @@ pub(crate) fn draw_info_values(
     // what sets values apart from labels.
     let label = MonoTextStyle::new(&FONT_9X15, Gray4::BLACK);
     let value = MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK);
-    let v_int = voltage as u32;
-    let v_frac = ((voltage - v_int as f32) * 100.0) as u32;
+    let v_int = info.voltage as u32;
+    let v_frac = ((info.voltage - v_int as f32) * 100.0) as u32;
 
     let mut volt = FmtBuf::<16>::new();
     write!(volt, "{v_int}.{v_frac:02} V").ok();
     let mut tmp = FmtBuf::<16>::new();
-    write!(tmp, "{temp} C").ok();
-    let uptime = format_duration(uptime);
-    let synced = match since_sync {
+    write!(tmp, "{} C", info.temp).ok();
+    let uptime = format_duration(info.uptime);
+    let synced = match info.since_sync {
         Some(s) => {
             let mut b = FmtBuf::<24>::new();
             write!(b, "{} ago", format_duration(s)).ok();
@@ -97,28 +114,57 @@ pub(crate) fn draw_info_values(
         }
     };
 
+    let mut input = FmtBuf::<24>::new();
+    let mut current = FmtBuf::<16>::new();
+    let charge = match &info.charger {
+        Some(c) => {
+            let source = match c.vbus {
+                bq25896::VbusStatus::NoInput => "none",
+                bq25896::VbusStatus::UsbHost => "USB",
+                bq25896::VbusStatus::Adapter => "adapter",
+                bq25896::VbusStatus::Otg => "OTG",
+                bq25896::VbusStatus::Unknown => "unknown",
+            };
+            if c.vbus_mv > 0 {
+                let mv = c.vbus_mv as u32;
+                write!(input, "{source} {}.{:02} V", mv / 1000, (mv % 1000) / 10).ok();
+            } else {
+                write!(input, "{source}").ok();
+            }
+            write!(current, "{} mA", c.charge_ma).ok();
+            match c.charge {
+                bq25896::ChargeStatus::NotCharging => "not charging",
+                bq25896::ChargeStatus::PreCharge => "pre-charge",
+                bq25896::ChargeStatus::FastCharge => "fast charge",
+                bq25896::ChargeStatus::Done => "done",
+            }
+        }
+        None => {
+            write!(input, "-").ok();
+            write!(current, "-").ok();
+            "-"
+        }
+    };
+
     let rows = [
         ("Model", MODEL_NAME),
         ("Battery", volt.as_str()),
         ("Temp", tmp.as_str()),
         ("Uptime", uptime.as_str()),
         ("Synced", synced.as_str()),
+        ("Charge", charge),
+        ("Input", input.as_str()),
+        ("Current", current.as_str()),
     ];
     let mut y = INFO_TOP + 36;
     for (name, val) in rows {
         Text::new(name, Point::new(70, y), label).draw(display).ok();
         Text::new(val, Point::new(250, y), value).draw(display).ok();
-        y += 58;
+        y += 48;
     }
 }
 
-pub(crate) fn draw_info_screen(
-    display: &mut Display,
-    voltage: f32,
-    temp: i8,
-    uptime: u64,
-    since_sync: Option<u64>,
-) {
+pub(crate) fn draw_info_screen(display: &mut Display, info: &Info) {
     let bold = MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK);
     draw_back_button(display);
     Text::with_alignment(
@@ -129,7 +175,7 @@ pub(crate) fn draw_info_screen(
     )
     .draw(display)
     .ok();
-    draw_info_values(display, voltage, temp, uptime, since_sync);
+    draw_info_values(display, info);
 }
 
 pub(crate) fn info_values_rect() -> t5s3_epaper_core::display::Rectangle {

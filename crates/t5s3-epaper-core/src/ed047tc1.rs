@@ -57,9 +57,6 @@ const TPS_TMST1_READ_THERM: u8 = 1 << 7;
 const BQ27220_ADDR: u8 = 0x55;
 const BQ27220_REG_VOLTAGE: u8 = 0x08;
 const BQ27220_REG_STATE_OF_CHARGE: u8 = 0x2C;
-const BQ25896_ADDR: u8 = 0x6B;
-const BQ25896_REG_MISC_OPERATION: u8 = 0x09;
-const BQ25896_BATFET_DIS: u8 = 1 << 5;
 const GT911_ADDR_LOW: u8 = 0x5D;
 const GT911_ADDR_HIGH: u8 = 0x14;
 const GT911_PRODUCT_ID: u16 = 0x8140;
@@ -329,9 +326,11 @@ impl<'a> ConfigWriter<'a> {
     }
 
     fn shutdown(&mut self) -> crate::Result<()> {
-        let mut value = self.read_register(BQ25896_ADDR, BQ25896_REG_MISC_OPERATION)?;
-        value |= BQ25896_BATFET_DIS;
-        self.write_register(BQ25896_ADDR, &[BQ25896_REG_MISC_OPERATION, value])
+        crate::bq25896::disable_batfet(&mut self.i2c)
+    }
+
+    fn charger_status(&mut self) -> crate::Result<crate::bq25896::Status> {
+        crate::bq25896::read_status(&mut self.i2c)
     }
 
     fn auxiliary_button_pressed(&mut self) -> crate::Result<bool> {
@@ -679,6 +678,10 @@ impl<'a> ED047TC1<'a> {
 
     pub(crate) fn battery_state_of_charge(&mut self) -> crate::Result<u16> {
         self.cfg_writer.battery_state_of_charge()
+    }
+
+    pub(crate) fn charger_status(&mut self) -> crate::Result<crate::bq25896::Status> {
+        self.cfg_writer.charger_status()
     }
 
     pub(crate) fn panel_temperature(&mut self) -> crate::Result<i8> {

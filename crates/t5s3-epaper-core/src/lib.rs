@@ -97,6 +97,7 @@
 
 extern crate alloc;
 
+pub mod bq25896;
 mod bus;
 pub mod display;
 pub mod frontlight;
@@ -144,6 +145,8 @@ pub enum Error {
     InvalidColor,
     /// Timed out waiting for the power supply to report ready.
     PowerTimeout,
+    /// Timed out waiting for the BQ25896 ADC conversion to complete.
+    ChargerAdcTimeout,
     /// LCD peripheral handle was unexpectedly unavailable.
     MissingI8080,
     /// DMA buffer was unexpectedly unavailable.
@@ -170,6 +173,9 @@ impl core::fmt::Display for Error {
             Self::OutOfBounds => write!(f, "pixel coordinates exceed display boundary"),
             Self::InvalidColor => write!(f, "color exceeds allowed range of 0x0-0x0F"),
             Self::PowerTimeout => write!(f, "timed out waiting for power supply ready"),
+            Self::ChargerAdcTimeout => {
+                write!(f, "timed out waiting for BQ25896 ADC conversion")
+            }
             Self::MissingI8080 => write!(f, "LCD peripheral handle unexpectedly unavailable"),
             Self::MissingDmaBuffer => write!(f, "DMA buffer unexpectedly unavailable"),
             Self::MissingRmtPin => write!(f, "RMT output pin unexpectedly unavailable"),

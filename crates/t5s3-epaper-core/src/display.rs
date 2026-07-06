@@ -210,6 +210,14 @@ impl<'a> Display<'a> {
         self.epd.battery_state_of_charge()
     }
 
+    /// Read a decoded status snapshot from the on-board BQ25896 charger.
+    ///
+    /// This kicks a one-shot ADC conversion and blocks until it completes
+    /// (typically ~10 ms).
+    pub fn charger_status(&mut self) -> Result<crate::bq25896::Status> {
+        self.epd.charger_status()
+    }
+
     /// Return the touchscreen resolution reported by the GT911 controller.
     pub fn touch_resolution(&self) -> (u16, u16) {
         self.epd.touch_resolution()
