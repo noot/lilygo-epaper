@@ -1,5 +1,9 @@
 use alloc::{string::String, vec::Vec};
-use core::{fmt::Write as _, net::Ipv4Addr};
+use core::{
+    fmt::Write as _,
+    net::Ipv4Addr,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use embassy_futures::select::{select, Either};
 use embassy_net::{
@@ -11,6 +15,7 @@ use embassy_net::{
     Stack,
     StackResources,
 };
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_time::{with_timeout, Duration, Timer};
 use embedded_io_async::Write as _;
 use esp_hal::rng::Rng;
@@ -89,6 +94,119 @@ pub(crate) const RESYNC_INTERVAL_SECS: u64 = 4 * 3600;
 // interval. wifi still powers down between attempts.
 pub(crate) const RETRY_INTERVAL_SECS: u64 = 120;
 
+// a wifi operation requested by the ui. each runs as one self-contained
+// session on the wifi task: radio up, do the work, radio down.
+pub(crate) enum Op {
+    SyncTime,
+    Scan,
+    Join,
+    Get {
+        host: Host,
+        path: String,
+        max_body: usize,
+    },
+    Music {
+        command: Option<&'static str>,
+    },
+    DownloadMaps {
+        tiles: Vec<(u32, String)>,
+        max_body: usize,
+    },
+}
+
+// which server an `Op::Get` targets.
+pub(crate) enum Host {
+    // noot-server (music and environment json).
+    Server,
+    // the configured map host.
+    Map,
+    // an arbitrary public host over plain http on port 80 (weather api).
+    External(&'static str),
+}
+
+// one queued operation plus the credentials to run it under.
+pub(crate) struct Request {
+    pub(crate) ssid: String,
+    pub(crate) password: String,
+    pub(crate) op: Op,
+}
+
+// a completed operation's result (or, for `Tile`, one step of an in-progress
+// bulk download), consumed by the ui loop's event router.
+pub(crate) enum Event {
+    TimeSynced(Option<u64>),
+    ScanDone(Option<Vec<ScanEntry>>),
+    JoinDone(bool),
+    GotBody(Option<Vec<u8>>),
+    MusicDone(Option<MusicSnapshot>),
+    // one fetched tile of a bulk download, streamed as it arrives so only one
+    // body is ever resident.
+    Tile { key: u32, body: Vec<u8> },
+    DownloadDone { fetched: usize },
+}
+
+// single-slot channels between the ui and the wifi task: the ui queues at most
+// one operation at a time (gated on its pending state) and drains events every
+// pass; the task blocks on the event send for tile bodies, bounding memory.
+static REQUESTS: Channel<CriticalSectionRawMutex, Request, 1> = Channel::new();
+static EVENTS: Channel<CriticalSectionRawMutex, Event, 1> = Channel::new();
+// set by the ui to abandon an in-flight bulk download (e.g. to enter sleep).
+static CANCEL: AtomicBool = AtomicBool::new(false);
+
+// queue an operation for the wifi task; false when one is already queued.
+pub(crate) fn send(req: Request) -> bool {
+    REQUESTS.try_send(req).is_ok()
+}
+
+// take the next completion event without blocking.
+pub(crate) fn poll_event() -> Option<Event> {
+    EVENTS.try_receive().ok()
+}
+
+// wait for the next completion event. used where the ui deliberately blocks on
+// the in-flight session (boot sync, pre-sleep drain).
+pub(crate) async fn next_event() -> Event {
+    EVENTS.receive().await
+}
+
+// ask the task to abandon an in-flight bulk download after the current tile.
+pub(crate) fn cancel() {
+    CANCEL.store(true, Ordering::Relaxed);
+}
+
+// the wifi task: sole owner of the WIFI peripheral, running one session per
+// queued request so exactly one controller ever exists and the radio is
+// dropped (powered down) between sessions. nothing else may touch WIFI.
+#[embassy_executor::task]
+pub(crate) async fn run() {
+    loop {
+        let req = REQUESTS.receive().await;
+        CANCEL.store(false, Ordering::Relaxed);
+        // sound: this task is the only code that steals WIFI, one session at a
+        // time, and the previous session's controller has been dropped.
+        let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
+        let event = match req.op {
+            Op::SyncTime => Event::TimeSynced(sync_time(wifi, &req.ssid, &req.password).await),
+            Op::Scan => Event::ScanDone(scan(wifi).await),
+            Op::Join => Event::JoinDone(try_connect(wifi, &req.ssid, &req.password).await),
+            Op::Get {
+                host,
+                path,
+                max_body,
+            } => Event::GotBody(
+                http_get(wifi, &req.ssid, &req.password, &host, &path, max_body).await,
+            ),
+            Op::Music { command } => {
+                Event::MusicDone(music_session(wifi, &req.ssid, &req.password, command).await)
+            }
+            Op::DownloadMaps { tiles, max_body } => Event::DownloadDone {
+                fetched: download_maps(wifi, &req.ssid, &req.password, &tiles, max_body).await,
+            },
+        };
+        EVENTS.send(event).await;
+    }
+}
+
 // connect to wifi, fetch the current unix time via SNTP, then power the radio
 // back down. self-contained: it drives the network stack (`runner`) alongside
 // the connect+query work via `select`, so when the query finishes everything
@@ -164,7 +282,7 @@ pub(crate) struct ScanEntry {
 // radio back down. named networks are deduplicated (keeping the strongest
 // signal) and hidden/unnamed APs dropped. returns None on timeout or scan
 // error.
-pub(crate) async fn scan(wifi: esp_hal::peripherals::WIFI<'static>) -> Option<Vec<ScanEntry>> {
+async fn scan(wifi: esp_hal::peripherals::WIFI<'static>) -> Option<Vec<ScanEntry>> {
     let mut controller = station_controller(wifi, "", "")?;
 
     let config = ScanConfig::default().with_max(20);
@@ -200,7 +318,7 @@ pub(crate) async fn scan(wifi: esp_hal::peripherals::WIFI<'static>) -> Option<Ve
 // bring wifi up with the given credentials and confirm a connection + DHCP
 // lease come up, then power the radio back down. used by the wifi settings page
 // to verify newly entered credentials. returns whether the join succeeded.
-pub(crate) async fn try_connect(
+async fn try_connect(
     wifi: esp_hal::peripherals::WIFI<'static>,
     ssid: &str,
     password: &str,
@@ -229,7 +347,7 @@ pub(crate) async fn try_connect(
     matches!(outcome, Either::Second(Some(())))
 }
 
-pub(crate) async fn sync_time(
+async fn sync_time(
     wifi: esp_hal::peripherals::WIFI<'static>,
     ssid: &str,
     password: &str,
@@ -268,16 +386,17 @@ pub(crate) async fn sync_time(
     }
 }
 
-// bring wifi up, GET `path` from noot-server, then power the radio back down.
+// bring wifi up, GET `path` from `host`, then power the radio back down.
 // mirrors `sync_time`: it drives the network stack alongside the request work
 // via `select`, so everything drops when the request finishes and
 // WifiController's Drop deinitialises the radio. returns the response body, or
 // None on any failure. `max_body` caps how much body is buffered: a few kB for
-// the environment page's json, much larger for the gps page's map image.
-pub(crate) async fn http_get(
+// json, much larger for a map tile.
+async fn http_get(
     wifi: esp_hal::peripherals::WIFI<'static>,
     ssid: &str,
     password: &str,
+    host: &Host,
     path: &str,
     max_body: usize,
 ) -> Option<Vec<u8>> {
@@ -297,44 +416,11 @@ pub(crate) async fn http_get(
         if !bring_up(&mut controller, stack).await {
             return None;
         }
-        request(stack, "GET", path, max_body).await
-    })
-    .await;
-
-    match outcome {
-        Either::First(_) => None,
-        Either::Second(body) => body,
-    }
-}
-
-// bring wifi up, GET `path` from an arbitrary public `host` over plain http,
-// then power the radio back down. mirrors `http_get` but targets a hostname of
-// the caller's choosing (used by the weather page to reach a forecast api)
-// rather than noot-server. returns the response body, or None on any failure.
-pub(crate) async fn http_get_from(
-    wifi: esp_hal::peripherals::WIFI<'static>,
-    ssid: &str,
-    password: &str,
-    host: &str,
-    path: &str,
-) -> Option<Vec<u8>> {
-    let mut controller = station_controller(wifi, ssid, password)?;
-
-    let rng = Rng::new();
-    let seed = (rng.random() as u64) << 32 | rng.random() as u64;
-    let mut resources = StackResources::<3>::new();
-    let (stack, mut runner) = embassy_net::new(
-        Interface::station(),
-        embassy_net::Config::dhcpv4(Default::default()),
-        &mut resources,
-        seed,
-    );
-
-    let outcome = select(runner.run(), async {
-        if !bring_up(&mut controller, stack).await {
-            return None;
+        match host {
+            Host::Server => request(stack, "GET", path, max_body).await,
+            Host::Map => request_host(stack, MAP_HOST, MAP_PORT, path, max_body).await,
+            Host::External(h) => request_host(stack, h, 80, path, max_body).await,
         }
-        request_ext(stack, host, path).await
     })
     .await;
 
@@ -344,60 +430,25 @@ pub(crate) async fn http_get_from(
     }
 }
 
-// bring wifi up, GET one map tile from the configured map host (a public proxy
-// if MAP_HOST is set, otherwise noot-server on the LAN), then power the radio
-// back down. mirrors `http_get` but targets the map host rather than the
-// noot-server host used by the music/environment pages.
-pub(crate) async fn http_get_map(
-    wifi: esp_hal::peripherals::WIFI<'static>,
-    ssid: &str,
-    password: &str,
-    path: &str,
-    max_body: usize,
-) -> Option<Vec<u8>> {
-    let mut controller = station_controller(wifi, ssid, password)?;
+// consecutive failed tile fetches before a bulk download gives up (the network
+// has clearly gone away, so don't eat the socket timeout for every remaining
+// tile).
+const MAX_CONSECUTIVE_MISSES: usize = 5;
 
-    let rng = Rng::new();
-    let seed = (rng.random() as u64) << 32 | rng.random() as u64;
-    let mut resources = StackResources::<3>::new();
-    let (stack, mut runner) = embassy_net::new(
-        Interface::station(),
-        embassy_net::Config::dhcpv4(Default::default()),
-        &mut resources,
-        seed,
-    );
-
-    let outcome = select(runner.run(), async {
-        if !bring_up(&mut controller, stack).await {
-            return None;
-        }
-        request_host(stack, MAP_HOST, MAP_PORT, path, max_body).await
-    })
-    .await;
-
-    match outcome {
-        Either::First(_) => None,
-        Either::Second(body) => body,
-    }
-}
-
-// bring wifi up, GET each map path from the configured map host in one session,
-// then power the radio back down. doing a whole area in one bring-up (rather
-// than one per tile) keeps a bulk download to a single ~20s radio start. each
-// fetched tile is handed to `on_tile(key, body)` so the caller can write it to
-// the sd cache as it arrives, keeping only one tile body resident at a time.
-// returns the number of tiles fetched.
-pub(crate) async fn download_maps<F>(
+// GET each map path from the configured map host in one session, then power
+// the radio back down. doing a whole area in one bring-up (rather than one per
+// tile) keeps a bulk download to a single ~20s radio start. each fetched tile
+// is streamed to the ui as an `Event::Tile` so it can be written to the sd
+// cache as it arrives, keeping only one tile body resident at a time. stops
+// early after a few consecutive misses or when cancelled. returns the number
+// of tiles fetched.
+async fn download_maps(
     wifi: esp_hal::peripherals::WIFI<'static>,
     ssid: &str,
     password: &str,
     tiles: &[(u32, String)],
     max_body: usize,
-    mut on_tile: F,
-) -> usize
-where
-    F: FnMut(u32, &[u8]),
-{
+) -> usize {
     let Some(mut controller) = station_controller(wifi, ssid, password) else {
         return 0;
     };
@@ -417,10 +468,27 @@ where
             return None;
         }
         let mut fetched = 0usize;
+        let mut misses = 0usize;
         for (key, path) in tiles {
-            if let Some(body) = request_host(stack, MAP_HOST, MAP_PORT, path, max_body).await {
-                on_tile(*key, &body);
-                fetched += 1;
+            if CANCEL.load(Ordering::Relaxed) {
+                esp_println::println!("wifi: bulk download cancelled");
+                break;
+            }
+            match request_host(stack, MAP_HOST, MAP_PORT, path, max_body).await {
+                Some(body) => {
+                    misses = 0;
+                    fetched += 1;
+                    EVENTS.send(Event::Tile { key: *key, body }).await;
+                }
+                None => {
+                    misses += 1;
+                    if misses >= MAX_CONSECUTIVE_MISSES {
+                        esp_println::println!(
+                            "wifi: bulk download aborted after {misses} consecutive misses"
+                        );
+                        break;
+                    }
+                }
             }
         }
         Some(fetched)
@@ -450,7 +518,7 @@ const MAX_COVER_BYTES: usize = 512 * 1024;
 // then fetch the current now-playing json and album art, then power the radio
 // back down. doing it all in one session keeps the music page to a single wifi
 // bring-up per refresh. returns None if wifi never came up.
-pub(crate) async fn music_session(
+async fn music_session(
     wifi: esp_hal::peripherals::WIFI<'static>,
     ssid: &str,
     password: &str,
@@ -523,17 +591,6 @@ async fn request(stack: Stack<'_>, method: &str, path: &str, max_body: usize) ->
     socket.write_all(req.as_bytes()).await.ok()?;
 
     read_response(&mut socket, max_body).await
-}
-
-// one plain-http GET to `host` on port 80 using HTTP/1.0 and return the
-// response body for a 2xx status. HTTP/1.0 (rather than /1.1) so the response
-// comes back with a plain connection-close body instead of chunked
-// transfer-encoding, which this minimal read-until-close client does not
-// decode. `host` is resolved over DNS (a public weather api, unlike
-// noot-server, lives at a hostname).
-async fn request_ext(stack: Stack<'_>, host: &str, path: &str) -> Option<Vec<u8>> {
-    // a forecast response is a few kB; cap well before the heap is at risk.
-    request_host(stack, host, 80, path, 16 * 1024).await
 }
 
 // one plain-http GET to `host:port` (HTTP/1.0 so the body comes back

@@ -17,6 +17,7 @@ mod wifi;
 use alloc::{collections::BTreeSet, format, string::String, vec::Vec};
 
 use embassy_executor::Spawner;
+use embassy_time::{with_timeout, Duration, Timer};
 use embedded_graphics::{
     mono_font::{
         ascii::{FONT_6X10, FONT_9X15, FONT_9X18_BOLD},
@@ -162,15 +163,8 @@ use crate::{
         BATTERY_REFRESH_TICKS,
     },
     wifi::{
-        download_maps,
-        http_get,
-        http_get_from,
-        http_get_map,
-        music_session,
-        scan as wifi_scan,
         set_utc_time,
-        sync_time,
-        try_connect,
+        Event as WifiEvent,
         ScanEntry,
         RESYNC_INTERVAL_SECS,
         RETRY_INTERVAL_SECS,
@@ -217,8 +211,47 @@ fn refresh_statusbar_clock(display: &mut Display, clock: &mut Clock, settings: &
     now.map_or(60, |(_, m)| m)
 }
 
+// a wifi-task request running under the saved network credentials.
+fn saved_request(settings: &Settings, op: wifi::Op) -> wifi::Request {
+    wifi::Request {
+        ssid: String::from(settings.wifi_ssid()),
+        password: String::from(settings.wifi_password()),
+        op,
+    }
+}
+
+// the wifi-task operation the ui is waiting on, so its completion event can be
+// routed back to the right page state. also the send gate: while this is Some,
+// no new operation is queued (the task runs one at a time).
+#[derive(Clone, Copy)]
+enum Pending {
+    Resync,
+    Scan,
+    Join {
+        reconnect: bool,
+    },
+    Music {
+        inline: bool,
+        command: Option<music::Button>,
+    },
+    Environment,
+    Weather,
+    #[cfg(feature = "gps")]
+    MapTile {
+        key: u32,
+        dx: i32,
+        dy: i32,
+    },
+    #[cfg(feature = "gps")]
+    MapArea {
+        total: usize,
+        done: usize,
+        km2: f32,
+    },
+}
+
 #[esp_rtos::main]
-async fn main(_spawner: Spawner) -> ! {
+async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::_240MHz);
@@ -241,6 +274,14 @@ async fn main(_spawner: Spawner) -> ! {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+
+    // all wifi work runs on a dedicated task that owns the radio; the ui talks
+    // to it over the request/event channels and stays responsive while
+    // sessions run.
+    match wifi::run() {
+        Ok(token) => spawner.spawn(token),
+        Err(e) => esp_println::println!("wifi: task spawn failed: {e:?}"),
+    }
 
     // a cold boot needs a fresh time sync; a wake from deep sleep keeps the RTC.
     let woke = t5s3_epaper_core::power::wake_status().woke_from_deep_sleep();
@@ -333,18 +374,16 @@ async fn main(_spawner: Spawner) -> ! {
         .ok();
         display.flush(DrawMode::BlackOnWhite).expect("to flush");
 
-        match sync_time(
-            peripherals.WIFI,
-            settings.wifi_ssid(),
-            settings.wifi_password(),
-        )
-        .await
-        {
-            Some(unix) => {
+        // the boot-time sync deliberately blocks until the session finishes
+        // (the ui hasn't started yet); everything after boot goes through the
+        // event router in the main loop instead.
+        wifi::send(saved_request(&settings, wifi::Op::SyncTime));
+        match wifi::next_event().await {
+            WifiEvent::TimeSynced(Some(unix)) => {
                 set_utc_time(&mut clock, unix);
                 clock_synced = true;
             }
-            None => esp_println::println!("clock: wifi/ntp sync failed, time unavailable"),
+            _ => esp_println::println!("clock: wifi/ntp sync failed, time unavailable"),
         }
     }
 
@@ -480,6 +519,9 @@ async fn main(_spawner: Spawner) -> ! {
     // its stored password: on failure we fall back to the password keyboard so
     // stale credentials can be re-entered, rather than reporting a plain error.
     let mut wifi_reconnect = false;
+    // the operation the wifi task is currently running for the ui, or None when
+    // it is idle. gates sends (one operation at a time) and routes results.
+    let mut wifi_pending: Option<Pending> = None;
 
     // the screen the reader returns to on Back: the file browser or the library,
     // depending on where the book was opened from.
@@ -516,6 +558,238 @@ async fn main(_spawner: Spawner) -> ! {
     let mut full_zoom: i32 = 0;
 
     loop {
+        // route completed wifi-task work back into page state before drawing.
+        // drained every pass; the task runs at most one operation at a time, so
+        // `wifi_pending` says which page a result belongs to. partial repaints
+        // only happen when the user is still on the page the result is for.
+        while let Some(event) = wifi::poll_event() {
+            let pending = wifi_pending.take();
+            match event {
+                WifiEvent::TimeSynced(result) => {
+                    match result {
+                        Some(unix) => {
+                            set_utc_time(&mut clock, unix);
+                            clock_synced = true;
+                            needs_redraw = true;
+                            resync_retry_secs = RETRY_INTERVAL_SECS;
+                        }
+                        None => {
+                            resync_retry_secs = (resync_retry_secs * 2).min(RESYNC_INTERVAL_SECS);
+                        }
+                    }
+                    last_resync_secs = clock.now_us() / 1_000_000;
+                }
+                WifiEvent::ScanDone(result) => {
+                    match result {
+                        Some(nets) => {
+                            wifi_status = if nets.is_empty() {
+                                String::from("no networks found")
+                            } else {
+                                format!("{} networks - tap one to join", nets.len())
+                            };
+                            wifi_networks = nets;
+                        }
+                        None => wifi_status = String::from("scan failed"),
+                    }
+                    if current_screen == Screen::SettingsWifi {
+                        needs_redraw = true;
+                    }
+                }
+                WifiEvent::JoinDone(ok) => {
+                    let reconnect = matches!(pending, Some(Pending::Join { reconnect: true }));
+                    if ok {
+                        settings.set_wifi(&wifi_pw_ssid, &wifi_pw_buf);
+                        settings_dirty = true;
+                        // a working network was just proven, so retry the clock
+                        // sync on the normal cadence again.
+                        resync_retry_secs = RETRY_INTERVAL_SECS;
+                        wifi_status = format!("connected: {wifi_pw_ssid}");
+                    } else if reconnect {
+                        // the saved password no longer works: drop into the
+                        // keyboard (pre-filled with it) so the user can correct
+                        // it.
+                        kb_symbols = false;
+                        kb_shift = false;
+                        wifi_pw_mode = true;
+                        wifi_status = String::from("reconnect failed - re-enter password");
+                    } else {
+                        wifi_status = String::from("join failed - check password");
+                    }
+                    if current_screen == Screen::SettingsWifi {
+                        needs_redraw = true;
+                    }
+                }
+                WifiEvent::MusicDone(snapshot) => {
+                    let (inline, command) = match pending {
+                        Some(Pending::Music { inline, command }) => (inline, command),
+                        _ => (false, None),
+                    };
+                    let on_music = current_screen == Screen::Music;
+                    match snapshot {
+                        Some(snap) => {
+                            music_view = music::build_view(&snap.json, snap.cover.as_deref());
+                            // anchor the local position tick to this fetch.
+                            music_anchor = music::playback(&music_view)
+                                .map(|p| (p.base_secs, p.duration_secs, clock.now_us()));
+                            music_refresh = 0;
+                            music_status_ticks = 0;
+                            if !inline || command.is_some_and(music::Button::changes_art) {
+                                // a (re)load, or a track change (next/previous),
+                                // redraws fully so the album art re-renders.
+                                // draw_screen shows the "ok" status on the
+                                // repainted page when inline.
+                                music_status = if inline { Some("ok") } else { None };
+                                if on_music {
+                                    needs_redraw = true;
+                                }
+                            } else if command.is_some_and(music::Button::changes_display) {
+                                // play/pause: repaint just the band below the art.
+                                music_status = Some("ok");
+                                if on_music {
+                                    music::redraw_body(&mut display, &music_view, Some("ok"));
+                                    display.flush_partial_fast(music::below_art_rect()).ok();
+                                }
+                            } else {
+                                // volume: only the status line needs updating.
+                                music_status = Some("ok");
+                                if on_music {
+                                    music::draw_status(&mut display, "ok");
+                                    display.flush_partial_fast(music::status_rect()).ok();
+                                }
+                            }
+                        }
+                        None if inline => {
+                            // leave the page as-is; just report the failure.
+                            music_status = Some("error");
+                            music_status_ticks = 0;
+                            if on_music {
+                                music::draw_status(&mut display, "error");
+                                display.flush_partial_fast(music::status_rect()).ok();
+                            }
+                        }
+                        None => {
+                            music_status = None;
+                            music_view = music::View::Error;
+                            if on_music {
+                                needs_redraw = true;
+                            }
+                        }
+                    }
+                }
+                WifiEvent::GotBody(body) => match pending {
+                    Some(Pending::Environment) => {
+                        env_view = match body {
+                            Some(body) => environment::parse(&body),
+                            None => environment::View::Error,
+                        };
+                        if current_screen == Screen::Environment {
+                            needs_redraw = true;
+                        }
+                    }
+                    Some(Pending::Weather) => {
+                        weather_view = match body {
+                            Some(body) => weather::parse(&body),
+                            None => weather::View::Error,
+                        };
+                        if current_screen == Screen::Weather {
+                            needs_redraw = true;
+                        }
+                    }
+                    #[cfg(feature = "gps")]
+                    Some(Pending::MapTile { key, dx, dy }) => {
+                        gps_map = match body {
+                            Some(body) => {
+                                let view = parse_map(&body, dx, dy);
+                                // only cache a body that decoded, so a bad
+                                // download can never poison the cache.
+                                if matches!(view, MapView::Ready { .. }) {
+                                    let _lora_cs = lora_cs_high();
+                                    match SdCard::new(
+                                        unsafe { esp_hal::peripherals::GPIO12::steal() },
+                                        &bus,
+                                    ) {
+                                        Ok(c) => {
+                                            c.create_dir_all(MAP_CACHE_DIR).ok();
+                                            if let Err(e) =
+                                                c.write_file(map_cache_path(key).as_str(), &body)
+                                            {
+                                                esp_println::println!(
+                                                    "gps: cache map failed: {e:?}"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => esp_println::println!(
+                                            "gps: cache sd init failed: {e:?}"
+                                        ),
+                                    }
+                                }
+                                view
+                            }
+                            None => MapView::Error,
+                        };
+                        // record what the panel now shows so the follow logic
+                        // nudges the marker / reloads on tile crossings.
+                        gps_marker_ticks = 0;
+                        gps_shown_cell = Some(key);
+                        gps_shown_offset = (dx, dy);
+                        if current_screen == Screen::Gps {
+                            refresh_map_panel(&mut display, &gps_map);
+                        }
+                    }
+                    _ => {}
+                },
+                #[cfg(feature = "gps")]
+                WifiEvent::Tile { key, body } => {
+                    // one tile of an in-flight bulk download: cache it and
+                    // advance the progress line. non-terminal, so the pending
+                    // op is put back with its count advanced.
+                    if let Some(Pending::MapArea { total, done, km2 }) = pending {
+                        let _lora_cs = lora_cs_high();
+                        match SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus) {
+                            Ok(c) => {
+                                if let Err(e) = c.write_file(map_cache_path(key).as_str(), &body) {
+                                    esp_println::println!(
+                                        "gps: cache tile {key:08X} failed: {e:?}"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                esp_println::println!("gps: save-area sd init failed: {e:?}")
+                            }
+                        }
+                        let done = done + 1;
+                        // refresh the progress line ~20 times over the download.
+                        let step = (total / 20).max(1);
+                        if (done.is_multiple_of(step) || done == total)
+                            && current_screen == Screen::Gps
+                        {
+                            show_download_progress(&mut display, done, total);
+                        }
+                        wifi_pending = Some(Pending::MapArea { total, done, km2 });
+                    }
+                }
+                #[cfg(feature = "gps")]
+                WifiEvent::DownloadDone { fetched } => {
+                    if let Some(Pending::MapArea { total, km2, .. }) = pending {
+                        esp_println::println!("gps: area download saved {fetched}/{total} tiles");
+                        // report the area now cached around the fix, then reload
+                        // the current cell (now cached) on the next pass.
+                        gps_map = MapView::Saved {
+                            km2,
+                            new_tiles: fetched,
+                        };
+                        if current_screen == Screen::Gps {
+                            refresh_map_panel(&mut display, &gps_map);
+                            Timer::after_millis(1500).await;
+                        }
+                        gps_map_dirty = true;
+                    }
+                }
+                #[cfg(not(feature = "gps"))]
+                WifiEvent::Tile { .. } | WifiEvent::DownloadDone { .. } => {}
+            }
+        }
+
         if needs_redraw {
             let pct = display.battery_percentage().unwrap_or(0);
             let now = status_time(&mut clock, settings.tz_offset_hours);
@@ -795,21 +1069,17 @@ async fn main(_spawner: Spawner) -> ! {
         } else {
             resync_retry_secs
         };
-        if !settings.wifi_ssid().is_empty()
+        if wifi_pending.is_none()
+            && !settings.wifi_ssid().is_empty()
             && clock.now_us() / 1_000_000 >= last_resync_secs + resync_interval
         {
             esp_println::println!("clock: periodic re-sync");
-            let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-            match sync_time(wifi, settings.wifi_ssid(), settings.wifi_password()).await {
-                Some(unix) => {
-                    set_utc_time(&mut clock, unix);
-                    clock_synced = true;
-                    needs_redraw = true;
-                    resync_retry_secs = RETRY_INTERVAL_SECS;
-                }
-                None => resync_retry_secs = (resync_retry_secs * 2).min(RESYNC_INTERVAL_SECS),
+            if wifi::send(saved_request(&settings, wifi::Op::SyncTime)) {
+                wifi_pending = Some(Pending::Resync);
+                // pushed forward again when the sync completes; this stamp just
+                // keeps the send from repeating while the session runs.
+                last_resync_secs = clock.now_us() / 1_000_000;
             }
-            last_resync_secs = clock.now_us() / 1_000_000;
         }
 
         // poll touch/buttons every pass so input stays responsive. the GPS
@@ -1649,169 +1919,129 @@ async fn main(_spawner: Spawner) -> ! {
             needs_redraw = true;
         }
 
-        // fetch the now-playing data from noot-server when the music page is
-        // opened or refreshed. the `!needs_redraw` guard lets the "loading" view
-        // paint first, since the wifi bring-up below blocks the loop for several
-        // seconds. (steal WIFI: the previous controller was dropped, so the
-        // peripheral is free to re-init; the radio powers down when http_get
-        // returns.)
-        if current_screen == Screen::Music && music_dirty && !needs_redraw {
-            music_dirty = false;
+        // queue the now-playing fetch to the wifi task when the music page is
+        // opened or refreshed; the result comes back through the event router
+        // above while the ui keeps running. the `!needs_redraw` guard lets the
+        // "loading" view paint first.
+        if current_screen == Screen::Music && music_dirty && !needs_redraw && wifi_pending.is_none()
+        {
             let command = music_command.take();
             let inline = music_inline;
             music_inline = false;
-            let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-            let snapshot = music_session(
-                wifi,
-                settings.wifi_ssid(),
-                settings.wifi_password(),
-                command.map(music::Button::command),
-            )
-            .await;
-            match snapshot {
-                Some(snap) => {
-                    music_view = music::build_view(&snap.json, snap.cover.as_deref());
-                    // anchor the local position tick to this fetch.
-                    music_anchor = music::playback(&music_view)
-                        .map(|p| (p.base_secs, p.duration_secs, clock.now_us()));
-                    music_refresh = 0;
-                    music_status_ticks = 0;
-                    if !inline || command.is_some_and(music::Button::changes_art) {
-                        // a (re)load, or a track change (next/previous), redraws
-                        // fully so the album art re-renders. draw_screen shows the
-                        // "ok" status on the repainted page when inline.
-                        music_status = if inline { Some("ok") } else { None };
-                        needs_redraw = true;
-                    } else if command.is_some_and(music::Button::changes_display) {
-                        // play/pause: repaint just the band below the art.
-                        music_status = Some("ok");
-                        music::redraw_body(&mut display, &music_view, Some("ok"));
-                        display.flush_partial_fast(music::below_art_rect()).ok();
-                    } else {
-                        // volume: only the status line needs updating.
-                        music_status = Some("ok");
-                        music::draw_status(&mut display, "ok");
-                        display.flush_partial_fast(music::status_rect()).ok();
-                    }
-                }
-                None if inline => {
-                    // leave the page as-is; just report the failure.
-                    music_status = Some("error");
-                    music_status_ticks = 0;
-                    music::draw_status(&mut display, "error");
-                    display.flush_partial_fast(music::status_rect()).ok();
-                }
-                None => {
-                    music_status = None;
-                    music_view = music::View::Error;
-                    needs_redraw = true;
-                }
+            if wifi::send(saved_request(
+                &settings,
+                wifi::Op::Music {
+                    command: command.map(music::Button::command),
+                },
+            )) {
+                music_dirty = false;
+                wifi_pending = Some(Pending::Music { inline, command });
             }
         }
 
-        if current_screen == Screen::Environment && env_dirty && !needs_redraw {
-            env_dirty = false;
+        if current_screen == Screen::Environment
+            && env_dirty
+            && !needs_redraw
+            && wifi_pending.is_none()
+        {
             let path = environment::path();
-            let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-            env_view = match http_get(
-                wifi,
-                settings.wifi_ssid(),
-                settings.wifi_password(),
-                path.as_str(),
-                8192,
-            )
-            .await
-            {
-                Some(body) => environment::parse(&body),
-                None => environment::View::Error,
-            };
-            needs_redraw = true;
+            if wifi::send(saved_request(
+                &settings,
+                wifi::Op::Get {
+                    host: wifi::Host::Server,
+                    path: String::from(path.as_str()),
+                    max_body: 8192,
+                },
+            )) {
+                env_dirty = false;
+                wifi_pending = Some(Pending::Environment);
+            }
         }
 
         // load the map for the gps page's current fix. cache-first: the cell the
         // fix falls in is read straight off the sd card (no wifi) when present,
-        // and only fetched over wifi + cached on a miss. without a fix there is
-        // no center to request a map for.
+        // and only fetched (via the wifi task) + cached on a miss. without a fix
+        // there is no center to request a map for.
         #[cfg(feature = "gps")]
         if current_screen == Screen::Gps && gps_map_dirty && !needs_redraw {
-            gps_map_dirty = false;
-            gps_map = match last_fix {
-                Some(fix) => {
-                    let cell = map_cell(fix.lat(), fix.lon());
-                    let cache_path = map_cache_path(cell.key());
-                    let _lora_cs = lora_cs_high();
-                    let card =
-                        SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus).ok();
-                    let cached = card
-                        .as_ref()
-                        .and_then(|c| c.read_file(cache_path.as_str()).ok())
-                        .map(|body| parse_map(&body, cell.dx(), cell.dy()));
-                    match cached {
-                        // parse_map only returns Ready or Error.
-                        Some(view @ MapView::Ready { .. }) => view,
-                        cached => {
-                            // a cached tile that no longer decodes is corrupt
-                            // (e.g. a truncated download from an older build):
-                            // delete it so the fetch below can replace it.
-                            if cached.is_some() {
-                                if let Some(c) = &card {
-                                    c.delete_file(cache_path.as_str()).ok();
-                                }
-                            }
-                            let path = map_request_path(cell.key());
-                            let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-                            match http_get_map(
-                                wifi,
-                                settings.wifi_ssid(),
-                                settings.wifi_password(),
-                                path.as_str(),
-                                MAP_MAX_BYTES,
-                            )
-                            .await
-                            {
-                                Some(body) => {
-                                    let view = parse_map(&body, cell.dx(), cell.dy());
-                                    // only cache a body that decoded, so a bad
-                                    // download can never poison the cache.
-                                    if let Some(c) = &card {
-                                        if matches!(view, MapView::Ready { .. }) {
-                                            c.create_dir_all(MAP_CACHE_DIR).ok();
-                                            if let Err(e) = c.write_file(cache_path.as_str(), &body)
-                                            {
-                                                esp_println::println!(
-                                                    "gps: cache map failed: {e:?}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    view
-                                }
-                                None => MapView::Error,
-                            }
-                        }
-                    }
-                }
-                None => MapView::NoFix,
-            };
-            // refresh just the map panel (grayscale, panel-only) rather than a
-            // full page redraw, so following the fix flashes only the panel.
-            refresh_map_panel(&mut display, &gps_map);
-            gps_marker_ticks = 0;
             match last_fix {
                 Some(fix) => {
                     let cell = map_cell(fix.lat(), fix.lon());
-                    gps_shown_cell = Some(cell.key());
-                    gps_shown_offset = (cell.dx(), cell.dy());
+                    let cache_path = map_cache_path(cell.key());
+                    let cached = {
+                        let _lora_cs = lora_cs_high();
+                        let card =
+                            SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus)
+                                .ok();
+                        card.as_ref()
+                            .and_then(|c| c.read_file(cache_path.as_str()).ok())
+                            .map(|body| parse_map(&body, cell.dx(), cell.dy()))
+                            .and_then(|view| match view {
+                                // parse_map only returns Ready or Error. a cached
+                                // tile that no longer decodes is corrupt (e.g. a
+                                // truncated download from an older build): delete
+                                // it so the fetch below can replace it.
+                                MapView::Error => {
+                                    if let Some(c) = &card {
+                                        c.delete_file(cache_path.as_str()).ok();
+                                    }
+                                    None
+                                }
+                                view => Some(view),
+                            })
+                    };
+                    match cached {
+                        Some(view) => {
+                            gps_map_dirty = false;
+                            gps_map = view;
+                            // refresh just the map panel (grayscale, panel-only)
+                            // rather than a full page redraw, so following the
+                            // fix flashes only the panel.
+                            refresh_map_panel(&mut display, &gps_map);
+                            gps_marker_ticks = 0;
+                            gps_shown_cell = Some(cell.key());
+                            gps_shown_offset = (cell.dx(), cell.dy());
+                        }
+                        None if wifi_pending.is_none() => {
+                            let path = map_request_path(cell.key());
+                            if wifi::send(saved_request(
+                                &settings,
+                                wifi::Op::Get {
+                                    host: wifi::Host::Map,
+                                    path: String::from(path.as_str()),
+                                    max_body: MAP_MAX_BYTES,
+                                },
+                            )) {
+                                gps_map_dirty = false;
+                                wifi_pending = Some(Pending::MapTile {
+                                    key: cell.key(),
+                                    dx: cell.dx(),
+                                    dy: cell.dy(),
+                                });
+                                gps_map = MapView::Loading;
+                                refresh_map_panel(&mut display, &gps_map);
+                            }
+                        }
+                        // wifi task busy: keep the dirty flag and retry on a
+                        // later pass.
+                        None => {}
+                    }
                 }
-                None => gps_shown_cell = None,
+                None => {
+                    gps_map_dirty = false;
+                    gps_map = MapView::NoFix;
+                    refresh_map_panel(&mut display, &gps_map);
+                    gps_shown_cell = None;
+                }
             }
         }
 
         // pre-download the cells around the current fix into the sd cache so the
-        // map keeps working offline while moving. the whole block is fetched in a
-        // single wifi session rather than one bring-up per tile.
+        // map keeps working offline while moving. the whole area is fetched by
+        // the wifi task in a single session (one radio bring-up), streaming each
+        // tile back to be cached as it arrives, so the ui stays responsive.
         #[cfg(feature = "gps")]
-        if current_screen == Screen::Gps && gps_download {
+        if current_screen == Screen::Gps && gps_download && wifi_pending.is_none() {
             gps_download = false;
             if let Some(fix) = last_fix {
                 let _lora_cs = lora_cs_high();
@@ -1848,139 +2078,114 @@ async fn main(_spawner: Spawner) -> ! {
                     None => Vec::new(),
                 };
 
-                if let Some(c) = &card {
+                if card.is_some() {
                     // download only the not-yet-cached cells; skip the wifi
                     // session entirely when the whole area is already saved.
-                    let new_tiles = if missing.is_empty() {
+                    if missing.is_empty() {
                         esp_println::println!("gps: area already cached, nothing to download");
-                        0
+                        let km2 = area_km2(fix.lat(), DOWNLOAD_RADIUS);
+                        gps_map = MapView::Saved { km2, new_tiles: 0 };
+                        refresh_map_panel(&mut display, &gps_map);
+                        Timer::after_millis(1500).await;
+                        // reload the current cell on the next pass.
+                        gps_map_dirty = true;
                     } else {
                         let total = missing.len();
-                        // show progress before the (blocking) download.
                         gps_map = MapView::Downloading(total);
                         refresh_map_panel(&mut display, &gps_map);
-
-                        let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-                        // refresh the progress line ~20 times over the download.
-                        let step = (total / 20).max(1);
-                        let mut done = 0usize;
-                        let saved = download_maps(
-                            wifi,
-                            settings.wifi_ssid(),
-                            settings.wifi_password(),
-                            &missing,
-                            MAP_MAX_BYTES,
-                            |key, body| {
-                                if let Err(e) = c.write_file(map_cache_path(key).as_str(), body) {
-                                    esp_println::println!(
-                                        "gps: cache tile {key:08X} failed: {e:?}"
-                                    );
-                                }
-                                done += 1;
-                                if done.is_multiple_of(step) || done == total {
-                                    show_download_progress(&mut display, done, total);
-                                }
+                        if wifi::send(saved_request(
+                            &settings,
+                            wifi::Op::DownloadMaps {
+                                tiles: missing,
+                                max_body: MAP_MAX_BYTES,
                             },
-                        )
-                        .await;
-                        esp_println::println!("gps: area download saved {saved}/{total} tiles");
-                        saved
-                    };
-
-                    // report the area now cached around the fix, then reload the map.
-                    let km2 = area_km2(fix.lat(), DOWNLOAD_RADIUS);
-                    gps_map = MapView::Saved { km2, new_tiles };
-                    refresh_map_panel(&mut display, &gps_map);
-                    delay.delay_millis(1500);
+                        )) {
+                            wifi_pending = Some(Pending::MapArea {
+                                total,
+                                done: 0,
+                                km2: area_km2(fix.lat(), DOWNLOAD_RADIUS),
+                            });
+                        }
+                    }
+                } else {
+                    // no card to cache onto; just reload the panel.
+                    gps_map_dirty = true;
                 }
-
-                // reload the current cell (now cached) on the next pass.
-                gps_map_dirty = true;
             }
         }
 
+        // the weather page fetches a public forecast for the device's current
+        // GPS position; without a fix there are no coordinates to query for.
         if current_screen == Screen::Weather && weather_dirty && !needs_redraw {
-            weather_dirty = false;
-            // the weather page fetches a public forecast for the device's current
-            // GPS position; without a fix there are no coordinates to query for.
             #[cfg(feature = "gps")]
-            {
-                weather_view = match last_fix {
-                    Some(fix) => {
+            match last_fix {
+                Some(fix) => {
+                    if wifi_pending.is_none() {
                         let path = weather::path(fix.lat(), fix.lon());
-                        let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-                        match http_get_from(
-                            wifi,
-                            settings.wifi_ssid(),
-                            settings.wifi_password(),
-                            weather::HOST,
-                            path.as_str(),
-                        )
-                        .await
-                        {
-                            Some(body) => weather::parse(&body),
-                            None => weather::View::Error,
+                        if wifi::send(saved_request(
+                            &settings,
+                            wifi::Op::Get {
+                                host: wifi::Host::External(weather::HOST),
+                                path: String::from(path.as_str()),
+                                // a forecast response is a few kB; cap well
+                                // before the heap is at risk.
+                                max_body: 16 * 1024,
+                            },
+                        )) {
+                            weather_dirty = false;
+                            wifi_pending = Some(Pending::Weather);
                         }
                     }
-                    None => weather::View::NoFix,
-                };
+                }
+                None => {
+                    weather_dirty = false;
+                    weather_view = weather::View::NoFix;
+                    needs_redraw = true;
+                }
             }
             #[cfg(not(feature = "gps"))]
             {
+                weather_dirty = false;
                 weather_view = weather::View::NoFix;
+                needs_redraw = true;
             }
-            needs_redraw = true;
         }
 
-        // scan for nearby access points when Scan is tapped on the wifi settings
-        // page. the `!needs_redraw` guard lets the "scanning..." view paint first,
-        // since the scan brings wifi up and blocks the loop for a few seconds.
-        // (steal WIFI: any previous controller was dropped, so the peripheral is
-        // free; the radio powers down when `wifi_scan` returns.)
-        if current_screen == Screen::SettingsWifi && wifi_scan_dirty && !needs_redraw {
+        // queue a scan for nearby access points when Scan is tapped on the wifi
+        // settings page; the "scanning..." status stays up until the ScanDone
+        // event lands.
+        if current_screen == Screen::SettingsWifi
+            && wifi_scan_dirty
+            && !needs_redraw
+            && wifi_pending.is_none()
+            && wifi::send(wifi::Request {
+                ssid: String::new(),
+                password: String::new(),
+                op: wifi::Op::Scan,
+            })
+        {
             wifi_scan_dirty = false;
-            let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-            match wifi_scan(wifi).await {
-                Some(nets) => {
-                    wifi_status = if nets.is_empty() {
-                        String::from("no networks found")
-                    } else {
-                        format!("{} networks - tap one to join", nets.len())
-                    };
-                    wifi_networks = nets;
-                }
-                None => wifi_status = String::from("scan failed"),
-            }
-            needs_redraw = true;
+            wifi_pending = Some(Pending::Scan);
         }
 
-        // attempt to join the selected network with the entered credentials, then
-        // power the radio down. only persists the credentials on a successful
-        // connect so a wrong passphrase is never saved. same `!needs_redraw`
-        // guard so the "connecting..." view paints before the blocking join.
-        if current_screen == Screen::SettingsWifi && wifi_join_dirty && !needs_redraw {
-            wifi_join_dirty = false;
+        // queue a join of the selected network with the entered credentials.
+        // the credentials are only persisted on a successful connect (see the
+        // JoinDone event) so a wrong passphrase is never saved.
+        if current_screen == Screen::SettingsWifi
+            && wifi_join_dirty
+            && !needs_redraw
+            && wifi_pending.is_none()
+        {
             let reconnect = wifi_reconnect;
             wifi_reconnect = false;
-            let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-            if try_connect(wifi, &wifi_pw_ssid, &wifi_pw_buf).await {
-                settings.set_wifi(&wifi_pw_ssid, &wifi_pw_buf);
-                settings_dirty = true;
-                // a working network was just proven, so retry the clock sync
-                // on the normal cadence again.
-                resync_retry_secs = RETRY_INTERVAL_SECS;
-                wifi_status = format!("connected: {wifi_pw_ssid}");
-            } else if reconnect {
-                // the saved password no longer works: drop into the keyboard
-                // (pre-filled with it) so the user can correct it.
-                kb_symbols = false;
-                kb_shift = false;
-                wifi_pw_mode = true;
-                wifi_status = String::from("reconnect failed - re-enter password");
-            } else {
-                wifi_status = String::from("join failed - check password");
+            if wifi::send(wifi::Request {
+                ssid: wifi_pw_ssid.clone(),
+                password: wifi_pw_buf.clone(),
+                op: wifi::Op::Join,
+            }) {
+                wifi_join_dirty = false;
+                wifi_pending = Some(Pending::Join { reconnect });
             }
-            needs_redraw = true;
         }
 
         // scan the SD card for the book shelf when the library is opened (or
@@ -2095,7 +2300,19 @@ async fn main(_spawner: Spawner) -> ! {
             }
         }
 
-        delay.delay_millis(50);
+        // yield to the executor (instead of a busy-wait) so the wifi task can
+        // run while the ui idles; also lets the cpu rest between passes.
+        Timer::after_millis(50).await;
+    }
+
+    // let an in-flight wifi session finish before tearing down, so deep sleep
+    // never races an active radio. a bulk download is cancelled (it stops after
+    // the current tile); remaining events are drained and dropped.
+    if wifi_pending.is_some() {
+        wifi::cancel();
+        while let Ok(WifiEvent::Tile { .. }) =
+            with_timeout(Duration::from_secs(30), wifi::next_event()).await
+        {}
     }
 
     // sleep was requested from the Sleep screen. turn the front light off,

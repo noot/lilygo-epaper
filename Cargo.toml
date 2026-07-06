@@ -29,6 +29,7 @@ esp-rtos = { version = "0.3.0", features = ["esp32s3", "esp-radio", "embassy", "
 embassy-executor = "0.10.0"
 embassy-net = { version = "0.9", features = ["dhcpv4", "medium-ethernet", "udp", "dns"] }
 embassy-time = "0.5"
+embassy-sync = "0.8"
 embassy-futures = "0.1"
 static_cell = "2.1"
 
