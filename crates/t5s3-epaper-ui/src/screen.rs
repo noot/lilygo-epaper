@@ -18,6 +18,8 @@ pub(crate) enum Screen {
     SettingsReader,
     SettingsWifi,
     MapFull,
+    Notes,
+    NoteEdit,
 }
 
 impl Screen {
@@ -43,6 +45,10 @@ impl Screen {
             // fullscreen map is a transient view of the gps page; it is not
             // restored on wake (from_index maps it back to Home).
             Screen::MapFull => 17,
+            Screen::Notes => 18,
+            // the editor's buffer is RAM-only (it is saved to the card before
+            // sleeping), so waking from it lands on the notes list instead.
+            Screen::NoteEdit => 19,
         }
     }
 
@@ -64,6 +70,7 @@ impl Screen {
             14 => Screen::SettingsSystem,
             15 => Screen::SettingsReader,
             16 => Screen::SettingsWifi,
+            18 | 19 => Screen::Notes,
             _ => Screen::Home,
         }
     }

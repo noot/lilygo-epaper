@@ -55,7 +55,7 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 - [x] pull now playing from music server (see waveshare-epaper repo)
 - [x] pull weather data and display on ui page
 - [x] pull home environment data (temp, humidity, co2)
-- [ ] notes app - stores notes on sd card
+- [x] notes app - stores notes on sd card
 
 # bug fixes
 

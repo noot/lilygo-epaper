@@ -34,7 +34,7 @@ pub(crate) struct Icon {
     pub(crate) screen: Screen,
 }
 
-pub(crate) const ICONS: [Icon; 11] = [
+pub(crate) const ICONS: [Icon; 12] = [
     Icon {
         label: "GPS",
         screen: Screen::Gps,
@@ -70,6 +70,10 @@ pub(crate) const ICONS: [Icon; 11] = [
     Icon {
         label: "Files",
         screen: Screen::Files,
+    },
+    Icon {
+        label: "Notes",
+        screen: Screen::Notes,
     },
     Icon {
         label: "Settings",
@@ -126,9 +130,11 @@ macro_rules! icon_set {
                 include_bytes!(concat!("../../assets/icons/", $dir, "/weather.bmp"))
             }
             Screen::Library => include_bytes!(concat!("../../assets/icons/", $dir, "/reader.bmp")),
+            Screen::Notes => include_bytes!(concat!("../../assets/icons/", $dir, "/notes.bmp")),
             Screen::Home
             | Screen::Image
             | Screen::MapFull
+            | Screen::NoteEdit
             | Screen::Reader
             | Screen::SettingsSystem
             | Screen::SettingsReader

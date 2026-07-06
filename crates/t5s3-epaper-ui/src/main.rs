@@ -135,6 +135,7 @@ use crate::{
             SENT_Y,
         },
         music,
+        notes,
         reader::{draw as draw_reader, is_reader, load_document, tap_zone, ReaderDoc, Tap},
         settings::{self as settings_page, MenuHit},
         sleep::{
@@ -396,6 +397,20 @@ async fn main(_spawner: Spawner) -> ! {
     // path of the .bmp currently shown full-screen by the image viewer.
     let mut image_path = String::new();
 
+    // notes state: the /NOTES listing, a scroll offset into it, a footer status
+    // line, and a flag that the listing needs (re)loading from the card on the
+    // next pass (mirrors `files_dirty`; set at declaration so a wake that
+    // restores the notes screen loads it). the editor holds the open note's
+    // filename, its text, and a flag that the text needs reading from the card
+    // on the next pass (mirrors `reader_dirty`).
+    let mut notes_entries: Vec<notes::Entry> = Vec::new();
+    let mut notes_scroll: usize = 0;
+    let mut notes_status = String::new();
+    let mut notes_dirty = current_screen == Screen::Notes;
+    let mut note_name = String::new();
+    let mut note_text = String::new();
+    let mut note_dirty = false;
+
     // reader state: the open text file, its paginated document (None if the
     // load failed), the current page, and a flag that the document needs
     // (re)loading from the card on the next pass (mirrors `files_dirty`).
@@ -635,6 +650,19 @@ async fn main(_spawner: Spawner) -> ! {
                     }
                 }
                 Screen::Music => music::draw_screen(&mut display, &music_view, music_status),
+                Screen::Notes => notes::draw_list_screen(
+                    &mut display,
+                    &notes_entries,
+                    notes_scroll,
+                    &notes_status,
+                ),
+                Screen::NoteEdit => notes::draw_edit_screen(
+                    &mut display,
+                    &note_name,
+                    &note_text,
+                    kb_symbols,
+                    kb_shift,
+                ),
                 Screen::Environment => environment::draw_screen(&mut display, &env_view),
                 Screen::Weather => weather::draw_screen(&mut display, &weather_view),
                 Screen::Library => {
@@ -788,6 +816,9 @@ async fn main(_spawner: Spawner) -> ! {
                     doc.save(&bus);
                 }
             }
+            if current_screen == Screen::NoteEdit {
+                notes::save(&bus, &note_name, &note_text);
+            }
             current_screen = Screen::Home;
             needs_redraw = true;
         }
@@ -831,6 +862,11 @@ async fn main(_spawner: Spawner) -> ! {
                                 Screen::Files => {
                                     files_path = String::from("/");
                                     files_dirty = true;
+                                }
+                                // the notes list draws only after its listing is
+                                // loaded too.
+                                Screen::Notes => {
+                                    notes_dirty = true;
                                 }
                                 // the server pages paint a "loading" view now,
                                 // then fetch over wifi on the next pass.
@@ -1039,6 +1075,95 @@ async fn main(_spawner: Spawner) -> ! {
                         // any tap dismisses the image and returns to the listing.
                         current_screen = Screen::Files;
                         needs_redraw = true;
+                    }
+                    Screen::Notes => {
+                        if back_button_hit(sx, sy) {
+                            current_screen = Screen::Home;
+                            needs_redraw = true;
+                        } else if notes::scroll_up_hit(sx, sy) {
+                            if notes_scroll > 0 {
+                                notes_scroll = notes_scroll.saturating_sub(notes::VISIBLE);
+                                notes::draw_note_list(&mut display, &notes_entries, notes_scroll);
+                                display.flush_partial_fast(notes::list_native_rect()).ok();
+                            }
+                        } else if notes::scroll_down_hit(sx, sy) {
+                            if notes_scroll + notes::VISIBLE < notes_entries.len() {
+                                notes_scroll += notes::VISIBLE;
+                                notes::draw_note_list(&mut display, &notes_entries, notes_scroll);
+                                display.flush_partial_fast(notes::list_native_rect()).ok();
+                            }
+                        } else if notes::new_hit(sx, sy) {
+                            match notes::next_name(&notes_entries) {
+                                Some(name) => {
+                                    note_name = name;
+                                    note_text.clear();
+                                    kb_symbols = false;
+                                    kb_shift = false;
+                                    current_screen = Screen::NoteEdit;
+                                    needs_redraw = true;
+                                }
+                                None => {
+                                    notes_status = String::from("notes full");
+                                    notes::draw_notes_footer(&mut display, &notes_status);
+                                    display.flush_partial_fast(notes::footer_native_rect()).ok();
+                                }
+                            }
+                        } else if let Some(i) =
+                            notes::list_hit(sx, sy, notes_entries.len(), notes_scroll)
+                        {
+                            if let Some(entry) = notes_entries.get(i) {
+                                note_name = entry.name.clone();
+                                kb_symbols = false;
+                                kb_shift = false;
+                                // the editor draws only after the note's text is
+                                // read (below), mirroring the reader.
+                                note_dirty = true;
+                                current_screen = Screen::NoteEdit;
+                            }
+                        }
+                    }
+                    Screen::NoteEdit => {
+                        if back_button_hit(sx, sy) {
+                            notes::save(&bus, &note_name, &note_text);
+                            // back to the list, rescanned so the saved note's
+                            // preview is current.
+                            notes_dirty = true;
+                            current_screen = Screen::Notes;
+                        } else if let Some(key) = keyboard::hit(sx, sy, kb_symbols, kb_shift) {
+                            match key {
+                                Key::Shift => {
+                                    kb_shift = !kb_shift;
+                                    keyboard::draw(&mut display, kb_symbols, kb_shift, "RET");
+                                    display.flush_partial_fast(keyboard::native_rect()).ok();
+                                }
+                                Key::Symbols => {
+                                    kb_symbols = !kb_symbols;
+                                    keyboard::draw(&mut display, kb_symbols, kb_shift, "RET");
+                                    display.flush_partial_fast(keyboard::native_rect()).ok();
+                                }
+                                other => {
+                                    match other {
+                                        Key::Char(c) if note_text.len() < notes::NOTE_MAX => {
+                                            note_text.push(c)
+                                        }
+                                        Key::Space if note_text.len() < notes::NOTE_MAX => {
+                                            note_text.push(' ')
+                                        }
+                                        Key::Enter if note_text.len() < notes::NOTE_MAX => {
+                                            note_text.push('\n')
+                                        }
+                                        Key::Backspace => {
+                                            note_text.pop();
+                                        }
+                                        _ => {}
+                                    }
+                                    notes::draw_note_text(&mut display, &note_text);
+                                    display
+                                        .flush_partial_fast(notes::text_area_native_rect())
+                                        .ok();
+                                }
+                            }
+                        }
                     }
                     Screen::Reader => {
                         if back_button_hit(sx, sy) {
@@ -1431,6 +1556,41 @@ async fn main(_spawner: Spawner) -> ! {
                     esp_println::println!("files: load {files_path} failed: {e:?}");
                     files_entries = Vec::new();
                     files_status = String::from("SD read failed");
+                }
+            }
+            needs_redraw = true;
+        }
+
+        // (re)load the notes listing when the notes page is opened or a note
+        // was saved. self-contained mount, mirrors the file browser.
+        if current_screen == Screen::Notes && notes_dirty {
+            notes_dirty = false;
+            notes_scroll = 0;
+            match notes::load_list(&bus) {
+                Ok(entries) => {
+                    notes_status = format!("{} notes", entries.len());
+                    notes_entries = entries;
+                }
+                Err(e) => {
+                    esp_println::println!("notes: load listing failed: {e:?}");
+                    notes_entries = Vec::new();
+                    notes_status = String::from("SD read failed");
+                }
+            }
+            needs_redraw = true;
+        }
+
+        // read the tapped note's text when the editor is opened (mirrors the
+        // reader). on failure fall back to the list with the error on its
+        // footer.
+        if current_screen == Screen::NoteEdit && note_dirty {
+            note_dirty = false;
+            match notes::load_note(&bus, &note_name) {
+                Ok(text) => note_text = text,
+                Err(e) => {
+                    esp_println::println!("notes: read {note_name} failed: {e:?}");
+                    notes_status = String::from("note read failed");
+                    current_screen = Screen::Notes;
                 }
             }
             needs_redraw = true;
@@ -1896,6 +2056,10 @@ async fn main(_spawner: Spawner) -> ! {
         if let Some(doc) = &reader_doc {
             doc.save(&bus);
         }
+    }
+    // persist the open note if we slept straight from the editor.
+    if current_screen == Screen::NoteEdit {
+        notes::save(&bus, &note_name, &note_text);
     }
     // persist the user's brightness so it is restored on the next boot.
     settings.brightness = brightness;
