@@ -58,6 +58,7 @@ use crate::pages::gps::{
     full_touch,
     fullscreen_button_hit,
     gps_data_native_rect,
+    lora_cs_high,
     map_area_tiles,
     map_cache_filename,
     map_cache_path,
@@ -649,6 +650,7 @@ async fn main(_spawner: Spawner) -> ! {
                 Screen::MapFull => {
                     // stitch the fullscreen map from cached tiles (offline) and
                     // draw the zoom/back controls over it.
+                    let _lora_cs = lora_cs_high();
                     let card =
                         match SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus) {
                             Ok(c) => Some(c),
@@ -1554,6 +1556,7 @@ async fn main(_spawner: Spawner) -> ! {
                 Some(fix) => {
                     let cell = map_cell(fix.lat(), fix.lon());
                     let cache_path = map_cache_path(cell.key());
+                    let _lora_cs = lora_cs_high();
                     let card =
                         SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus).ok();
                     let cached = card
@@ -1628,6 +1631,7 @@ async fn main(_spawner: Spawner) -> ! {
         if current_screen == Screen::Gps && gps_download {
             gps_download = false;
             if let Some(fix) = last_fix {
+                let _lora_cs = lora_cs_high();
                 let card = match SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus)
                 {
                     Ok(c) => Some(c),
