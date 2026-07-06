@@ -19,7 +19,7 @@ use t5s3_epaper_core::Display;
 use crate::{
     fmt::FmtBuf,
     layout::{screen_to_native_rect, SCREEN_W},
-    widgets::{draw_back_button, draw_image_fit},
+    widgets::{centered, draw_back_button, draw_image_fit},
 };
 
 // loop ticks (~50ms each) between live progress repaints on the music page, so
@@ -401,10 +401,4 @@ fn draw_button(display: &mut Display, x: i32, y: i32, w: u32, text: &str) {
     )
     .draw(display)
     .ok();
-}
-
-fn centered(display: &mut Display, text: &str, y: i32, style: MonoTextStyle<'_, Gray4>) {
-    Text::with_alignment(text, Point::new(SCREEN_W / 2, y), style, Alignment::Center)
-        .draw(display)
-        .ok();
 }

@@ -18,7 +18,7 @@ use t5s3_epaper_core::{Display, SdCard};
 use crate::{
     layout::SCREEN_W,
     pages::reader::{content_key, read_progress, Progress},
-    widgets::{draw_back_button, draw_image_fit},
+    widgets::{centered, draw_back_button, draw_button, draw_image_fit},
 };
 
 // where per-book metadata and cover thumbnails are cached, alongside the
@@ -348,9 +348,19 @@ pub(crate) fn draw_screen(display: &mut Display, view: &View, scroll: usize) {
     .ok();
 
     match view {
-        View::Loading => centered(display, "scanning SD card for books...", 460),
+        View::Loading => centered(
+            display,
+            "scanning SD card for books...",
+            460,
+            MonoTextStyle::new(&FONT_9X15, Gray4::new(4)),
+        ),
         View::Ready(books) if books.is_empty() => {
-            centered(display, "no epubs found on SD card", 460);
+            centered(
+                display,
+                "no epubs found on SD card",
+                460,
+                MonoTextStyle::new(&FONT_9X15, Gray4::new(4)),
+            );
         }
         View::Ready(books) => {
             for slot in 0..VISIBLE {
@@ -372,8 +382,22 @@ pub(crate) fn draw_screen(display: &mut Display, view: &View, scroll: usize) {
             )
             .draw(display)
             .ok();
-            draw_button(display, UP_BTN_X, "Up");
-            draw_button(display, DOWN_BTN_X, "Down");
+            draw_button(
+                display,
+                UP_BTN_X,
+                SCROLL_Y,
+                SCROLL_BTN_W,
+                SCROLL_BTN_H,
+                "Up",
+            );
+            draw_button(
+                display,
+                DOWN_BTN_X,
+                SCROLL_Y,
+                SCROLL_BTN_W,
+                SCROLL_BTN_H,
+                "Down",
+            );
         }
     }
 }
@@ -509,47 +533,6 @@ fn draw_cover(display: &mut Display, cover: Option<&GrayImage>, cover_y: i32) {
             .stroke_color(Gray4::new(8))
             .stroke_width(1)
             .build(),
-    )
-    .draw(display)
-    .ok();
-}
-
-fn draw_button(display: &mut Display, x: i32, label: &str) {
-    RoundedRectangle::with_equal_corners(
-        Rectangle::new(
-            Point::new(x, SCROLL_Y),
-            Size::new(SCROLL_BTN_W, SCROLL_BTN_H),
-        ),
-        Size::new(10, 10),
-    )
-    .into_styled(
-        PrimitiveStyleBuilder::new()
-            .stroke_color(Gray4::BLACK)
-            .stroke_width(2)
-            .fill_color(Gray4::WHITE)
-            .build(),
-    )
-    .draw(display)
-    .ok();
-    Text::with_alignment(
-        label,
-        Point::new(
-            x + SCROLL_BTN_W as i32 / 2,
-            SCROLL_Y + SCROLL_BTN_H as i32 / 2 + 6,
-        ),
-        MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK),
-        Alignment::Center,
-    )
-    .draw(display)
-    .ok();
-}
-
-fn centered(display: &mut Display, text: &str, y: i32) {
-    Text::with_alignment(
-        text,
-        Point::new(SCREEN_W / 2, y),
-        MonoTextStyle::new(&FONT_9X15, Gray4::new(4)),
-        Alignment::Center,
     )
     .draw(display)
     .ok();

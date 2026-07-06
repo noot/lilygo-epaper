@@ -8,7 +8,7 @@ use embedded_graphics::{
         MonoTextStyle,
     },
     prelude::*,
-    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle},
+    primitives::{PrimitiveStyle, Rectangle},
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
@@ -21,7 +21,7 @@ use tinybmp::Bmp;
 
 use crate::{
     layout::{screen_to_native_rect, SCREEN_W},
-    widgets::draw_back_button,
+    widgets::{draw_back_button, draw_button},
 };
 
 const TITLE_Y: i32 = 95;
@@ -173,35 +173,6 @@ pub(crate) fn files_scroll_down_hit(sx: i32, sy: i32) -> bool {
         && (SCROLL_Y..SCROLL_Y + SCROLL_BTN_H as i32).contains(&sy)
 }
 
-fn draw_button(display: &mut Display, x: i32, label: &str) {
-    let border = PrimitiveStyleBuilder::new()
-        .stroke_color(Gray4::BLACK)
-        .stroke_width(2)
-        .fill_color(Gray4::WHITE)
-        .build();
-    RoundedRectangle::with_equal_corners(
-        Rectangle::new(
-            Point::new(x, SCROLL_Y),
-            Size::new(SCROLL_BTN_W, SCROLL_BTN_H),
-        ),
-        Size::new(10, 10),
-    )
-    .into_styled(border)
-    .draw(display)
-    .ok();
-    Text::with_alignment(
-        label,
-        Point::new(
-            x + SCROLL_BTN_W as i32 / 2,
-            SCROLL_Y + SCROLL_BTN_H as i32 / 2 + 6,
-        ),
-        MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK),
-        Alignment::Center,
-    )
-    .draw(display)
-    .ok();
-}
-
 fn draw_path(display: &mut Display, path: &str) {
     Rectangle::new(
         Point::new(LIST_X, PATH_Y - 16),
@@ -311,8 +282,22 @@ pub(crate) fn draw_files_screen(
     draw_path(display, path);
     draw_file_list(display, path, entries, scroll);
     draw_files_footer(display, status);
-    draw_button(display, UP_BTN_X, "Up");
-    draw_button(display, DOWN_BTN_X, "Down");
+    draw_button(
+        display,
+        UP_BTN_X,
+        SCROLL_Y,
+        SCROLL_BTN_W,
+        SCROLL_BTN_H,
+        "Up",
+    );
+    draw_button(
+        display,
+        DOWN_BTN_X,
+        SCROLL_Y,
+        SCROLL_BTN_W,
+        SCROLL_BTN_H,
+        "Down",
+    );
 }
 
 pub(crate) fn file_list_native_rect() -> t5s3_epaper_core::display::Rectangle {

@@ -12,7 +12,7 @@ use embedded_graphics::{
         MonoTextStyle,
     },
     prelude::*,
-    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle},
+    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
@@ -22,7 +22,7 @@ use t5s3_epaper_core::{sdcard::Error, Display};
 use crate::{
     keyboard,
     layout::{screen_to_native_rect, SCREEN_W},
-    widgets::draw_back_button,
+    widgets::{draw_back_button, draw_button},
 };
 
 // notes live as NOTE####.TXT files under /NOTES: embedded_sdmmc cannot create
@@ -247,29 +247,6 @@ pub(crate) fn delete_native_rect() -> t5s3_epaper_core::display::Rectangle {
     screen_to_native_rect(DELETE_X, DELETE_Y, DELETE_W, DELETE_H)
 }
 
-fn draw_button(display: &mut Display, x: i32, label: &str) {
-    let border = PrimitiveStyleBuilder::new()
-        .stroke_color(Gray4::BLACK)
-        .stroke_width(2)
-        .fill_color(Gray4::WHITE)
-        .build();
-    RoundedRectangle::with_equal_corners(
-        Rectangle::new(Point::new(x, BTN_Y), Size::new(BTN_W, BTN_H)),
-        Size::new(10, 10),
-    )
-    .into_styled(border)
-    .draw(display)
-    .ok();
-    Text::with_alignment(
-        label,
-        Point::new(x + BTN_W as i32 / 2, BTN_Y + BTN_H as i32 / 2 + 6),
-        MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK),
-        Alignment::Center,
-    )
-    .draw(display)
-    .ok();
-}
-
 pub(crate) fn draw_note_list(display: &mut Display, entries: &[Entry], scroll: usize) {
     Rectangle::new(
         Point::new(LIST_X, LIST_TOP),
@@ -333,9 +310,9 @@ pub(crate) fn draw_list_screen(
     .ok();
     draw_note_list(display, entries, scroll);
     draw_notes_footer(display, status);
-    draw_button(display, UP_BTN_X, "Up");
-    draw_button(display, DOWN_BTN_X, "Down");
-    draw_button(display, NEW_BTN_X, "New");
+    draw_button(display, UP_BTN_X, BTN_Y, BTN_W, BTN_H, "Up");
+    draw_button(display, DOWN_BTN_X, BTN_Y, BTN_W, BTN_H, "Down");
+    draw_button(display, NEW_BTN_X, BTN_Y, BTN_W, BTN_H, "New");
 }
 
 pub(crate) fn list_native_rect() -> t5s3_epaper_core::display::Rectangle {

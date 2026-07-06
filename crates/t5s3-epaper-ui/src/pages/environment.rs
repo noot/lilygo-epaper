@@ -13,7 +13,11 @@ use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use serde::Deserialize;
 use t5s3_epaper_core::Display;
 
-use crate::{fmt::FmtBuf, layout::SCREEN_W, widgets::draw_back_button};
+use crate::{
+    fmt::FmtBuf,
+    layout::SCREEN_W,
+    widgets::{centered, draw_back_button},
+};
 
 // the sensor device whose latest reading this page shows (from .env at build
 // time; see the justfile). matches the id the sensor firmware posts under.
@@ -129,10 +133,4 @@ fn draw_body(display: &mut Display, view: &View) {
             }
         }
     }
-}
-
-fn centered(display: &mut Display, text: &str, y: i32, style: MonoTextStyle<'_, Gray4>) {
-    Text::with_alignment(text, Point::new(SCREEN_W / 2, y), style, Alignment::Center)
-        .draw(display)
-        .ok();
 }

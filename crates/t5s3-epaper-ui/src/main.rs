@@ -12,6 +12,7 @@ mod pages;
 mod screen;
 mod sd;
 mod settings;
+mod state;
 mod widgets;
 mod wifi;
 
@@ -151,6 +152,7 @@ use crate::{
     },
     screen::Screen,
     settings::Settings,
+    state::Remote,
     widgets::{
         back_button_hit,
         draw_back_button,
@@ -474,7 +476,8 @@ async fn main(spawner: Spawner) -> ! {
     let mut files_entries: Vec<DirectoryEntry> = Vec::new();
     let mut files_scroll: usize = 0;
     let mut files_status = String::new();
-    let mut files_dirty = false;
+    // set at declaration so a wake that restores the browser loads it.
+    let mut files_dirty = current_screen == Screen::Files;
     // path of the .bmp currently shown full-screen by the image viewer.
     let mut image_path = String::new();
 
@@ -503,11 +506,10 @@ async fn main(spawner: Spawner) -> ! {
     // why the open failed, shown on the reader screen when `reader_doc` is None.
     let mut reader_status = String::new();
 
-    // music / environment page state: the last fetched view and a flag that a
-    // fresh fetch from noot-server is needed on the next pass (set on entry and
-    // on tap-to-refresh, mirrors `files_dirty`).
-    let mut music_view = music::View::Loading;
-    let mut music_dirty = false;
+    // music / environment page state: the last fetched view plus its reload
+    // flag (set on entry, on tap-to-refresh, and at declaration when a wake
+    // restored the screen).
+    let mut music = Remote::new(music::View::Loading, current_screen == Screen::Music);
     // a pending transport/volume control to POST on the next music fetch, or None
     // to just refresh the now-playing state.
     let mut music_command: Option<music::Button> = None;
@@ -524,21 +526,18 @@ async fn main(spawner: Spawner) -> ! {
     // last fetch, track duration, clock micros at that fetch). None unless a
     // track is actively playing with a known position.
     let mut music_anchor: Option<(u32, u32, u64)> = None;
-    let mut env_view = environment::View::Loading;
-    let mut env_dirty = false;
+    let mut env = Remote::new(
+        environment::View::Loading,
+        current_screen == Screen::Environment,
+    );
 
-    // weather page state: mirrors the environment page (last fetched view plus a
-    // flag that a fresh fetch from noot-server is needed on the next pass, set on
-    // entry and on tap-to-refresh).
-    let mut weather_view = weather::View::Loading;
-    let mut weather_dirty = false;
+    // weather page state: mirrors the environment page.
+    let mut weather = Remote::new(weather::View::Loading, current_screen == Screen::Weather);
 
-    // library (reader shelf) state: the scanned books, the scroll offset into
-    // them, and a flag that a fresh scan is needed on the next pass (set on entry
-    // and on returning from the reader, mirrors `files_dirty`).
-    let mut library_view = library::View::Loading;
+    // library (reader shelf) state: the scanned books plus their reload flag
+    // (set on entry and on returning from the reader), and the scroll offset.
+    let mut library = Remote::new(library::View::Loading, current_screen == Screen::Library);
     let mut library_scroll: usize = 0;
-    let mut library_dirty = false;
 
     // wifi settings page state: the last scan results, a status line, and flags
     // that a scan or a join should run on the next pass (mirrors env/weather).
@@ -570,12 +569,11 @@ async fn main(spawner: Spawner) -> ! {
     #[cfg(feature = "gps")]
     let mut last_fix: Option<GpsFix> = None;
 
-    // the gps page's map panel: the last fetched view plus a flag that a fresh
-    // fetch is needed on the next pass (set on entry and on tap-to-refresh).
+    // the gps page's map panel: the last fetched view plus its reload flag (set
+    // on entry, on tap-to-refresh, on tile crossings, and at declaration when a
+    // wake restored the screen).
     #[cfg(feature = "gps")]
-    let mut gps_map = MapView::Loading;
-    #[cfg(feature = "gps")]
-    let mut gps_map_dirty = false;
+    let mut gps_map = Remote::new(MapView::Loading, current_screen == Screen::Gps);
     // set when the "save area" button is tapped: pre-download the cells around
     // the current fix into the sd cache on the next pass.
     #[cfg(feature = "gps")]
@@ -663,9 +661,9 @@ async fn main(spawner: Spawner) -> ! {
                     let on_music = current_screen == Screen::Music;
                     match snapshot {
                         Some(snap) => {
-                            music_view = music::build_view(&snap.json, snap.cover.as_deref());
+                            music.view = music::build_view(&snap.json, snap.cover.as_deref());
                             // anchor the local position tick to this fetch.
-                            music_anchor = music::playback(&music_view)
+                            music_anchor = music::playback(&music.view)
                                 .map(|p| (p.base_secs, p.duration_secs, clock.now_us()));
                             music_refresh = 0;
                             music_status_ticks = 0;
@@ -682,7 +680,7 @@ async fn main(spawner: Spawner) -> ! {
                                 // play/pause: repaint just the band below the art.
                                 music_status = Some("ok");
                                 if on_music {
-                                    music::redraw_body(&mut display, &music_view, Some("ok"));
+                                    music::redraw_body(&mut display, &music.view, Some("ok"));
                                     display.flush_partial_fast(music::below_art_rect()).ok();
                                 }
                             } else {
@@ -705,7 +703,7 @@ async fn main(spawner: Spawner) -> ! {
                         }
                         None => {
                             music_status = None;
-                            music_view = music::View::Error;
+                            music.view = music::View::Error;
                             if on_music {
                                 needs_redraw = true;
                             }
@@ -714,7 +712,7 @@ async fn main(spawner: Spawner) -> ! {
                 }
                 WifiEvent::GotBody(body) => match pending {
                     Some(Pending::Environment) => {
-                        env_view = match body {
+                        env.view = match body {
                             Some(body) => environment::parse(&body),
                             None => environment::View::Error,
                         };
@@ -723,7 +721,7 @@ async fn main(spawner: Spawner) -> ! {
                         }
                     }
                     Some(Pending::Weather) => {
-                        weather_view = match body {
+                        weather.view = match body {
                             Some(body) => weather::parse(&body),
                             None => weather::View::Error,
                         };
@@ -733,7 +731,7 @@ async fn main(spawner: Spawner) -> ! {
                     }
                     #[cfg(feature = "gps")]
                     Some(Pending::MapTile { key, dx, dy }) => {
-                        gps_map = match body {
+                        gps_map.view = match body {
                             Some(body) => {
                                 let view = parse_map(&body, dx, dy);
                                 // only cache a body that decoded, so a bad
@@ -765,7 +763,7 @@ async fn main(spawner: Spawner) -> ! {
                         gps_shown_cell = Some(key);
                         gps_shown_offset = (dx, dy);
                         if current_screen == Screen::Gps {
-                            refresh_map_panel(&mut display, &gps_map);
+                            refresh_map_panel(&mut display, &gps_map.view);
                         }
                     }
                     _ => {}
@@ -805,15 +803,15 @@ async fn main(spawner: Spawner) -> ! {
                         esp_println::println!("gps: area download saved {fetched}/{total} tiles");
                         // report the area now cached around the fix, then reload
                         // the current cell (now cached) on the next pass.
-                        gps_map = MapView::Saved {
+                        gps_map.view = MapView::Saved {
                             km2,
                             new_tiles: fetched,
                         };
                         if current_screen == Screen::Gps {
-                            refresh_map_panel(&mut display, &gps_map);
+                            refresh_map_panel(&mut display, &gps_map.view);
                             Timer::after_millis(1500).await;
                         }
-                        gps_map_dirty = true;
+                        gps_map.invalidate();
                     }
                 }
                 #[cfg(not(feature = "gps"))]
@@ -854,7 +852,7 @@ async fn main(spawner: Spawner) -> ! {
                     match &gps {
                         Some(g) => {
                             draw_gps_data(&mut display, g, last_fix);
-                            draw_map(&mut display, &gps_map);
+                            draw_map(&mut display, &gps_map.view);
                         }
                         None => {
                             let small = MonoTextStyle::new(&FONT_6X10, Gray4::new(4));
@@ -962,7 +960,7 @@ async fn main(spawner: Spawner) -> ! {
                         );
                     }
                 }
-                Screen::Music => music::draw_screen(&mut display, &music_view, music_status),
+                Screen::Music => music::draw_screen(&mut display, &music.view, music_status),
                 Screen::Notes => notes::draw_list_screen(
                     &mut display,
                     &notes_entries,
@@ -977,10 +975,10 @@ async fn main(spawner: Spawner) -> ! {
                     kb_shift,
                     note_delete_armed,
                 ),
-                Screen::Environment => environment::draw_screen(&mut display, &env_view),
-                Screen::Weather => weather::draw_screen(&mut display, &weather_view),
+                Screen::Environment => environment::draw_screen(&mut display, &env.view),
+                Screen::Weather => weather::draw_screen(&mut display, &weather.view),
                 Screen::Library => {
-                    library::draw_screen(&mut display, &library_view, library_scroll)
+                    library::draw_screen(&mut display, &library.view, library_scroll)
                 }
                 #[cfg(feature = "gps")]
                 Screen::MapFull => {
@@ -1069,7 +1067,7 @@ async fn main(spawner: Spawner) -> ! {
                         music_command = None;
                         music_inline = false;
                         music_anchor = None;
-                        music_dirty = true;
+                        music.invalidate();
                     } else {
                         music::draw_progress(&mut display, current as u32, duration);
                         display.flush_partial_fast(music::progress_rect()).ok();
@@ -1184,38 +1182,33 @@ async fn main(spawner: Spawner) -> ! {
                                 // the server pages paint a "loading" view now,
                                 // then fetch over wifi on the next pass.
                                 Screen::Music => {
-                                    music_view = music::View::Loading;
+                                    music.refresh(music::View::Loading);
                                     music_command = None;
                                     music_inline = false;
                                     music_status = None;
                                     music_anchor = None;
-                                    music_dirty = true;
                                     needs_redraw = true;
                                 }
                                 Screen::Environment => {
-                                    env_view = environment::View::Loading;
-                                    env_dirty = true;
+                                    env.refresh(environment::View::Loading);
                                     needs_redraw = true;
                                 }
                                 Screen::Weather => {
-                                    weather_view = weather::View::Loading;
-                                    weather_dirty = true;
+                                    weather.refresh(weather::View::Loading);
                                     needs_redraw = true;
                                 }
                                 // the shelf paints a "scanning" view now, then
                                 // scans the card on the next pass.
                                 Screen::Library => {
-                                    library_view = library::View::Loading;
+                                    library.refresh(library::View::Loading);
                                     library_scroll = 0;
-                                    library_dirty = true;
                                     needs_redraw = true;
                                 }
                                 // the gps page paints its map panel as "loading"
                                 // now, then fetches over wifi on the next pass.
                                 #[cfg(feature = "gps")]
                                 Screen::Gps => {
-                                    gps_map = MapView::Loading;
-                                    gps_map_dirty = true;
+                                    gps_map.refresh(MapView::Loading);
                                     needs_redraw = true;
                                 }
                                 _ => needs_redraw = true,
@@ -1505,7 +1498,9 @@ async fn main(spawner: Spawner) -> ! {
                             }
                             // returning to the shelf rescans so the just-read
                             // book's progress is up to date (cache-fast).
-                            library_dirty = reader_return == Screen::Library;
+                            if reader_return == Screen::Library {
+                                library.invalidate();
+                            }
                             current_screen = reader_return;
                             needs_redraw = true;
                         } else if let Some(doc) = &mut reader_doc {
@@ -1744,15 +1739,14 @@ async fn main(spawner: Spawner) -> ! {
                             music::draw_status(&mut display, "contacting server...");
                             display.flush_partial_fast(music::status_rect()).ok();
                             // no needs_redraw: keep the page, fetch on this pass.
-                            music_dirty = true;
+                            music.invalidate();
                         } else {
                             // a tap elsewhere refreshes the whole page.
                             music_command = None;
                             music_inline = false;
                             music_status = None;
-                            music_view = music::View::Loading;
+                            music.refresh(music::View::Loading);
                             music_anchor = None;
-                            music_dirty = true;
                             needs_redraw = true;
                         }
                     }
@@ -1762,8 +1756,7 @@ async fn main(spawner: Spawner) -> ! {
                             needs_redraw = true;
                         } else {
                             // a tap anywhere else re-fetches the latest reading.
-                            env_view = environment::View::Loading;
-                            env_dirty = true;
+                            env.refresh(environment::View::Loading);
                             needs_redraw = true;
                         }
                     }
@@ -1773,8 +1766,7 @@ async fn main(spawner: Spawner) -> ! {
                             needs_redraw = true;
                         } else {
                             // a tap anywhere else re-fetches the latest forecast.
-                            weather_view = weather::View::Loading;
-                            weather_dirty = true;
+                            weather.refresh(weather::View::Loading);
                             needs_redraw = true;
                         }
                     }
@@ -1782,7 +1774,7 @@ async fn main(spawner: Spawner) -> ! {
                         if back_button_hit(sx, sy) {
                             current_screen = Screen::Home;
                             needs_redraw = true;
-                        } else if let library::View::Ready(books) = &library_view {
+                        } else if let library::View::Ready(books) = &library.view {
                             if library::scroll_up_hit(sx, sy) {
                                 if library_scroll >= library::VISIBLE {
                                     library_scroll -= library::VISIBLE;
@@ -1821,7 +1813,7 @@ async fn main(spawner: Spawner) -> ! {
                             // current fix. panel-only (no full-page redraw): the
                             // fetch block below reloads the cell and repaints just
                             // the panel.
-                            gps_map_dirty = true;
+                            gps_map.invalidate();
                         }
                     }
                     #[cfg(feature = "gps")]
@@ -1952,7 +1944,10 @@ async fn main(spawner: Spawner) -> ! {
         // opened or refreshed; the result comes back through the event router
         // above while the ui keeps running. the `!needs_redraw` guard lets the
         // "loading" view paint first.
-        if current_screen == Screen::Music && music_dirty && !needs_redraw && wifi_pending.is_none()
+        if current_screen == Screen::Music
+            && music.is_dirty()
+            && !needs_redraw
+            && wifi_pending.is_none()
         {
             let command = music_command.take();
             let inline = music_inline;
@@ -1963,13 +1958,13 @@ async fn main(spawner: Spawner) -> ! {
                     command: command.map(music::Button::command),
                 },
             )) {
-                music_dirty = false;
+                music.clear();
                 wifi_pending = Some(Pending::Music { inline, command });
             }
         }
 
         if current_screen == Screen::Environment
-            && env_dirty
+            && env.is_dirty()
             && !needs_redraw
             && wifi_pending.is_none()
         {
@@ -1982,7 +1977,7 @@ async fn main(spawner: Spawner) -> ! {
                     max_body: 8192,
                 },
             )) {
-                env_dirty = false;
+                env.clear();
                 wifi_pending = Some(Pending::Environment);
             }
         }
@@ -1992,7 +1987,7 @@ async fn main(spawner: Spawner) -> ! {
         // and only fetched (via the wifi task) + cached on a miss. without a fix
         // there is no center to request a map for.
         #[cfg(feature = "gps")]
-        if current_screen == Screen::Gps && gps_map_dirty && !needs_redraw {
+        if current_screen == Screen::Gps && gps_map.is_dirty() && !needs_redraw {
             match last_fix {
                 Some(fix) => {
                     let cell = map_cell(fix.lat(), fix.lon());
@@ -2018,12 +2013,12 @@ async fn main(spawner: Spawner) -> ! {
                     };
                     match cached {
                         Some(view) => {
-                            gps_map_dirty = false;
-                            gps_map = view;
+                            gps_map.clear();
+                            gps_map.view = view;
                             // refresh just the map panel (grayscale, panel-only)
                             // rather than a full page redraw, so following the
                             // fix flashes only the panel.
-                            refresh_map_panel(&mut display, &gps_map);
+                            refresh_map_panel(&mut display, &gps_map.view);
                             gps_marker_ticks = 0;
                             gps_shown_cell = Some(cell.key());
                             gps_shown_offset = (cell.dx(), cell.dy());
@@ -2038,14 +2033,14 @@ async fn main(spawner: Spawner) -> ! {
                                     max_body: MAP_MAX_BYTES,
                                 },
                             )) {
-                                gps_map_dirty = false;
+                                gps_map.clear();
                                 wifi_pending = Some(Pending::MapTile {
                                     key: cell.key(),
                                     dx: cell.dx(),
                                     dy: cell.dy(),
                                 });
-                                gps_map = MapView::Loading;
-                                refresh_map_panel(&mut display, &gps_map);
+                                gps_map.view = MapView::Loading;
+                                refresh_map_panel(&mut display, &gps_map.view);
                             }
                         }
                         // wifi task busy: keep the dirty flag and retry on a
@@ -2054,9 +2049,9 @@ async fn main(spawner: Spawner) -> ! {
                     }
                 }
                 None => {
-                    gps_map_dirty = false;
-                    gps_map = MapView::NoFix;
-                    refresh_map_panel(&mut display, &gps_map);
+                    gps_map.clear();
+                    gps_map.view = MapView::NoFix;
+                    refresh_map_panel(&mut display, &gps_map.view);
                     gps_shown_cell = None;
                 }
             }
@@ -2108,15 +2103,15 @@ async fn main(spawner: Spawner) -> ! {
                     if missing.is_empty() {
                         esp_println::println!("gps: area already cached, nothing to download");
                         let km2 = area_km2(fix.lat(), DOWNLOAD_RADIUS);
-                        gps_map = MapView::Saved { km2, new_tiles: 0 };
-                        refresh_map_panel(&mut display, &gps_map);
+                        gps_map.view = MapView::Saved { km2, new_tiles: 0 };
+                        refresh_map_panel(&mut display, &gps_map.view);
                         Timer::after_millis(1500).await;
                         // reload the current cell on the next pass.
-                        gps_map_dirty = true;
+                        gps_map.invalidate();
                     } else {
                         let total = missing.len();
-                        gps_map = MapView::Downloading(total);
-                        refresh_map_panel(&mut display, &gps_map);
+                        gps_map.view = MapView::Downloading(total);
+                        refresh_map_panel(&mut display, &gps_map.view);
                         if wifi::send(saved_request(
                             &settings,
                             wifi::Op::DownloadMaps {
@@ -2133,14 +2128,14 @@ async fn main(spawner: Spawner) -> ! {
                     }
                 } else {
                     // no card to cache onto; just reload the panel.
-                    gps_map_dirty = true;
+                    gps_map.invalidate();
                 }
             }
         }
 
         // the weather page fetches a public forecast for the device's current
         // GPS position; without a fix there are no coordinates to query for.
-        if current_screen == Screen::Weather && weather_dirty && !needs_redraw {
+        if current_screen == Screen::Weather && weather.is_dirty() && !needs_redraw {
             #[cfg(feature = "gps")]
             match last_fix {
                 Some(fix) => {
@@ -2156,21 +2151,21 @@ async fn main(spawner: Spawner) -> ! {
                                 max_body: 16 * 1024,
                             },
                         )) {
-                            weather_dirty = false;
+                            weather.clear();
                             wifi_pending = Some(Pending::Weather);
                         }
                     }
                 }
                 None => {
-                    weather_dirty = false;
-                    weather_view = weather::View::NoFix;
+                    weather.clear();
+                    weather.view = weather::View::NoFix;
                     needs_redraw = true;
                 }
             }
             #[cfg(not(feature = "gps"))]
             {
-                weather_dirty = false;
-                weather_view = weather::View::NoFix;
+                weather.clear();
+                weather.view = weather::View::NoFix;
                 needs_redraw = true;
             }
         }
@@ -2217,9 +2212,9 @@ async fn main(spawner: Spawner) -> ! {
         // "scanning" view paint first, since the scan can be slow on first run
         // (it parses each new epub and decodes its cover). self-contained mount,
         // so it never conflicts with the radio, which is dropped off-screen.
-        if current_screen == Screen::Library && library_dirty && !needs_redraw {
-            library_dirty = false;
-            library_view = library::load_library(&bus);
+        if current_screen == Screen::Library && library.is_dirty() && !needs_redraw {
+            library.clear();
+            library.view = library::load_library(&bus);
             needs_redraw = true;
         }
 
@@ -2302,7 +2297,7 @@ async fn main(spawner: Spawner) -> ! {
                         Some(shown) if shown != cell.key() => {
                             // crossed a tile boundary: reload (cache-first) on the
                             // next pass via the map fetch block above.
-                            gps_map_dirty = true;
+                            gps_map.invalidate();
                         }
                         Some(_) => {
                             gps_marker_ticks = gps_marker_ticks.saturating_add(1);
@@ -2310,11 +2305,11 @@ async fn main(spawner: Spawner) -> ! {
                                 + (cell.dy() - gps_shown_offset.1).abs();
                             if gps_marker_ticks >= MARKER_REFRESH_TICKS && moved >= MARKER_MOVE_PX {
                                 gps_marker_ticks = 0;
-                                if let MapView::Ready { dx, dy, .. } = &mut gps_map {
+                                if let MapView::Ready { dx, dy, .. } = &mut gps_map.view {
                                     *dx = cell.dx();
                                     *dy = cell.dy();
                                 }
-                                refresh_map_panel(&mut display, &gps_map);
+                                refresh_map_panel(&mut display, &gps_map.view);
                                 gps_shown_offset = (cell.dx(), cell.dy());
                             }
                         }

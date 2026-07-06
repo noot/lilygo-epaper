@@ -26,7 +26,7 @@ use crate::{
     datetime::{weekday, DAY_NAMES},
     fmt::FmtBuf,
     layout::SCREEN_W,
-    widgets::draw_back_button,
+    widgets::{centered, draw_back_button},
 };
 
 // the public forecast api the page fetches from. keyless and reachable over
@@ -322,10 +322,4 @@ fn icon_bytes(sky: Sky, small: bool) -> &'static [u8] {
         Sky::Snow => pick!("snow"),
         Sky::Storm => pick!("storm"),
     }
-}
-
-fn centered(display: &mut Display, text: &str, y: i32, style: MonoTextStyle<'_, Gray4>) {
-    Text::with_alignment(text, Point::new(SCREEN_W / 2, y), style, Alignment::Center)
-        .draw(display)
-        .ok();
 }

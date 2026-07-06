@@ -6,7 +6,7 @@ use embedded_graphics::{
         MonoTextStyle,
     },
     prelude::*,
-    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
+    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle},
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
@@ -236,4 +236,35 @@ fn dither(luma: u8, x: u32, y: u32) -> u8 {
         base
     };
     level.min(15) as u8
+}
+
+// a rounded, outlined button with a centered bold label.
+pub(crate) fn draw_button(display: &mut Display, x: i32, y: i32, w: u32, h: u32, label: &str) {
+    let border = PrimitiveStyleBuilder::new()
+        .stroke_color(Gray4::BLACK)
+        .stroke_width(2)
+        .fill_color(Gray4::WHITE)
+        .build();
+    RoundedRectangle::with_equal_corners(
+        Rectangle::new(Point::new(x, y), Size::new(w, h)),
+        Size::new(10, 10),
+    )
+    .into_styled(border)
+    .draw(display)
+    .ok();
+    Text::with_alignment(
+        label,
+        Point::new(x + w as i32 / 2, y + h as i32 / 2 + 6),
+        MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK),
+        Alignment::Center,
+    )
+    .draw(display)
+    .ok();
+}
+
+// a line of text centered horizontally on the screen.
+pub(crate) fn centered(display: &mut Display, text: &str, y: i32, style: MonoTextStyle<'_, Gray4>) {
+    Text::with_alignment(text, Point::new(SCREEN_W / 2, y), style, Alignment::Center)
+        .draw(display)
+        .ok();
 }
