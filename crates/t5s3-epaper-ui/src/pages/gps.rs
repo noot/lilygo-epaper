@@ -596,9 +596,11 @@ const FULL_BTN_W: i32 = SCREEN_W / 3;
 // digital zoom range in powers of two of world-pixels-per-screen-pixel:
 // negative magnifies cached tiles (blocky), positive stitches more tiles in
 // (more area). bounded so a zoom-out doesn't decode an unreasonable number of
-// tiles.
+// tiles: at 16x the viewport already covers a whole `save area` block
+// (DOWNLOAD_RADIUS 8 => 17x17 cells = 8160 world px across vs the 8640 the
+// viewport spans), so any further out is just blank margin.
 pub(crate) const FULL_ZOOM_MIN: i32 = -1;
-pub(crate) const FULL_ZOOM_MAX: i32 = 2;
+pub(crate) const FULL_ZOOM_MAX: i32 = 4;
 
 // which fullscreen control a tap landed on.
 pub(crate) enum FullAction {
