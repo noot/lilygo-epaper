@@ -522,28 +522,7 @@ async fn request(stack: Stack<'_>, method: &str, path: &str, max_body: usize) ->
     .ok()?;
     socket.write_all(req.as_bytes()).await.ok()?;
 
-    let mut resp = Vec::new();
-    let mut chunk = [0u8; 1024];
-    loop {
-        match socket.read(&mut chunk).await {
-            Ok(0) => break,
-            Ok(n) => {
-                resp.extend_from_slice(&chunk[..n]);
-                // headers + body; stop once we've buffered past the cap.
-                if resp.len() > max_body + 2048 {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-
-    // status line is "HTTP/1.1 NNN ...": the first status digit sits at byte 9.
-    if resp.get(9) != Some(&b'2') {
-        return None;
-    }
-    let split = resp.windows(4).position(|w| w == b"\r\n\r\n")?;
-    Some(resp[split + 4..].to_vec())
+    read_response(&mut socket, max_body).await
 }
 
 // one plain-http GET to `host` on port 80 using HTTP/1.0 and return the
@@ -588,13 +567,29 @@ async fn request_host(
     .ok()?;
     socket.write_all(req.as_bytes()).await.ok()?;
 
+    read_response(&mut socket, max_body).await
+}
+
+// buffer a response until the server closes the connection, then strip the
+// headers and return the body for a 2xx status. a body cut short by a mid-read
+// socket error or the `max_body` cap returns None rather than a silently
+// truncated buffer — callers cache these bodies (sd map tiles), so a partial
+// body must never look like a success. when the server declares a
+// content-length the body is validated against it; without one, only an
+// orderly close marks the body complete.
+async fn read_response(socket: &mut TcpSocket<'_>, max_body: usize) -> Option<Vec<u8>> {
     let mut resp = Vec::new();
     let mut chunk = [0u8; 1024];
+    let mut closed = false;
     loop {
         match socket.read(&mut chunk).await {
-            Ok(0) => break,
+            Ok(0) => {
+                closed = true;
+                break;
+            }
             Ok(n) => {
                 resp.extend_from_slice(&chunk[..n]);
+                // headers + body; stop once we've buffered past the cap.
                 if resp.len() > max_body + 2048 {
                     break;
                 }
@@ -608,7 +603,26 @@ async fn request_host(
         return None;
     }
     let split = resp.windows(4).position(|w| w == b"\r\n\r\n")?;
-    Some(resp[split + 4..].to_vec())
+    let body = &resp[split + 4..];
+    match content_length(&resp[..split]) {
+        Some(len) if body.len() >= len => Some(body[..len].to_vec()),
+        Some(_) => None,
+        None if closed => Some(body.to_vec()),
+        None => None,
+    }
+}
+
+// find a content-length header in the raw header block, if any.
+fn content_length(headers: &[u8]) -> Option<usize> {
+    headers.split(|&b| b == b'\n').find_map(|line| {
+        let line = core::str::from_utf8(line).ok()?;
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            value.trim().parse::<usize>().ok()
+        } else {
+            None
+        }
+    })
 }
 
 // set the RTC to UTC from an NTP unix timestamp. the timezone offset is applied
@@ -641,7 +655,11 @@ async fn sntp_unix_time(stack: embassy_net::Stack<'_>) -> Option<u64> {
     socket.send_to(&request, server).await.ok()?;
 
     let mut response = [0u8; 48];
-    let (n, _) = socket.recv_from(&mut response).await.ok()?;
+    // a dropped reply must not hang the sync forever; the caller retries.
+    let (n, _) = with_timeout(Duration::from_secs(5), socket.recv_from(&mut response))
+        .await
+        .ok()?
+        .ok()?;
     if n < 44 {
         return None;
     }

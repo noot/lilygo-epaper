@@ -15,7 +15,9 @@ impl<'a> DrawTarget for Display<'a> {
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
         for Pixel(coord, color) in pixels.into_iter() {
-            let (x, y) = translate_coord_rotation(coord.x as u16, coord.y as u16, &self.rotation());
+            let Some((x, y)) = translate_coord_rotation(coord.x, coord.y, &self.rotation()) else {
+                continue;
+            };
             let result = self.set_pixel(x, y, color.luma());
             if matches!(result, Err(Error::OutOfBounds)) {
                 continue;
@@ -30,13 +32,23 @@ impl<'a> DrawTarget for Display<'a> {
     }
 }
 
+// map a logical coordinate to a native panel coordinate, or None when the
+// pixel falls outside the panel. the DrawTarget contract requires drawing to
+// ignore out-of-bounds pixels; the previous u16 arithmetic underflowed (and
+// panicked with overflow checks on) for coordinates past the rotated edge.
 #[inline(always)]
-fn translate_coord_rotation(x: u16, y: u16, rotation: &DisplayRotation) -> (u16, u16) {
-    match rotation {
+fn translate_coord_rotation(x: i32, y: i32, rotation: &DisplayRotation) -> Option<(u16, u16)> {
+    let (width, height) = (i32::from(Display::WIDTH), i32::from(Display::HEIGHT));
+    let (nx, ny) = match rotation {
         DisplayRotation::Rotate0 => (x, y),
-        DisplayRotation::Rotate90 => (Display::WIDTH - 1 - y, x),
-        DisplayRotation::Rotate180 => (Display::WIDTH - 1 - x, Display::HEIGHT - 1 - y),
-        DisplayRotation::Rotate270 => (y, Display::HEIGHT - 1 - x),
+        DisplayRotation::Rotate90 => (width - 1 - y, x),
+        DisplayRotation::Rotate180 => (width - 1 - x, height - 1 - y),
+        DisplayRotation::Rotate270 => (y, height - 1 - x),
+    };
+    if (0..width).contains(&nx) && (0..height).contains(&ny) {
+        Some((nx as u16, ny as u16))
+    } else {
+        None
     }
 }
 

@@ -58,6 +58,7 @@ use crate::pages::gps::{
     full_touch,
     fullscreen_button_hit,
     gps_data_native_rect,
+    lora_cs_high,
     map_area_tiles,
     map_cache_filename,
     map_cache_path,
@@ -318,9 +319,10 @@ async fn main(_spawner: Spawner) -> ! {
     let mut clock_synced = woke;
 
     // on a cold boot, sync the clock over wifi (best effort, with a timeout so
-    // it still boots when offline), then the radio powers down. on wake the RTC
-    // already holds the time, so we skip wifi for a fast resume.
-    if !woke {
+    // it still boots when offline; skipped entirely when no network is
+    // configured), then the radio powers down. on wake the RTC already holds
+    // the time, so we skip wifi for a fast resume.
+    if !woke && !settings.wifi_ssid().is_empty() {
         Text::with_alignment(
             "syncing clock over wifi...",
             Point::new(SCREEN_W / 2, 400),
@@ -369,6 +371,10 @@ async fn main(_spawner: Spawner) -> ! {
     let mut last_status_minute: u32 = 60;
     // time of the last clock sync, used to schedule periodic re-syncs.
     let mut last_resync_secs = clock.now_us() / 1_000_000;
+    // retry cadence while the clock is unsynced, doubled after each failed
+    // attempt (up to the normal re-sync interval) so an unreachable network
+    // doesn't freeze the ui with a blocking wifi session every two minutes.
+    let mut resync_retry_secs = RETRY_INTERVAL_SECS;
 
     // lora send/receive state: the message being typed, a status line, the last
     // few sent and received messages, and the keyboard's symbol/shift toggles.
@@ -675,6 +681,7 @@ async fn main(_spawner: Spawner) -> ! {
                 Screen::MapFull => {
                     // stitch the fullscreen map from cached tiles (offline) and
                     // draw the zoom/back controls over it.
+                    let _lora_cs = lora_cs_high();
                     let card =
                         match SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus) {
                             Ok(c) => Some(c),
@@ -786,17 +793,21 @@ async fn main(_spawner: Spawner) -> ! {
         let resync_interval = if clock_synced {
             RESYNC_INTERVAL_SECS
         } else {
-            RETRY_INTERVAL_SECS
+            resync_retry_secs
         };
-        if clock.now_us() / 1_000_000 >= last_resync_secs + resync_interval {
+        if !settings.wifi_ssid().is_empty()
+            && clock.now_us() / 1_000_000 >= last_resync_secs + resync_interval
+        {
             esp_println::println!("clock: periodic re-sync");
             let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-            if let Some(unix) =
-                sync_time(wifi, settings.wifi_ssid(), settings.wifi_password()).await
-            {
-                set_utc_time(&mut clock, unix);
-                clock_synced = true;
-                needs_redraw = true;
+            match sync_time(wifi, settings.wifi_ssid(), settings.wifi_password()).await {
+                Some(unix) => {
+                    set_utc_time(&mut clock, unix);
+                    clock_synced = true;
+                    needs_redraw = true;
+                    resync_retry_secs = RETRY_INTERVAL_SECS;
+                }
+                None => resync_retry_secs = (resync_retry_secs * 2).min(RESYNC_INTERVAL_SECS),
             }
             last_resync_secs = clock.now_us() / 1_000_000;
         }
@@ -1728,14 +1739,25 @@ async fn main(_spawner: Spawner) -> ! {
                 Some(fix) => {
                     let cell = map_cell(fix.lat(), fix.lon());
                     let cache_path = map_cache_path(cell.key());
+                    let _lora_cs = lora_cs_high();
                     let card =
                         SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus).ok();
                     let cached = card
                         .as_ref()
-                        .and_then(|c| c.read_file(cache_path.as_str()).ok());
+                        .and_then(|c| c.read_file(cache_path.as_str()).ok())
+                        .map(|body| parse_map(&body, cell.dx(), cell.dy()));
                     match cached {
-                        Some(body) => parse_map(&body, cell.dx(), cell.dy()),
-                        None => {
+                        // parse_map only returns Ready or Error.
+                        Some(view @ MapView::Ready { .. }) => view,
+                        cached => {
+                            // a cached tile that no longer decodes is corrupt
+                            // (e.g. a truncated download from an older build):
+                            // delete it so the fetch below can replace it.
+                            if cached.is_some() {
+                                if let Some(c) = &card {
+                                    c.delete_file(cache_path.as_str()).ok();
+                                }
+                            }
                             let path = map_request_path(cell.key());
                             let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
                             match http_get_map(
@@ -1748,13 +1770,21 @@ async fn main(_spawner: Spawner) -> ! {
                             .await
                             {
                                 Some(body) => {
+                                    let view = parse_map(&body, cell.dx(), cell.dy());
+                                    // only cache a body that decoded, so a bad
+                                    // download can never poison the cache.
                                     if let Some(c) = &card {
-                                        c.create_dir_all(MAP_CACHE_DIR).ok();
-                                        if let Err(e) = c.write_file(cache_path.as_str(), &body) {
-                                            esp_println::println!("gps: cache map failed: {e:?}");
+                                        if matches!(view, MapView::Ready { .. }) {
+                                            c.create_dir_all(MAP_CACHE_DIR).ok();
+                                            if let Err(e) = c.write_file(cache_path.as_str(), &body)
+                                            {
+                                                esp_println::println!(
+                                                    "gps: cache map failed: {e:?}"
+                                                );
+                                            }
                                         }
                                     }
-                                    parse_map(&body, cell.dx(), cell.dy())
+                                    view
                                 }
                                 None => MapView::Error,
                             }
@@ -1784,6 +1814,7 @@ async fn main(_spawner: Spawner) -> ! {
         if current_screen == Screen::Gps && gps_download {
             gps_download = false;
             if let Some(fix) = last_fix {
+                let _lora_cs = lora_cs_high();
                 let card = match SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus)
                 {
                     Ok(c) => Some(c),
@@ -1935,6 +1966,9 @@ async fn main(_spawner: Spawner) -> ! {
             if try_connect(wifi, &wifi_pw_ssid, &wifi_pw_buf).await {
                 settings.set_wifi(&wifi_pw_ssid, &wifi_pw_buf);
                 settings_dirty = true;
+                // a working network was just proven, so retry the clock sync
+                // on the normal cadence again.
+                resync_retry_secs = RETRY_INTERVAL_SECS;
                 wifi_status = format!("connected: {wifi_pw_ssid}");
             } else if reconnect {
                 // the saved password no longer works: drop into the keyboard
