@@ -275,34 +275,6 @@ async fn main(_spawner: Spawner) -> ! {
     delay.delay_millis(10);
     display.clear().expect("to clear");
 
-    // log the fuel gauge's capacity accounting once per boot: a full-charge
-    // capacity far from the real pack shows up as a battery percentage that
-    // tops out early, and a gauge stranded in config-update mode stops
-    // gauging entirely (percentage frozen) — recover from the latter here.
-    match display.fuel_gauge_diagnostics() {
-        Ok(d) => {
-            esp_println::println!("fuel gauge: {d:?}");
-            if d.config_update {
-                match display.fuel_gauge_exit_config_update() {
-                    Ok(()) => esp_println::println!("fuel gauge: exited config-update mode"),
-                    Err(e) => esp_println::println!("fuel gauge: config-update exit failed: {e}"),
-                }
-            }
-            // the gauge's capacity profile is RAM-backed (reset to the 3000
-            // mAh default only if the pack is ever unplugged), so re-program
-            // the real pack capacity whenever the stored value differs.
-            if d.design_mah != BATTERY_MAH {
-                match display.fuel_gauge_program_capacity(BATTERY_MAH) {
-                    Ok(()) => {
-                        esp_println::println!("fuel gauge: programmed {BATTERY_MAH} mAh capacity")
-                    }
-                    Err(e) => esp_println::println!("fuel gauge: capacity programming failed: {e}"),
-                }
-            }
-        }
-        Err(e) => esp_println::println!("fuel gauge: diagnostics read failed: {e}"),
-    }
-
     // one SPI2 bus shared by the SD card and the LoRa radio, owned here and lent
     // out by reference so only a single owner ever exists — no more per-access
     // steal()s of SPI2 and the sclk/mosi/miso lines.
@@ -343,6 +315,37 @@ async fn main(_spawner: Spawner) -> ! {
             g.update().ok();
             delay.delay_millis(20);
         }
+    }
+
+    // log the fuel gauge's capacity accounting once per boot: a full-charge
+    // capacity far from the real pack shows up as a battery percentage that
+    // tops out early, and a gauge stranded in config-update mode stops
+    // gauging entirely (percentage frozen) — recover from the latter here.
+    // this runs after the gps probe: the probe's timing is fragile (see the
+    // comment above) and the capacity programming below can block for a few
+    // seconds when it has to run.
+    match display.fuel_gauge_diagnostics() {
+        Ok(d) => {
+            esp_println::println!("fuel gauge: {d:?}");
+            if d.config_update {
+                match display.fuel_gauge_exit_config_update() {
+                    Ok(()) => esp_println::println!("fuel gauge: exited config-update mode"),
+                    Err(e) => esp_println::println!("fuel gauge: config-update exit failed: {e}"),
+                }
+            }
+            // the gauge's capacity profile is RAM-backed (reset to the 3000
+            // mAh default only if the pack is ever unplugged), so re-program
+            // the real pack capacity whenever the stored value differs.
+            if d.design_mah != BATTERY_MAH {
+                match display.fuel_gauge_program_capacity(BATTERY_MAH) {
+                    Ok(()) => {
+                        esp_println::println!("fuel gauge: programmed {BATTERY_MAH} mAh capacity")
+                    }
+                    Err(e) => esp_println::println!("fuel gauge: capacity programming failed: {e}"),
+                }
+            }
+        }
+        Err(e) => esp_println::println!("fuel gauge: diagnostics read failed: {e}"),
     }
 
     // whether the clock currently holds a real synced time: kept in the RTC
