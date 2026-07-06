@@ -12,12 +12,8 @@ use embedded_graphics::{
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use epub_reader::{chapter_number, decode_image, Epub, GrayImage};
-use esp_hal::{
-    gpio::{Level, Output, OutputConfig},
-    spi::master::Spi,
-    Blocking,
-};
-use t5s3_epaper_core::{sdcard::Error, Display, SdCard};
+use esp_hal::{spi::master::Spi, Blocking};
+use t5s3_epaper_core::{Display, SdCard};
 
 use crate::{
     layout::SCREEN_W,
@@ -99,7 +95,7 @@ pub(crate) fn is_epub(name: &str) -> bool {
 // the cache when possible), read its bookmark, and return the shelf sorted with
 // in-progress books first. self-contained mount, mirroring the file browser.
 pub(crate) fn load_library(bus: &RefCell<Spi<'static, Blocking>>) -> View {
-    let (_lora_cs, card) = match mount(bus) {
+    let card = match crate::sd::mount(bus) {
         Ok(pair) => pair,
         Err(e) => {
             esp_println::println!("library: sd init failed: {e:?}");
@@ -619,19 +615,4 @@ fn cache_key(path: &str, size: u32) -> u32 {
         mix(b);
     }
     hash as u32
-}
-
-// mount the SD card on `bus`, mirroring the file browser/reader: hold the LoRa
-// chip-select high to release MISO for the duration. the returned guard and
-// card must not outlive `bus`.
-fn mount<'a>(
-    bus: &'a RefCell<Spi<'static, Blocking>>,
-) -> Result<(Output<'static>, SdCard<'a, 'static>), Error> {
-    let lora_cs = Output::new(
-        unsafe { esp_hal::peripherals::GPIO46::steal() },
-        Level::High,
-        OutputConfig::default(),
-    );
-    let card = SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, bus)?;
-    Ok((lora_cs, card))
 }

@@ -19,12 +19,8 @@ use epub_reader::{
     Span,
     Style,
 };
-use esp_hal::{
-    gpio::{Level, Output, OutputConfig},
-    spi::master::Spi,
-    Blocking,
-};
-use t5s3_epaper_core::{sdcard::Error, Display, SdCard};
+use esp_hal::{spi::master::Spi, Blocking};
+use t5s3_epaper_core::{Display, SdCard};
 use u8g2_fonts::{
     fonts,
     types::{FontColor, VerticalPosition},
@@ -284,7 +280,7 @@ impl ReaderDoc {
     // section's page count is stored too, so the library can draw a page-refined
     // overall-progress bar without having to paginate the book itself.
     pub(crate) fn save(&self, bus: &RefCell<Spi<'static, Blocking>>) {
-        let Ok((_lora_cs, card)) = mount(bus) else {
+        let Ok(card) = crate::sd::mount(bus) else {
             return;
         };
         card.create_dir_all(PROGRESS_DIR).ok();
@@ -318,7 +314,7 @@ pub(crate) fn load_document(
     path: &str,
     style: ReaderStyle,
 ) -> Result<ReaderDoc, String> {
-    let (_lora_cs, card) = mount(bus).map_err(|e| format!("SD init failed: {e:?}"))?;
+    let card = crate::sd::mount(bus).map_err(|e| format!("SD init failed: {e:?}"))?;
     let bytes = card
         .read_file(path)
         .map_err(|e| format!("read failed: {e:?}"))?;
@@ -755,19 +751,4 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
-}
-
-// mount the SD card on `bus`, mirroring the file browser: hold the LoRa
-// chip-select high to release MISO for the duration. the returned guard and
-// card must not outlive `bus`.
-fn mount<'a>(
-    bus: &'a RefCell<Spi<'static, Blocking>>,
-) -> Result<(Output<'static>, SdCard<'a, 'static>), Error> {
-    let lora_cs = Output::new(
-        unsafe { esp_hal::peripherals::GPIO46::steal() },
-        Level::High,
-        OutputConfig::default(),
-    );
-    let card = SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, bus)?;
-    Ok((lora_cs, card))
 }

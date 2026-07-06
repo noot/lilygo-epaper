@@ -12,7 +12,6 @@ use embedded_graphics::{
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use epub_reader::{decode_image, GrayImage};
-use esp_hal::gpio::{Level, Output, OutputConfig};
 use t5s3_epaper_core::{display::DrawMode, gps::Gps, Display, SdCard};
 
 use crate::{
@@ -341,18 +340,6 @@ pub(crate) fn map_cell(lat: f64, lon: f64) -> MapCell {
         dx: libm::round(px - center_px) as i32,
         dy: libm::round(py - center_py) as i32,
     }
-}
-
-// hold the LoRa chip-select high while the sd card is mounted, mirroring the
-// file browser: the radio is dropped while off its screen, so its floating
-// chip-select would let the idle SX1262 drive MISO on the shared spi bus and
-// break card init. callers keep the guard alive for as long as the card is.
-pub(crate) fn lora_cs_high() -> Output<'static> {
-    Output::new(
-        unsafe { esp_hal::peripherals::GPIO46::steal() },
-        Level::High,
-        OutputConfig::default(),
-    )
 }
 
 // the sd cache path for a cell key.

@@ -10,6 +10,7 @@ mod keyboard;
 mod layout;
 mod pages;
 mod screen;
+mod sd;
 mod settings;
 mod widgets;
 mod wifi;
@@ -43,7 +44,6 @@ use t5s3_epaper_core::{
     Display,
     DrawMode,
     FrontLight,
-    SdCard,
 };
 #[cfg(feature = "gps")]
 use t5s3_epaper_core::{gps::Gps, gps_pin_config};
@@ -59,7 +59,6 @@ use crate::pages::gps::{
     full_touch,
     fullscreen_button_hit,
     gps_data_native_rect,
-    lora_cs_high,
     map_area_tiles,
     map_cache_filename,
     map_cache_path,
@@ -740,11 +739,7 @@ async fn main(spawner: Spawner) -> ! {
                                 // only cache a body that decoded, so a bad
                                 // download can never poison the cache.
                                 if matches!(view, MapView::Ready { .. }) {
-                                    let _lora_cs = lora_cs_high();
-                                    match SdCard::new(
-                                        unsafe { esp_hal::peripherals::GPIO12::steal() },
-                                        &bus,
-                                    ) {
+                                    match sd::mount(&bus) {
                                         Ok(c) => {
                                             c.create_dir_all(MAP_CACHE_DIR).ok();
                                             if let Err(e) =
@@ -781,8 +776,7 @@ async fn main(spawner: Spawner) -> ! {
                     // advance the progress line. non-terminal, so the pending
                     // op is put back with its count advanced.
                     if let Some(Pending::MapArea { total, done, km2 }) = pending {
-                        let _lora_cs = lora_cs_high();
-                        match SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus) {
+                        match sd::mount(&bus) {
                             Ok(c) => {
                                 if let Err(e) = c.write_file(map_cache_path(key).as_str(), &body) {
                                     esp_println::println!(
@@ -992,16 +986,14 @@ async fn main(spawner: Spawner) -> ! {
                 Screen::MapFull => {
                     // stitch the fullscreen map from cached tiles (offline) and
                     // draw the zoom/back controls over it.
-                    let _lora_cs = lora_cs_high();
-                    let card =
-                        match SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus) {
-                            Ok(c) => Some(c),
-                            Err(e) => {
-                                esp_println::println!("gps: fullscreen sd init failed: {e:?}");
-                                None
-                            }
-                        };
-                    render_full_map(&mut display, card.as_ref(), last_fix, full_zoom);
+                    let card = match sd::mount(&bus) {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            esp_println::println!("gps: fullscreen sd init failed: {e:?}");
+                            None
+                        }
+                    };
+                    render_full_map(&mut display, card.as_deref(), last_fix, full_zoom);
                     draw_full_controls(&mut display, full_zoom);
                 }
                 #[cfg(not(feature = "gps"))]
@@ -2006,10 +1998,7 @@ async fn main(spawner: Spawner) -> ! {
                     let cell = map_cell(fix.lat(), fix.lon());
                     let cache_path = map_cache_path(cell.key());
                     let cached = {
-                        let _lora_cs = lora_cs_high();
-                        let card =
-                            SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus)
-                                .ok();
+                        let card = sd::mount(&bus).ok();
                         card.as_ref()
                             .and_then(|c| c.read_file(cache_path.as_str()).ok())
                             .map(|body| parse_map(&body, cell.dx(), cell.dy()))
@@ -2081,9 +2070,7 @@ async fn main(spawner: Spawner) -> ! {
         if current_screen == Screen::Gps && gps_download && wifi_pending.is_none() {
             gps_download = false;
             if let Some(fix) = last_fix {
-                let _lora_cs = lora_cs_high();
-                let card = match SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, &bus)
-                {
+                let card = match sd::mount(&bus) {
                     Ok(c) => Some(c),
                     Err(e) => {
                         esp_println::println!("gps: save-area sd init failed: {e:?}");

@@ -16,12 +16,8 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
-use esp_hal::{
-    gpio::{Level, Output, OutputConfig},
-    spi::master::Spi,
-    Blocking,
-};
-use t5s3_epaper_core::{sdcard::Error, Display, SdCard};
+use esp_hal::{spi::master::Spi, Blocking};
+use t5s3_epaper_core::{sdcard::Error, Display};
 
 use crate::{
     keyboard,
@@ -75,21 +71,6 @@ pub(crate) struct Entry {
     preview: String,
 }
 
-// mount the SD card on `bus`, mirroring the file browser: hold the LoRa
-// chip-select high to release MISO for the duration. the returned guard and
-// card must not outlive `bus`.
-fn mount<'a>(
-    bus: &'a RefCell<Spi<'static, Blocking>>,
-) -> Result<(Output<'static>, SdCard<'a, 'static>), Error> {
-    let lora_cs = Output::new(
-        unsafe { esp_hal::peripherals::GPIO46::steal() },
-        Level::High,
-        OutputConfig::default(),
-    );
-    let card = SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, bus)?;
-    Ok((lora_cs, card))
-}
-
 fn note_path(name: &str) -> String {
     format!("{NOTES_DIR}/{name}")
 }
@@ -109,7 +90,7 @@ fn preview(text: &str) -> Option<String> {
 // each note's first line as its preview. a missing folder is an empty list,
 // not an error, so the page works before the first note is ever saved.
 pub(crate) fn load_list(bus: &RefCell<Spi<'static, Blocking>>) -> Result<Vec<Entry>, Error> {
-    let (_lora_cs, card) = mount(bus)?;
+    let card = crate::sd::mount(bus)?;
     let entries = match card.exists(NOTES_DIR)? {
         true => card.list_dir(NOTES_DIR)?,
         false => Vec::new(),
@@ -165,7 +146,7 @@ pub(crate) fn load_note(
     bus: &RefCell<Spi<'static, Blocking>>,
     name: &str,
 ) -> Result<String, Error> {
-    let (_lora_cs, card) = mount(bus)?;
+    let card = crate::sd::mount(bus)?;
     let bytes = card.read_file(&note_path(name))?;
     Ok(match String::from_utf8_lossy(&bytes) {
         Cow::Borrowed(s) => s.to_string(),
@@ -177,7 +158,7 @@ pub(crate) fn load_note(
 // empty buffer for a note that was never written is skipped, so backing out
 // of an untouched new note leaves no empty file behind.
 pub(crate) fn save(bus: &RefCell<Spi<'static, Blocking>>, name: &str, text: &str) {
-    let (_lora_cs, card) = match mount(bus) {
+    let card = match crate::sd::mount(bus) {
         Ok(mounted) => mounted,
         Err(e) => {
             esp_println::println!("notes: save mount failed: {e:?}");
@@ -197,7 +178,7 @@ pub(crate) fn save(bus: &RefCell<Spi<'static, Blocking>>, name: &str, text: &str
 // remove the note's file from the card. a note that was never saved has no
 // file yet, so deleting it just discards the buffer.
 pub(crate) fn delete(bus: &RefCell<Spi<'static, Blocking>>, name: &str) {
-    let (_lora_cs, card) = match mount(bus) {
+    let card = match crate::sd::mount(bus) {
         Ok(mounted) => mounted,
         Err(e) => {
             esp_println::println!("notes: delete mount failed: {e:?}");

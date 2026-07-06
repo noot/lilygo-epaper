@@ -12,14 +12,8 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
-use esp_hal::{
-    gpio::{Level, Output, OutputConfig},
-    rng::Rng,
-    spi::master::Spi,
-    time::Instant,
-    Blocking,
-};
-use t5s3_epaper_core::{Display, SdCard};
+use esp_hal::{rng::Rng, spi::master::Spi, time::Instant, Blocking};
+use t5s3_epaper_core::Display;
 use tinybmp::Bmp;
 
 use crate::{fmt::FmtBuf, layout::SCREEN_W, widgets::draw_back_button};
@@ -193,16 +187,7 @@ pub(crate) fn draw_power_off_screen(display: &mut Display, pct: u16) {
 // false if the card, file, or bitmap is missing or unreadable so the caller can
 // fall back to the drawn screensaver.
 pub(crate) fn show_wallpaper(display: &mut Display, bus: &RefCell<Spi<'static, Blocking>>) -> bool {
-    // the SD card shares the bus with the LoRa SX1262 radio, which is dropped
-    // while off its screen; its chip-select floats, so hold it high to make the
-    // idle radio release MISO (otherwise SD init returns CardNotFound).
-    let _lora_cs = Output::new(
-        unsafe { esp_hal::peripherals::GPIO46::steal() },
-        Level::High,
-        OutputConfig::default(),
-    );
-
-    let sdcard = match SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, bus) {
+    let sdcard = match crate::sd::mount(bus) {
         Ok(sdcard) => sdcard,
         Err(e) => {
             esp_println::println!("wallpaper: sd init failed: {e:?}");

@@ -12,15 +12,10 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
-use esp_hal::{
-    gpio::{Level, Output, OutputConfig},
-    spi::master::Spi,
-    Blocking,
-};
+use esp_hal::{spi::master::Spi, Blocking};
 use t5s3_epaper_core::{
     sdcard::{DirectoryEntry, Error},
     Display,
-    SdCard,
 };
 use tinybmp::Bmp;
 
@@ -49,20 +44,14 @@ pub(crate) enum Row {
     Entry(usize),
 }
 
-// mount the SD card on the shared `bus` and list a directory, sorted
-// directories-first then by name. the radio is dropped while off its screen, so
-// its chip-select floats: hold it high so the idle SX1262 releases MISO for the
-// duration. the card and the CS guard drop when this returns.
+// mount the SD card on the shared `bus` (via `sd::mount`, which holds the
+// LoRa chip-select for the session) and list a directory, sorted
+// directories-first then by name. the session drops when this returns.
 pub(crate) fn load_dir(
     bus: &RefCell<Spi<'static, Blocking>>,
     path: &str,
 ) -> Result<Vec<DirectoryEntry>, Error> {
-    let _lora_cs = Output::new(
-        unsafe { esp_hal::peripherals::GPIO46::steal() },
-        Level::High,
-        OutputConfig::default(),
-    );
-    let card = SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, bus)?;
+    let card = crate::sd::mount(bus)?;
     let mut entries = card.list_dir(path)?;
     entries.sort_by(|a, b| {
         b.is_directory
@@ -86,12 +75,7 @@ pub(crate) fn view_image(
     display: &mut Display,
     path: &str,
 ) -> bool {
-    let _lora_cs = Output::new(
-        unsafe { esp_hal::peripherals::GPIO46::steal() },
-        Level::High,
-        OutputConfig::default(),
-    );
-    let card = match SdCard::new(unsafe { esp_hal::peripherals::GPIO12::steal() }, bus) {
+    let card = match crate::sd::mount(bus) {
         Ok(card) => card,
         Err(e) => {
             esp_println::println!("files: view sd init failed: {e:?}");
