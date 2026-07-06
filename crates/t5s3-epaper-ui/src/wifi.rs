@@ -57,6 +57,27 @@ const fn parse_port(s: &str) -> u16 {
     }
 }
 
+// where map tiles are fetched from. defaults to noot-server on the LAN, but can
+// be pointed at a public map proxy (set MAP_HOST/MAP_PORT at build time) so
+// maps download anywhere the device has internet, not only on the home network.
+// an empty env value falls back to noot-server, so leaving it unset is safe.
+const MAP_HOST: &str = pick_str(option_env!("MAP_HOST"), SERVER_HOST);
+const MAP_PORT: u16 = pick_port(option_env!("MAP_PORT"), SERVER_PORT);
+
+const fn pick_str(env: Option<&'static str>, fallback: &'static str) -> &'static str {
+    match env {
+        Some(s) if !s.is_empty() => s,
+        _ => fallback,
+    }
+}
+
+const fn pick_port(env: Option<&'static str>, fallback: u16) -> u16 {
+    match env {
+        Some(s) if !s.is_empty() => parse_port(s),
+        _ => fallback,
+    }
+}
+
 const NTP_SERVER: &str = "pool.ntp.org";
 // seconds between the NTP epoch (1900-01-01) and the unix epoch (1970-01-01).
 const NTP_UNIX_DELTA: u64 = 2_208_988_800;
@@ -323,12 +344,49 @@ pub(crate) async fn http_get_from(
     }
 }
 
-// bring wifi up, GET each map path in one session, then power the radio back
-// down. doing a whole area in one bring-up (rather than one per tile) keeps a
-// bulk download to a single ~20s radio start. each fetched tile is handed to
-// `on_tile(key, body)` so the caller can write it to the sd cache as it
-// arrives, keeping only one tile body resident at a time. returns the number of
-// tiles fetched.
+// bring wifi up, GET one map tile from the configured map host (a public proxy
+// if MAP_HOST is set, otherwise noot-server on the LAN), then power the radio
+// back down. mirrors `http_get` but targets the map host rather than the
+// noot-server host used by the music/environment pages.
+pub(crate) async fn http_get_map(
+    wifi: esp_hal::peripherals::WIFI<'static>,
+    ssid: &str,
+    password: &str,
+    path: &str,
+    max_body: usize,
+) -> Option<Vec<u8>> {
+    let mut controller = station_controller(wifi, ssid, password)?;
+
+    let rng = Rng::new();
+    let seed = (rng.random() as u64) << 32 | rng.random() as u64;
+    let mut resources = StackResources::<3>::new();
+    let (stack, mut runner) = embassy_net::new(
+        Interface::station(),
+        embassy_net::Config::dhcpv4(Default::default()),
+        &mut resources,
+        seed,
+    );
+
+    let outcome = select(runner.run(), async {
+        if !bring_up(&mut controller, stack).await {
+            return None;
+        }
+        request_host(stack, MAP_HOST, MAP_PORT, path, max_body).await
+    })
+    .await;
+
+    match outcome {
+        Either::First(_) => None,
+        Either::Second(body) => body,
+    }
+}
+
+// bring wifi up, GET each map path from the configured map host in one session,
+// then power the radio back down. doing a whole area in one bring-up (rather
+// than one per tile) keeps a bulk download to a single ~20s radio start. each
+// fetched tile is handed to `on_tile(key, body)` so the caller can write it to
+// the sd cache as it arrives, keeping only one tile body resident at a time.
+// returns the number of tiles fetched.
 pub(crate) async fn download_maps<F>(
     wifi: esp_hal::peripherals::WIFI<'static>,
     ssid: &str,
@@ -355,13 +413,12 @@ where
     );
 
     let outcome = select(runner.run(), async {
-        controller.connect_async().await.ok()?;
-        with_timeout(Duration::from_secs(15), stack.wait_config_up())
-            .await
-            .ok()?;
+        if !bring_up(&mut controller, stack).await {
+            return None;
+        }
         let mut fetched = 0usize;
         for (key, path) in tiles {
-            if let Some(body) = request(stack, "GET", path, max_body).await {
+            if let Some(body) = request_host(stack, MAP_HOST, MAP_PORT, path, max_body).await {
                 on_tile(*key, &body);
                 fetched += 1;
             }
@@ -496,6 +553,22 @@ async fn request(stack: Stack<'_>, method: &str, path: &str, max_body: usize) ->
 // decode. `host` is resolved over DNS (a public weather api, unlike
 // noot-server, lives at a hostname).
 async fn request_ext(stack: Stack<'_>, host: &str, path: &str) -> Option<Vec<u8>> {
+    // a forecast response is a few kB; cap well before the heap is at risk.
+    request_host(stack, host, 80, path, 16 * 1024).await
+}
+
+// one plain-http GET to `host:port` (HTTP/1.0 so the body comes back
+// connection-close rather than chunked, which this minimal read-until-close
+// client can't decode), returning the response body for a 2xx status. `host` is
+// used verbatim if it parses as an IPv4 address, otherwise resolved over DNS.
+// `max_body` caps how much body is buffered.
+async fn request_host(
+    stack: Stack<'_>,
+    host: &str,
+    port: u16,
+    path: &str,
+    max_body: usize,
+) -> Option<Vec<u8>> {
     let addr = match host.parse::<Ipv4Addr>() {
         Ok(ip) => IpAddress::Ipv4(ip),
         Err(_) => *stack.dns_query(host, DnsQueryType::A).await.ok()?.first()?,
@@ -505,7 +578,7 @@ async fn request_ext(stack: Stack<'_>, host: &str, path: &str) -> Option<Vec<u8>
     let mut tx = [0u8; 1536];
     let mut socket = TcpSocket::new(stack, &mut rx, &mut tx);
     socket.set_timeout(Some(Duration::from_secs(8)));
-    socket.connect(IpEndpoint::new(addr, 80)).await.ok()?;
+    socket.connect(IpEndpoint::new(addr, port)).await.ok()?;
 
     let mut req = String::new();
     write!(
@@ -522,9 +595,7 @@ async fn request_ext(stack: Stack<'_>, host: &str, path: &str) -> Option<Vec<u8>
             Ok(0) => break,
             Ok(n) => {
                 resp.extend_from_slice(&chunk[..n]);
-                // a forecast response is a few kB; stop well before the heap is at
-                // risk if the server misbehaves.
-                if resp.len() > 16 * 1024 {
+                if resp.len() > max_body + 2048 {
                     break;
                 }
             }

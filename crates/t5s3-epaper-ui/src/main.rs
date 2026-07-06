@@ -14,7 +14,7 @@ mod settings;
 mod widgets;
 mod wifi;
 
-use alloc::{format, string::String, vec::Vec};
+use alloc::{collections::BTreeSet, format, string::String, vec::Vec};
 
 use embassy_executor::Spawner;
 use embedded_graphics::{
@@ -59,12 +59,14 @@ use crate::pages::gps::{
     fullscreen_button_hit,
     gps_data_native_rect,
     map_area_tiles,
+    map_cache_filename,
     map_cache_path,
     map_cell,
     map_request_path,
     parse_map,
     refresh_map_panel,
     render_full_map,
+    show_download_progress,
     FullAction,
     GpsFix,
     MapView,
@@ -161,6 +163,7 @@ use crate::{
         download_maps,
         http_get,
         http_get_from,
+        http_get_map,
         music_session,
         scan as wifi_scan,
         set_utc_time,
@@ -1552,7 +1555,7 @@ async fn main(_spawner: Spawner) -> ! {
                         None => {
                             let path = map_request_path(cell.key());
                             let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-                            match http_get(
+                            match http_get_map(
                                 wifi,
                                 settings.wifi_ssid(),
                                 settings.wifi_password(),
@@ -1606,14 +1609,25 @@ async fn main(_spawner: Spawner) -> ! {
                         None
                     }
                 };
-                // keep only the cells not already cached.
+                // keep only the cells not already cached. list the cache dir
+                // once (uppercased names) and membership-test each tile, rather
+                // than a per-tile lookup — far cheaper for a few hundred tiles.
                 let missing: Vec<(u32, String)> = match &card {
                     Some(c) => {
                         c.create_dir_all(MAP_CACHE_DIR).ok();
+                        let existing: BTreeSet<String> = c
+                            .list_dir(MAP_CACHE_DIR)
+                            .map(|entries| {
+                                entries
+                                    .into_iter()
+                                    .map(|e| e.name.to_ascii_uppercase())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
                         map_area_tiles(fix.lat(), fix.lon(), DOWNLOAD_RADIUS)
                             .into_iter()
                             .filter(|(key, _)| {
-                                !c.exists(map_cache_path(*key).as_str()).unwrap_or(false)
+                                !existing.contains(map_cache_filename(*key).as_str())
                             })
                             .collect()
                     }
@@ -1633,6 +1647,9 @@ async fn main(_spawner: Spawner) -> ! {
                         refresh_map_panel(&mut display, &gps_map);
 
                         let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
+                        // refresh the progress line ~20 times over the download.
+                        let step = (total / 20).max(1);
+                        let mut done = 0usize;
                         let saved = download_maps(
                             wifi,
                             settings.wifi_ssid(),
@@ -1644,6 +1661,10 @@ async fn main(_spawner: Spawner) -> ! {
                                     esp_println::println!(
                                         "gps: cache tile {key:08X} failed: {e:?}"
                                     );
+                                }
+                                done += 1;
+                                if done.is_multiple_of(step) || done == total {
+                                    show_download_progress(&mut display, done, total);
                                 }
                             },
                         )

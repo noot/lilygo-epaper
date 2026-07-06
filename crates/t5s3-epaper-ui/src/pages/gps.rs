@@ -222,9 +222,15 @@ pub(crate) const MAP_MAX_BYTES: usize = 256 * 1024;
 // where fetched maps are cached. 8.3-safe: a <=8 char dir plus files named from
 // a 32-bit cell key (8 hex chars) with a 3-char extension.
 pub(crate) const MAP_CACHE_DIR: &str = "/MAPS";
-// how far out from the fix's cell `save area` pre-downloads, in cells. radius 2
-// => a 5x5 block (~7-8 km across at MAP_ZOOM).
-pub(crate) const DOWNLOAD_RADIUS: i32 = 2;
+// how far out from the fix's cell `save area` pre-downloads, in cells. each
+// cell is ~1.6 km at MAP_ZOOM, so radius 8 => a 17x17 block (~27 km across,
+// ~289 tiles). the ceiling is practical, not technical: the download blocks the
+// ui while it runs (~10-15 min for 289 tiles) and each tile makes the server
+// pull several OpenStreetMap tiles, so a much larger radius is both a very long
+// freeze and impolite to OSM. raise it if you accept those costs; genuinely
+// huge areas need a coarser zoom instead (street detail can't cover hundreds of
+// km).
+pub(crate) const DOWNLOAD_RADIUS: i32 = 8;
 
 // the "save area" button overlaid on the top-right of the map panel.
 const DL_BTN_W: u32 = 150;
@@ -340,6 +346,14 @@ pub(crate) fn map_cell(lat: f64, lon: f64) -> MapCell {
 pub(crate) fn map_cache_path(key: u32) -> FmtBuf<24> {
     let mut buf = FmtBuf::<24>::new();
     write!(buf, "{MAP_CACHE_DIR}/{key:08X}.JPG").ok();
+    buf
+}
+
+// the cache filename (no directory) for a cell key, for matching a cell against
+// a directory listing without a per-tile filesystem lookup.
+pub(crate) fn map_cache_filename(key: u32) -> FmtBuf<16> {
+    let mut buf = FmtBuf::<16>::new();
+    write!(buf, "{key:08X}.JPG").ok();
     buf
 }
 
@@ -483,6 +497,30 @@ pub(crate) fn refresh_map_panel(display: &mut Display, view: &MapView) {
     draw_map(display, view);
     display
         .flush_partial(map_panel_native_rect(), DrawMode::BlackOnWhite)
+        .ok();
+}
+
+// update the "saving area: done/total" line on a white strip across the panel
+// center and fast-refresh just that strip, so a long save-area download shows
+// progress instead of a silent frozen screen. called periodically mid-download.
+pub(crate) fn show_download_progress(display: &mut Display, done: usize, total: usize) {
+    let strip_y = MAP_Y + MAP_H as i32 / 2 - 15;
+    Rectangle::new(Point::new(MAP_X, strip_y), Size::new(MAP_W, 30))
+        .into_styled(PrimitiveStyle::with_fill(Gray4::WHITE))
+        .draw(display)
+        .ok();
+    let mut buf = FmtBuf::<40>::new();
+    write!(buf, "saving area: {done}/{total}...").ok();
+    Text::with_alignment(
+        buf.as_str(),
+        Point::new(MAP_X + MAP_W as i32 / 2, strip_y + 20),
+        MonoTextStyle::new(&FONT_6X10, Gray4::BLACK),
+        Alignment::Center,
+    )
+    .draw(display)
+    .ok();
+    display
+        .flush_partial_fast(screen_to_native_rect(MAP_X, strip_y, MAP_W as i32, 30))
         .ok();
 }
 
