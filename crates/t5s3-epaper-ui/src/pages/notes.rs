@@ -52,6 +52,14 @@ const DOWN_BTN_X: i32 = 195;
 const NEW_BTN_X: i32 = 365;
 const PREVIEW_CHARS: usize = 40;
 
+// the delete button shares the editor's title row: the status bar's battery
+// indicator occupies the screen's top-right corner, so the row below it is
+// the free spot opposite the centered note name.
+const DELETE_X: i32 = 410;
+const DELETE_Y: i32 = 66;
+const DELETE_W: i32 = 120;
+const DELETE_H: i32 = 30;
+
 // the editor's text area sits between the status bar and the keyboard.
 const EDIT_X: i32 = 20;
 const EDIT_Y: i32 = 100;
@@ -186,6 +194,25 @@ pub(crate) fn save(bus: &RefCell<Spi<'static, Blocking>>, name: &str, text: &str
     }
 }
 
+// remove the note's file from the card. a note that was never saved has no
+// file yet, so deleting it just discards the buffer.
+pub(crate) fn delete(bus: &RefCell<Spi<'static, Blocking>>, name: &str) {
+    let (_lora_cs, card) = match mount(bus) {
+        Ok(mounted) => mounted,
+        Err(e) => {
+            esp_println::println!("notes: delete mount failed: {e:?}");
+            return;
+        }
+    };
+    let path = note_path(name);
+    if !card.exists(&path).unwrap_or(false) {
+        return;
+    }
+    if let Err(e) = card.delete_file(&path) {
+        esp_println::println!("notes: delete {name} failed: {e:?}");
+    }
+}
+
 pub(crate) fn list_hit(sx: i32, sy: i32, count: usize, scroll: usize) -> Option<usize> {
     if !(LIST_X..LIST_X + LIST_W).contains(&sx) || !(LIST_TOP..LIST_TOP + LIST_H).contains(&sy) {
         return None;
@@ -209,6 +236,34 @@ pub(crate) fn scroll_down_hit(sx: i32, sy: i32) -> bool {
 
 pub(crate) fn new_hit(sx: i32, sy: i32) -> bool {
     button_hit(sx, sy, NEW_BTN_X)
+}
+
+pub(crate) fn delete_hit(sx: i32, sy: i32) -> bool {
+    sx >= DELETE_X && (55..DELETE_Y + DELETE_H).contains(&sy)
+}
+
+// the editor's delete button: deleting is destructive, so the first tap only
+// arms it ("Sure?") and the second deletes; any other tap disarms it.
+pub(crate) fn draw_delete_button(display: &mut Display, armed: bool) {
+    Rectangle::new(
+        Point::new(DELETE_X, DELETE_Y),
+        Size::new(DELETE_W as u32, DELETE_H as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(Gray4::WHITE))
+    .draw(display)
+    .ok();
+    Text::with_alignment(
+        if armed { "Sure?" } else { "Delete" },
+        Point::new(DELETE_X + DELETE_W, 88),
+        MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK),
+        Alignment::Right,
+    )
+    .draw(display)
+    .ok();
+}
+
+pub(crate) fn delete_native_rect() -> t5s3_epaper_core::display::Rectangle {
+    screen_to_native_rect(DELETE_X, DELETE_Y, DELETE_W, DELETE_H)
 }
 
 fn draw_button(display: &mut Display, x: i32, label: &str) {
@@ -399,6 +454,7 @@ pub(crate) fn draw_edit_screen(
     text: &str,
     symbols: bool,
     shift: bool,
+    delete_armed: bool,
 ) {
     draw_back_button(display);
     let title = name.rsplit_once('.').map_or(name, |(base, _)| base);
@@ -410,6 +466,7 @@ pub(crate) fn draw_edit_screen(
     )
     .draw(display)
     .ok();
+    draw_delete_button(display, delete_armed);
     draw_note_text(display, text);
     keyboard::draw(display, symbols, shift, "RET");
 }

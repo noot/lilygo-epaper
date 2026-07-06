@@ -410,6 +410,8 @@ async fn main(_spawner: Spawner) -> ! {
     let mut note_name = String::new();
     let mut note_text = String::new();
     let mut note_dirty = false;
+    // whether the editor's delete button is armed (two-tap confirm).
+    let mut note_delete_armed = false;
 
     // reader state: the open text file, its paginated document (None if the
     // load failed), the current page, and a flag that the document needs
@@ -662,6 +664,7 @@ async fn main(_spawner: Spawner) -> ! {
                     &note_text,
                     kb_symbols,
                     kb_shift,
+                    note_delete_armed,
                 ),
                 Screen::Environment => environment::draw_screen(&mut display, &env_view),
                 Screen::Weather => weather::draw_screen(&mut display, &weather_view),
@@ -1099,6 +1102,7 @@ async fn main(_spawner: Spawner) -> ! {
                                     note_text.clear();
                                     kb_symbols = false;
                                     kb_shift = false;
+                                    note_delete_armed = false;
                                     current_screen = Screen::NoteEdit;
                                     needs_redraw = true;
                                 }
@@ -1115,6 +1119,7 @@ async fn main(_spawner: Spawner) -> ! {
                                 note_name = entry.name.clone();
                                 kb_symbols = false;
                                 kb_shift = false;
+                                note_delete_armed = false;
                                 // the editor draws only after the note's text is
                                 // read (below), mirroring the reader.
                                 note_dirty = true;
@@ -1129,38 +1134,56 @@ async fn main(_spawner: Spawner) -> ! {
                             // preview is current.
                             notes_dirty = true;
                             current_screen = Screen::Notes;
-                        } else if let Some(key) = keyboard::hit(sx, sy, kb_symbols, kb_shift) {
-                            match key {
-                                Key::Shift => {
-                                    kb_shift = !kb_shift;
-                                    keyboard::draw(&mut display, kb_symbols, kb_shift, "RET");
-                                    display.flush_partial_fast(keyboard::native_rect()).ok();
-                                }
-                                Key::Symbols => {
-                                    kb_symbols = !kb_symbols;
-                                    keyboard::draw(&mut display, kb_symbols, kb_shift, "RET");
-                                    display.flush_partial_fast(keyboard::native_rect()).ok();
-                                }
-                                other => {
-                                    match other {
-                                        Key::Char(c) if note_text.len() < notes::NOTE_MAX => {
-                                            note_text.push(c)
-                                        }
-                                        Key::Space if note_text.len() < notes::NOTE_MAX => {
-                                            note_text.push(' ')
-                                        }
-                                        Key::Enter if note_text.len() < notes::NOTE_MAX => {
-                                            note_text.push('\n')
-                                        }
-                                        Key::Backspace => {
-                                            note_text.pop();
-                                        }
-                                        _ => {}
+                        } else if notes::delete_hit(sx, sy) {
+                            if note_delete_armed {
+                                notes::delete(&bus, &note_name);
+                                notes_dirty = true;
+                                current_screen = Screen::Notes;
+                            } else {
+                                note_delete_armed = true;
+                                notes::draw_delete_button(&mut display, true);
+                                display.flush_partial_fast(notes::delete_native_rect()).ok();
+                            }
+                        } else {
+                            // any tap besides the second delete tap disarms it.
+                            if note_delete_armed {
+                                note_delete_armed = false;
+                                notes::draw_delete_button(&mut display, false);
+                                display.flush_partial_fast(notes::delete_native_rect()).ok();
+                            }
+                            if let Some(key) = keyboard::hit(sx, sy, kb_symbols, kb_shift) {
+                                match key {
+                                    Key::Shift => {
+                                        kb_shift = !kb_shift;
+                                        keyboard::draw(&mut display, kb_symbols, kb_shift, "RET");
+                                        display.flush_partial_fast(keyboard::native_rect()).ok();
                                     }
-                                    notes::draw_note_text(&mut display, &note_text);
-                                    display
-                                        .flush_partial_fast(notes::text_area_native_rect())
-                                        .ok();
+                                    Key::Symbols => {
+                                        kb_symbols = !kb_symbols;
+                                        keyboard::draw(&mut display, kb_symbols, kb_shift, "RET");
+                                        display.flush_partial_fast(keyboard::native_rect()).ok();
+                                    }
+                                    other => {
+                                        match other {
+                                            Key::Char(c) if note_text.len() < notes::NOTE_MAX => {
+                                                note_text.push(c)
+                                            }
+                                            Key::Space if note_text.len() < notes::NOTE_MAX => {
+                                                note_text.push(' ')
+                                            }
+                                            Key::Enter if note_text.len() < notes::NOTE_MAX => {
+                                                note_text.push('\n')
+                                            }
+                                            Key::Backspace => {
+                                                note_text.pop();
+                                            }
+                                            _ => {}
+                                        }
+                                        notes::draw_note_text(&mut display, &note_text);
+                                        display
+                                            .flush_partial_fast(notes::text_area_native_rect())
+                                            .ok();
+                                    }
                                 }
                             }
                         }
