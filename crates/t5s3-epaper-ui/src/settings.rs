@@ -545,6 +545,22 @@ impl Settings {
         self.wifi_network_count = new_count as u8;
     }
 
+    // drop the saved entry for `ssid`, if any, shifting later entries up.
+    pub(crate) fn forget_wifi(&mut self, ssid: &str) {
+        let count = (self.wifi_network_count as usize).min(WIFI_NETWORK_CAP);
+        let Some(pos) = self.wifi_networks[..count]
+            .iter()
+            .position(|net| net.ssid() == ssid)
+        else {
+            return;
+        };
+        for i in pos..count - 1 {
+            self.wifi_networks[i] = self.wifi_networks[i + 1];
+        }
+        self.wifi_networks[count - 1] = WifiNetwork::EMPTY;
+        self.wifi_network_count = (count - 1) as u8;
+    }
+
     pub(crate) fn reader_style(&self) -> ReaderStyle {
         ReaderStyle {
             size: self.reader_font_size,

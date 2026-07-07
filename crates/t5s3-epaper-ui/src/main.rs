@@ -1429,7 +1429,8 @@ async fn main(_spawner: Spawner) -> ! {
                                 }
                             }
                         } else {
-                            match settings_page::wifi::status_hit(sx, sy, wifi_networks.len()) {
+                            match settings_page::wifi::status_hit(sx, sy, &wifi_networks, &settings)
+                            {
                                 Some(settings_page::wifi::Hit::Back) => {
                                     current_screen = Screen::Settings;
                                     needs_redraw = true;
@@ -1479,6 +1480,17 @@ async fn main(_spawner: Spawner) -> ! {
                                                 wifi_status = String::from("connecting...");
                                             }
                                         }
+                                        needs_redraw = true;
+                                    }
+                                }
+                                Some(settings_page::wifi::Hit::Forget(i)) => {
+                                    if let Some(entry) = wifi_networks.get(i) {
+                                        settings.forget_wifi(&entry.ssid);
+                                        // persist immediately, like a join: the
+                                        // user expects the credentials gone.
+                                        settings.save();
+                                        settings_dirty = false;
+                                        wifi_status = format!("forgot {}", entry.ssid);
                                         needs_redraw = true;
                                     }
                                 }

@@ -4,7 +4,7 @@ use embedded_graphics::{
         MonoTextStyle,
     },
     prelude::*,
-    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
+    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle},
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
@@ -32,6 +32,14 @@ const ROW_H: i32 = 62;
 // how many scanned networks fit on the page below the scan button.
 pub(crate) const LIST_VISIBLE: usize = 9;
 
+// per-row Forget button, drawn only on saved networks (it doubles as the
+// saved marker). sits between the name (26 chars ends at x=278) and the
+// signal bars (x=410).
+const FORGET_BTN_X: i32 = 300;
+const FORGET_BTN_W: u32 = 90;
+const FORGET_BTN_H: u32 = 44;
+const FORGET_BTN_DY: i32 = (ROW_H - FORGET_BTN_H as i32) / 2;
+
 const PW_BOX_X: i32 = 30;
 const PW_BOX_Y: i32 = 195;
 const PW_BOX_W: u32 = 480;
@@ -42,13 +50,19 @@ pub(crate) enum Hit {
     Scan,
     Sync,
     Network(usize),
+    Forget(usize),
 }
 
 fn row_y(i: usize) -> i32 {
     LIST_TOP + i as i32 * ROW_H
 }
 
-pub(crate) fn status_hit(sx: i32, sy: i32, network_count: usize) -> Option<Hit> {
+pub(crate) fn status_hit(
+    sx: i32,
+    sy: i32,
+    networks: &[ScanEntry],
+    settings: &Settings,
+) -> Option<Hit> {
     if crate::widgets::back_button_hit(sx, sy) {
         return Some(Hit::Back);
     }
@@ -58,10 +72,25 @@ pub(crate) fn status_hit(sx: i32, sy: i32, network_count: usize) -> Option<Hit> 
     if in_rect(sx, sy, SYNC_BTN_X, SCAN_BTN_Y, SYNC_BTN_W, BTN_H) {
         return Some(Hit::Sync);
     }
-    for i in 0..network_count.min(LIST_VISIBLE) {
-        if in_rect(sx, sy, 30, row_y(i), (SCREEN_W - 60) as u32, ROW_H as u32) {
-            return Some(Hit::Network(i));
+    for (i, entry) in networks.iter().take(LIST_VISIBLE).enumerate() {
+        if !in_rect(sx, sy, 30, row_y(i), (SCREEN_W - 60) as u32, ROW_H as u32) {
+            continue;
         }
+        // the Forget button exists only on saved rows; anywhere else on the
+        // row (re)connects.
+        if settings.saved_wifi_password(&entry.ssid).is_some()
+            && in_rect(
+                sx,
+                sy,
+                FORGET_BTN_X,
+                row_y(i) + FORGET_BTN_DY,
+                FORGET_BTN_W,
+                FORGET_BTN_H,
+            )
+        {
+            return Some(Hit::Forget(i));
+        }
+        return Some(Hit::Network(i));
     }
     None
 }
@@ -160,8 +189,8 @@ pub(crate) fn draw_status(
         .draw(display)
         .ok();
 
-        // a saved network joins on tap without a password prompt; tag it so
-        // that's visible in the list. keep the tag clear of the signal bars.
+        // a saved network joins on tap without a password prompt; its Forget
+        // button doubles as the saved marker and drops the stored credentials.
         let saved = settings.saved_wifi_password(&entry.ssid).is_some();
         let name = truncate(&entry.ssid, if saved { 26 } else { 34 });
         Text::with_alignment(
@@ -173,14 +202,27 @@ pub(crate) fn draw_status(
         .draw(display)
         .ok();
         if saved {
-            Text::with_alignment(
-                "saved",
-                Point::new(
-                    44 + (name.chars().count() as i32 * 9) + 14,
-                    y + ROW_H / 2 + 5,
+            RoundedRectangle::with_equal_corners(
+                Rectangle::new(
+                    Point::new(FORGET_BTN_X, y + FORGET_BTN_DY),
+                    Size::new(FORGET_BTN_W, FORGET_BTN_H),
                 ),
-                MonoTextStyle::new(&FONT_9X15, Gray4::new(6)),
-                Alignment::Left,
+                Size::new(8, 8),
+            )
+            .into_styled(
+                PrimitiveStyleBuilder::new()
+                    .stroke_color(Gray4::BLACK)
+                    .stroke_width(2)
+                    .fill_color(Gray4::WHITE)
+                    .build(),
+            )
+            .draw(display)
+            .ok();
+            Text::with_alignment(
+                "Forget",
+                Point::new(FORGET_BTN_X + FORGET_BTN_W as i32 / 2, y + ROW_H / 2 + 5),
+                MonoTextStyle::new(&FONT_9X15, Gray4::BLACK),
+                Alignment::Center,
             )
             .draw(display)
             .ok();
