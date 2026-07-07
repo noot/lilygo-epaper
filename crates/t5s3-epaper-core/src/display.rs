@@ -93,6 +93,9 @@ pub struct Display<'a> {
     previous_framebuffer: Box<[u8; FRAMEBUFFER_SIZE]>,
     tainted_rows: [u8; TAINTED_ROWS_SIZE],
     rotation: DisplayRotation,
+    // reusable waveform lookup table (64 KiB), rebuilt at the start of every
+    // flush and kept allocated so the refresh hot path does no heap work.
+    lut: Vec<u8>,
 }
 
 impl<'a> Display<'a> {
@@ -121,6 +124,7 @@ impl<'a> Display<'a> {
             previous_framebuffer: Box::new([0xFF; FRAMEBUFFER_SIZE]),
             tainted_rows: [0; TAINTED_ROWS_SIZE],
             rotation: DisplayRotation::default(),
+            lut: vec![0; 1 << 16],
         })
     }
 
@@ -325,7 +329,7 @@ impl<'a> Display<'a> {
     /// contents of your framebuffer.
     pub fn flush(&mut self, mode: DrawMode) -> Result<()> {
         debug!("display flush");
-        self.draw(mode)?;
+        self.draw(mode, Self::BOUNDING_BOX)?;
         self.tainted_rows.fill(0);
         self.previous_framebuffer
             .copy_from_slice(&*self.framebuffer);
@@ -369,12 +373,13 @@ impl<'a> Display<'a> {
 
     /// Partial grayscale update limited to `area`.
     ///
-    /// Like [`Display::flush`] this uses the full grayscale waveform, but it
-    /// only writes rows that were drawn (which the caller must keep within
-    /// `area`) and only updates the diff state for `area`, so the rest of the
-    /// panel is left untouched — no whole-screen flash. Use this for a
-    /// grayscale region (e.g. an image panel) that must refresh on its own
-    /// without redrawing the whole page.
+    /// Like [`Display::flush`] this uses the full grayscale waveform, but the
+    /// drive is clipped to `area`: rows and columns outside it are left
+    /// untouched on the panel, and anything drawn outside `area` is discarded
+    /// rather than driven, so the rest of the panel neither flashes nor has
+    /// its diff state desynced. Use this for a grayscale region (e.g. an
+    /// image panel) that must refresh on its own without redrawing the whole
+    /// page.
     pub fn flush_partial(&mut self, area: Rectangle, mode: DrawMode) -> Result<()> {
         let area = self.clip_rectangle(area);
         if area.width == 0 || area.height == 0 {
@@ -382,7 +387,7 @@ impl<'a> Display<'a> {
         }
 
         debug!("display flush partial");
-        self.draw(mode)?;
+        self.draw(mode, area)?;
         copy_rect(&mut self.previous_framebuffer, &self.framebuffer, area);
         self.framebuffer.fill(0xFF);
         self.tainted_rows.fill(0);
@@ -420,11 +425,13 @@ impl<'a> Display<'a> {
     }
 
     fn draw_partial_du(&mut self, area: Rectangle) -> Result<()> {
-        let mut lut = vec![0u8; 1 << 16];
+        // the du lut depends only on the fixed phase table: build it once for
+        // all frames, in the display-owned buffer (no allocation).
+        update_du_lut(&mut self.lut, &DU_LUT_PHASE);
         let mut line = [0u8; LINE_BYTES_DIFFERENCE];
+        let mut buf = [0u8; BYTES_PER_LINE];
 
         for output_time in DU_FRAME_TIMES {
-            update_du_lut(&mut lut, &DU_LUT_PHASE);
             self.skipping = 0;
             self.epd.frame_start()?;
 
@@ -444,8 +451,8 @@ impl<'a> Display<'a> {
                     continue;
                 }
 
-                let buf = prepare_dma_difference_buffer(&line, &lut);
-                self.epd.set_buffer(buf.as_slice())?;
+                prepare_dma_difference_buffer(&line, &self.lut, &mut buf);
+                self.epd.set_buffer(&buf)?;
                 self.row_write(output_time)?;
             }
 
@@ -539,29 +546,49 @@ impl<'a> Display<'a> {
     }
 
     const DRAW_IMAGE_FRAME_COUNT: usize = 15;
-    fn draw(&mut self, mode: DrawMode) -> Result<()> {
+    fn draw(&mut self, mode: DrawMode, area: Rectangle) -> Result<()> {
         // let start = esp_hal::time::current_time();
 
-        // init lut
-        let mut lut = vec![mode.lut_default(); 1 << 16];
+        // init lut (display-owned; no allocation on the refresh path)
+        self.lut.fill(mode.lut_default());
 
+        // for a partial flush, mask the drive ops of pixels outside the
+        // area's columns to no-ops (2 bits per pixel, low bits first), so the
+        // rest of a row is left untouched on the panel — the same clipping
+        // the du path gets from its difference line.
+        let full_width = area.x == 0 && area.width == Self::WIDTH;
+        let mut mask = [0u8; BYTES_PER_LINE];
+        if full_width {
+            mask.fill(0xFF);
+        } else {
+            for x in area.x..area.x + area.width {
+                mask[x as usize / 4] |= 0b11 << (2 * (x as usize % 4));
+            }
+        }
+
+        let mut buf = [0u8; BYTES_PER_LINE];
         for k in 0..Self::DRAW_IMAGE_FRAME_COUNT {
             // update lut
-            update_lut(&mut lut, k, mode);
+            update_lut(&mut self.lut, k, mode);
             // start draw
             self.skipping = 0;
             self.epd.frame_start()?;
             // build line
             for y in 0..Self::HEIGHT {
-                if !self.is_tainted(y) {
+                if y < area.y || y >= area.y + area.height || !self.is_tainted(y) {
                     self.row_skip(mode.contrast_cycles()[k])?;
                     continue;
                 }
                 let start = y as usize * LINE_BYTES_4BPP;
                 let end = start + LINE_BYTES_4BPP;
                 // draw
-                let buf = prepare_dma_buffer(&self.framebuffer[start..end], &lut);
-                self.epd.set_buffer(buf.as_slice())?;
+                prepare_dma_buffer(&self.framebuffer[start..end], &self.lut, &mut buf);
+                if !full_width {
+                    for (b, m) in buf.iter_mut().zip(mask.iter()) {
+                        *b &= m;
+                    }
+                }
+                self.epd.set_buffer(&buf)?;
                 self.row_write(mode.contrast_cycles()[k])?;
             }
             if self.skipping == 0 {
@@ -588,46 +615,34 @@ fn line_buffer_reorder(data: &mut [u8]) {
     }
 }
 
-fn prepare_dma_buffer(line_data: &[u8], conversion_lut: &[u8]) -> Vec<u8> {
-    let mut epd_input = vec![0u8; BYTES_PER_LINE];
-    let mut wide_epd_input: Vec<u32> = vec![0u32; Display::WIDTH as usize / 16];
-
-    let line_data_16: Vec<u16> = line_data
-        .chunks(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-        .collect();
-
-    for (j, chunk) in line_data_16.chunks(4).enumerate() {
-        if let [v1, v2, v3, v4] = chunk {
-            let pixel: u32 = (conversion_lut[*v1 as usize] as u32)
-                | (conversion_lut[*v2 as usize] as u32) << 8
-                | (conversion_lut[*v3 as usize] as u32) << 16
-                | (conversion_lut[*v4 as usize] as u32) << 24;
-            wide_epd_input[j] = pixel;
-        }
+fn prepare_dma_buffer(
+    line_data: &[u8],
+    conversion_lut: &[u8],
+    epd_input: &mut [u8; BYTES_PER_LINE],
+) {
+    for (j, chunk) in line_data.chunks_exact(8).enumerate() {
+        let v1 = u16::from_le_bytes([chunk[0], chunk[1]]) as usize;
+        let v2 = u16::from_le_bytes([chunk[2], chunk[3]]) as usize;
+        let v3 = u16::from_le_bytes([chunk[4], chunk[5]]) as usize;
+        let v4 = u16::from_le_bytes([chunk[6], chunk[7]]) as usize;
+        let pixel: u32 = (conversion_lut[v1] as u32)
+            | (conversion_lut[v2] as u32) << 8
+            | (conversion_lut[v3] as u32) << 16
+            | (conversion_lut[v4] as u32) << 24;
+        epd_input[j * 4..(j + 1) * 4].copy_from_slice(&pixel.to_le_bytes());
     }
-
-    for (i, &wide_pixel) in wide_epd_input.iter().enumerate() {
-        epd_input[i * 4..(i + 1) * 4].copy_from_slice(&wide_pixel.to_le_bytes());
-    }
-
-    epd_input
 }
 
-fn prepare_dma_difference_buffer(line_data: &[u8], conversion_lut: &[u8]) -> Vec<u8> {
-    let mut epd_input = vec![0u8; BYTES_PER_LINE];
-    let line_data_16: Vec<u16> = line_data
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-        .collect();
-
-    for j in 0..BYTES_PER_LINE {
-        let v1 = line_data_16[2 * j] as usize;
-        let v2 = line_data_16[2 * j + 1] as usize;
+fn prepare_dma_difference_buffer(
+    line_data: &[u8],
+    conversion_lut: &[u8],
+    epd_input: &mut [u8; BYTES_PER_LINE],
+) {
+    for (j, chunk) in line_data.chunks_exact(4).enumerate() {
+        let v1 = u16::from_le_bytes([chunk[0], chunk[1]]) as usize;
+        let v2 = u16::from_le_bytes([chunk[2], chunk[3]]) as usize;
         epd_input[j] = conversion_lut[v1] | (conversion_lut[v2] << 4);
     }
-
-    epd_input
 }
 
 fn update_lut(conversion_lut: &mut [u8], k: usize, mode: DrawMode) {
