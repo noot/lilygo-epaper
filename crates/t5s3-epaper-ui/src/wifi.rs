@@ -2,7 +2,7 @@ use alloc::{string::String, vec::Vec};
 use core::{
     fmt::Write as _,
     net::Ipv4Addr,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
 use embassy_futures::select::{select, Either};
@@ -29,6 +29,8 @@ use esp_radio::wifi::{
     WifiController,
 };
 use t5s3_epaper_core::Clock;
+
+use crate::tls;
 
 // noot-server address (from .env at build time; see the justfile). the music
 // and environment pages fetch JSON from it over http.
@@ -82,6 +84,37 @@ const fn pick_port(env: Option<&'static str>, fallback: u16) -> u16 {
         _ => fallback,
     }
 }
+
+// tailscale funnel hostname for reaching noot-server away from home (e.g.
+// "machine.tailnet.ts.net"). when set, all noot-server traffic goes to it
+// over verified https instead of plain http to SERVER_HOST.
+const FUNNEL_HOST: Option<&str> = match option_env!("FUNNEL_HOST") {
+    Some(s) if !s.is_empty() => Some(s),
+    _ => None,
+};
+// how noot-server was last reached: unknown (probe on the next request),
+// over the lan, or through the funnel. probed once per boot — the first
+// request tries the lan and falls back — so at-home traffic stays on the
+// fast direct path while the same build works anywhere via the funnel.
+// statics reset on deep-sleep wake, so a location change re-probes.
+const PATH_UNKNOWN: u8 = 0;
+const PATH_LAN: u8 = 1;
+const PATH_FUNNEL: u8 = 2;
+static SERVER_PATH: AtomicU8 = AtomicU8::new(PATH_UNKNOWN);
+
+// forget the probed path. called after joining a different network, which
+// may or may not be the lan noot-server lives on.
+pub(crate) fn reset_server_path() {
+    SERVER_PATH.store(PATH_UNKNOWN, Ordering::Relaxed);
+}
+
+// bearer token sent with every noot-server request when set. required once
+// the server is exposed to the internet via funnel, since anyone can reach
+// that hostname.
+const SERVER_TOKEN: Option<&str> = match option_env!("SERVER_TOKEN") {
+    Some(s) if !s.is_empty() => Some(s),
+    _ => None,
+};
 
 const NTP_SERVER: &str = "pool.ntp.org";
 // seconds between the NTP epoch (1900-01-01) and the unix epoch (1970-01-01).
@@ -418,8 +451,8 @@ async fn http_get(
         }
         match host {
             Host::Server => request(stack, "GET", path, max_body).await,
-            Host::Map => request_host(stack, MAP_HOST, MAP_PORT, path, max_body).await,
-            Host::External(h) => request_host(stack, h, 80, path, max_body).await,
+            Host::Map => request_map(stack, path, max_body).await,
+            Host::External(h) => request_tls(stack, h, "GET", path, max_body, None).await,
         }
     })
     .await;
@@ -474,7 +507,7 @@ async fn download_maps(
                 esp_println::println!("wifi: bulk download cancelled");
                 break;
             }
-            match request_host(stack, MAP_HOST, MAP_PORT, path, max_body).await {
+            match request_map(stack, path, max_body).await {
                 Some(body) => {
                     misses = 0;
                     fetched += 1;
@@ -564,6 +597,68 @@ async fn music_session(
 // for a 2xx status (None otherwise, e.g. a 404 from the cover endpoint when the
 // track has no art). `max_body` caps how much body we buffer.
 async fn request(stack: Stack<'_>, method: &str, path: &str, max_body: usize) -> Option<Vec<u8>> {
+    let Some(funnel) = FUNNEL_HOST else {
+        return request_plain(stack, method, path, max_body).await;
+    };
+
+    // lan-first: at home talk to the server directly (fast, no hairpin
+    // through tailscale's relays); away, fall back to the funnel over
+    // verified https with the bearer token. the first attempt is the probe,
+    // and the outcome is latched so the fallback timeout is paid once per
+    // boot, not per request. any total failure clears the latch so the next
+    // request probes again.
+    match SERVER_PATH.load(Ordering::Relaxed) {
+        PATH_LAN => match request_plain(stack, method, path, max_body).await {
+            Some(body) => Some(body),
+            None => {
+                let result = request_tls(stack, funnel, method, path, max_body, SERVER_TOKEN).await;
+                SERVER_PATH.store(
+                    if result.is_some() {
+                        esp_println::println!("server: lan lost, switching to funnel");
+                        PATH_FUNNEL
+                    } else {
+                        PATH_UNKNOWN
+                    },
+                    Ordering::Relaxed,
+                );
+                result
+            }
+        },
+        PATH_FUNNEL => {
+            let result = request_tls(stack, funnel, method, path, max_body, SERVER_TOKEN).await;
+            if result.is_none() {
+                SERVER_PATH.store(PATH_UNKNOWN, Ordering::Relaxed);
+            }
+            result
+        }
+        _ => {
+            if let Some(body) = request_plain(stack, method, path, max_body).await {
+                esp_println::println!("server: reachable over lan");
+                SERVER_PATH.store(PATH_LAN, Ordering::Relaxed);
+                return Some(body);
+            }
+            let result = request_tls(stack, funnel, method, path, max_body, SERVER_TOKEN).await;
+            SERVER_PATH.store(
+                if result.is_some() {
+                    esp_println::println!("server: lan unreachable, using funnel");
+                    PATH_FUNNEL
+                } else {
+                    PATH_UNKNOWN
+                },
+                Ordering::Relaxed,
+            );
+            result
+        }
+    }
+}
+
+// one plain-http request to noot-server on the lan.
+async fn request_plain(
+    stack: Stack<'_>,
+    method: &str,
+    path: &str,
+    max_body: usize,
+) -> Option<Vec<u8>> {
     let addr = match SERVER_HOST.parse::<Ipv4Addr>() {
         Ok(ip) => IpAddress::Ipv4(ip),
         Err(_) => *stack
@@ -583,14 +678,124 @@ async fn request(stack: Stack<'_>, method: &str, path: &str, max_body: usize) ->
         .ok()?;
 
     let mut req = String::new();
-    write!(
-        req,
-        "{method} {path} HTTP/1.1\r\nHost: {SERVER_HOST}\r\nConnection: close\r\n\r\n"
-    )
-    .ok()?;
+    write!(req, "{method} {path} HTTP/1.1\r\nHost: {SERVER_HOST}\r\n").ok()?;
+    if let Some(token) = SERVER_TOKEN {
+        write!(req, "Authorization: Bearer {token}\r\n").ok()?;
+    }
+    write!(req, "Connection: close\r\n\r\n").ok()?;
     socket.write_all(req.as_bytes()).await.ok()?;
 
     read_response(&mut socket, max_body).await
+}
+
+// a zeroed byte buffer explicitly in PSRAM. the tls session needs ~37 KiB of
+// buffers, and the default allocator serves internal RAM first — the same
+// small pool esp-radio needs for its packet buffers mid-session. starving it
+// stalls all traffic until the socket timeout aborts the connection.
+fn psram_buffer(len: usize) -> allocator_api2::vec::Vec<u8, esp_alloc::ExternalMemory> {
+    let mut buf = allocator_api2::vec::Vec::with_capacity_in(len, esp_alloc::ExternalMemory);
+    buf.resize(len, 0);
+    buf
+}
+
+// one https request to `host:443`, with the server verified against the
+// pinned root. used for the weather api and the funnel endpoint.
+async fn request_tls(
+    stack: Stack<'_>,
+    host: &str,
+    method: &str,
+    path: &str,
+    max_body: usize,
+    bearer: Option<&str>,
+) -> Option<Vec<u8>> {
+    let addr = match host.parse::<Ipv4Addr>() {
+        Ok(ip) => IpAddress::Ipv4(ip),
+        Err(_) => match stack.dns_query(host, DnsQueryType::A).await {
+            Ok(addrs) => match addrs.first() {
+                Some(addr) => *addr,
+                None => {
+                    esp_println::println!("tls: {host}: dns returned no addresses");
+                    return None;
+                }
+            },
+            Err(e) => {
+                esp_println::println!("tls: {host}: dns failed: {e:?}");
+                return None;
+            }
+        },
+    };
+
+    // a full-size receive window: tls servers send 4-16 KiB flights, and a
+    // tiny advertised window is both slow and a behavior real-world servers
+    // rarely see.
+    let mut rx = psram_buffer(16_384);
+    let mut tx = [0u8; 1536];
+    let mut socket = TcpSocket::new(stack, rx.as_mut_slice(), &mut tx);
+    // a tls handshake makes several round trips (and the funnel path adds
+    // relay latency), so give it more slack than the plain-http paths. note
+    // that when this inactivity timeout aborts the socket, io errors surface
+    // as ConnectionReset.
+    socket.set_timeout(Some(Duration::from_secs(15)));
+    let connect_started = embassy_time::Instant::now();
+    if let Err(e) = socket.connect(IpEndpoint::new(addr, 443)).await {
+        esp_println::println!(
+            "tls: {host} ({addr}): connect failed after {} ms: {e:?}",
+            connect_started.elapsed().as_millis()
+        );
+        esp_println::println!("{}", esp_alloc::HEAP.stats());
+        return None;
+    }
+
+    let mut read_buf = psram_buffer(tls::READ_BUF);
+    let mut write_buf = psram_buffer(tls::WRITE_BUF);
+    let handshake_started = embassy_time::Instant::now();
+    let mut connection = match tls::open(
+        socket,
+        host,
+        read_buf.as_mut_slice(),
+        write_buf.as_mut_slice(),
+    )
+    .await
+    {
+        Ok(connection) => {
+            esp_println::println!(
+                "tls: {host} ({addr}): handshake ok in {} ms",
+                handshake_started.elapsed().as_millis()
+            );
+            connection
+        }
+        Err(e) => {
+            esp_println::println!(
+                "tls: {host} ({addr}): handshake failed after {} ms (connect took {} ms): {e:?}",
+                handshake_started.elapsed().as_millis(),
+                connect_started.elapsed().as_millis() - handshake_started.elapsed().as_millis(),
+            );
+            esp_println::println!("{}", esp_alloc::HEAP.stats());
+            return None;
+        }
+    };
+
+    let mut req = String::new();
+    write!(req, "{method} {path} HTTP/1.0\r\nHost: {host}\r\n").ok()?;
+    if let Some(token) = bearer {
+        write!(req, "Authorization: Bearer {token}\r\n").ok()?;
+    }
+    write!(req, "Connection: close\r\n\r\n").ok()?;
+    connection.write_all(req.as_bytes()).await.ok()?;
+    connection.flush().await.ok()?;
+
+    read_response(&mut connection, max_body).await
+}
+
+// one map-tile GET. when the map host is noot-server itself the request
+// rides the server path (lan-first, funnel fallback, bearer as needed);
+// a custom map host is reached over plain http as configured.
+async fn request_map(stack: Stack<'_>, path: &str, max_body: usize) -> Option<Vec<u8>> {
+    if MAP_HOST == SERVER_HOST {
+        request(stack, "GET", path, max_body).await
+    } else {
+        request_host(stack, MAP_HOST, MAP_PORT, path, max_body).await
+    }
 }
 
 // one plain-http GET to `host:port` (HTTP/1.0 so the body comes back
@@ -634,7 +839,10 @@ async fn request_host(
 // body must never look like a success. when the server declares a
 // content-length the body is validated against it; without one, only an
 // orderly close marks the body complete.
-async fn read_response(socket: &mut TcpSocket<'_>, max_body: usize) -> Option<Vec<u8>> {
+async fn read_response<R>(socket: &mut R, max_body: usize) -> Option<Vec<u8>>
+where
+    R: embedded_io_async::Read,
+{
     let mut resp = Vec::new();
     let mut chunk = [0u8; 1024];
     let mut closed = false;
