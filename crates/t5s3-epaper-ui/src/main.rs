@@ -2115,7 +2115,7 @@ async fn main(spawner: Spawner) -> ! {
                             if wifi::send(saved_request(
                                 &settings,
                                 wifi::Op::Get {
-                                    host: wifi::Host::Map,
+                                    host: wifi::Host::Server,
                                     path: String::from(path.as_str()),
                                     max_body: MAP_MAX_BYTES,
                                 },

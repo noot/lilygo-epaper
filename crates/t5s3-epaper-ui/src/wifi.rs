@@ -62,27 +62,6 @@ const fn parse_port(s: &str) -> u16 {
     }
 }
 
-// where map tiles are fetched from. defaults to noot-server on the LAN, but can
-// be pointed at a public map proxy (set MAP_HOST/MAP_PORT at build time) so
-// maps download anywhere the device has internet, not only on the home network.
-// an empty env value falls back to noot-server, so leaving it unset is safe.
-const MAP_HOST: &str = pick_str(option_env!("MAP_HOST"), SERVER_HOST);
-const MAP_PORT: u16 = pick_port(option_env!("MAP_PORT"), SERVER_PORT);
-
-const fn pick_str(env: Option<&'static str>, fallback: &'static str) -> &'static str {
-    match env {
-        Some(s) if !s.is_empty() => s,
-        _ => fallback,
-    }
-}
-
-const fn pick_port(env: Option<&'static str>, fallback: u16) -> u16 {
-    match env {
-        Some(s) if !s.is_empty() => parse_port(s),
-        _ => fallback,
-    }
-}
-
 const NTP_SERVER: &str = "pool.ntp.org";
 // seconds between the NTP epoch (1900-01-01) and the unix epoch (1970-01-01).
 const NTP_UNIX_DELTA: u64 = 2_208_988_800;
@@ -116,10 +95,8 @@ pub(crate) enum Op {
 
 // which server an `Op::Get` targets.
 pub(crate) enum Host {
-    // noot-server (music and environment json).
+    // noot-server (music and environment json, and map tiles).
     Server,
-    // the configured map host.
-    Map,
     // an arbitrary public host over plain http on port 80 (weather api).
     External(&'static str),
 }
@@ -418,7 +395,6 @@ async fn http_get(
         }
         match host {
             Host::Server => request(stack, "GET", path, max_body).await,
-            Host::Map => request_host(stack, MAP_HOST, MAP_PORT, path, max_body).await,
             Host::External(h) => request_host(stack, h, 80, path, max_body).await,
         }
     })
@@ -435,7 +411,7 @@ async fn http_get(
 // tile).
 const MAX_CONSECUTIVE_MISSES: usize = 5;
 
-// GET each map path from the configured map host in one session, then power
+// GET each map path from noot-server in one session, then power
 // the radio back down. doing a whole area in one bring-up (rather than one per
 // tile) keeps a bulk download to a single ~20s radio start. each fetched tile
 // is streamed to the ui as an `Event::Tile` so it can be written to the sd
@@ -474,7 +450,7 @@ async fn download_maps(
                 esp_println::println!("wifi: bulk download cancelled");
                 break;
             }
-            match request_host(stack, MAP_HOST, MAP_PORT, path, max_body).await {
+            match request(stack, "GET", path, max_body).await {
                 Some(body) => {
                     misses = 0;
                     fetched += 1;
