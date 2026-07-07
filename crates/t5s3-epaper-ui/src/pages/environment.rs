@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use core::fmt::Write as _;
 
 use embedded_graphics::{
@@ -10,6 +11,7 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
+use heapless::{String as HString, Vec as HVec};
 use serde::Deserialize;
 use t5s3_epaper_core::Display;
 
@@ -19,42 +21,44 @@ use crate::{
     widgets::{centered, draw_back_button},
 };
 
-// the sensor device whose latest reading this page shows (from .env at build
-// time; see the justfile). matches the id the sensor firmware posts under.
-const SENSOR_ID: &str = match option_env!("SENSOR_ID") {
-    Some(s) => s,
-    None => "living-room",
-};
+// the most sensor devices the page parses from one response; one card each.
+const MAX_SENSORS: usize = 8;
 
-const BODY_TOP: i32 = 200;
-const BODY_H: u32 = 360;
+const CARDS_TOP: i32 = 176;
+const CARD_H: i32 = 150;
+// how many cards fit below the header before running off the 960px-tall screen.
+const MAX_VISIBLE: usize = 5;
 
-// a single sensor sample from `/api/sensors/{id}`. received_at is ignored here.
+// a single device's latest reading from `/api/sensors`. every metric field is
+// optional so one struct covers both sensor kinds: air sensors report co2 and
+// humidity, water sensors report tds_ppm. received_at is present in the body
+// but ignored here.
 #[derive(Deserialize)]
 pub(crate) struct Reading {
-    co2: u16,
+    id: HString<32>,
+    co2: Option<u16>,
+    tds_ppm: Option<f32>,
     temperature_c: f32,
-    humidity: f32,
+    humidity: Option<f32>,
 }
 
-// what the environment page is currently showing.
+// what the environment page is currently showing. Ready is boxed: the readings
+// list is much larger than the other variants.
 pub(crate) enum View {
     Loading,
-    Ready(Reading),
+    Ready(Box<HVec<Reading, MAX_SENSORS>>),
     Error,
 }
 
-// the request path for the configured sensor device.
-pub(crate) fn path() -> FmtBuf<48> {
-    let mut buf = FmtBuf::<48>::new();
-    write!(buf, "/api/sensors/{SENSOR_ID}").ok();
-    buf
+// the request path for the list of all sensor devices.
+pub(crate) fn path() -> &'static str {
+    "/api/sensors"
 }
 
-// parse a `/api/sensors/{id}` response body into a view.
+// parse an `/api/sensors` list response body into a view.
 pub(crate) fn parse(body: &[u8]) -> View {
-    match serde_json_core::from_slice::<Reading>(body) {
-        Ok((reading, _)) => View::Ready(reading),
+    match serde_json_core::from_slice::<HVec<Reading, MAX_SENSORS>>(body) {
+        Ok((readings, _)) => View::Ready(Box::new(readings)),
         Err(_) => View::Error,
     }
 }
@@ -71,6 +75,22 @@ fn quality(co2: u16) -> &'static str {
     }
 }
 
+// a word describing water hardness at a given tds level, matching the server's
+// sensor dashboard.
+fn hardness(tds_ppm: f32) -> &'static str {
+    if tds_ppm < 100.0 {
+        "very soft"
+    } else if tds_ppm < 250.0 {
+        "soft"
+    } else if tds_ppm < 450.0 {
+        "moderate"
+    } else if tds_ppm < 700.0 {
+        "hard"
+    } else {
+        "very hard"
+    }
+}
+
 pub(crate) fn draw_screen(display: &mut Display, view: &View) {
     let bold = MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK);
     draw_back_button(display);
@@ -82,55 +102,93 @@ pub(crate) fn draw_screen(display: &mut Display, view: &View) {
     )
     .draw(display)
     .ok();
-    Text::with_alignment(
-        SENSOR_ID,
-        Point::new(SCREEN_W / 2, 160),
-        MonoTextStyle::new(&FONT_9X15, Gray4::new(4)),
-        Alignment::Center,
-    )
-    .draw(display)
-    .ok();
     draw_body(display, view);
 }
 
-// the data area, drawn over a white fill so a refresh cleanly replaces it.
+// the card area, drawn over a white fill so a refresh cleanly replaces it.
 fn draw_body(display: &mut Display, view: &View) {
-    Rectangle::new(Point::new(20, BODY_TOP), Size::new(500, BODY_H))
+    Rectangle::new(Point::new(16, CARDS_TOP - 12), Size::new(508, 784))
         .into_styled(PrimitiveStyle::with_fill(Gray4::WHITE))
         .draw(display)
         .ok();
 
     let label = MonoTextStyle::new(&FONT_9X15, Gray4::new(4));
-    let value = MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK);
 
     match view {
-        View::Loading => {
-            centered(display, "loading...", BODY_TOP + 120, label);
+        View::Loading => centered(display, "loading...", CARDS_TOP + 120, label),
+        View::Error => centered(display, "no readings available", CARDS_TOP + 120, label),
+        View::Ready(readings) if readings.is_empty() => {
+            centered(display, "no sensors reporting", CARDS_TOP + 120, label)
         }
-        View::Error => {
-            centered(display, "no reading available", BODY_TOP + 120, label);
-        }
-        View::Ready(r) => {
-            let mut co2 = FmtBuf::<24>::new();
-            write!(co2, "{} ppm ({})", r.co2, quality(r.co2)).ok();
-            let mut temp = FmtBuf::<16>::new();
-            write!(temp, "{:.1} C", r.temperature_c).ok();
-            let mut hum = FmtBuf::<16>::new();
-            write!(hum, "{:.0} %RH", r.humidity).ok();
-
-            let rows = [
-                ("CO2", co2.as_str()),
-                ("Temperature", temp.as_str()),
-                ("Humidity", hum.as_str()),
-            ];
-            let mut y = BODY_TOP + 40;
-            for (name, val) in rows {
-                Text::new(name, Point::new(40, y), label).draw(display).ok();
-                Text::new(val, Point::new(40, y + 26), value)
-                    .draw(display)
-                    .ok();
-                y += 80;
+        View::Ready(readings) => {
+            let shown = readings.len().min(MAX_VISIBLE);
+            for (i, reading) in readings.iter().take(shown).enumerate() {
+                draw_card(display, reading, CARDS_TOP + i as i32 * CARD_H);
+            }
+            if readings.len() > shown {
+                let mut more = FmtBuf::<24>::new();
+                write!(more, "+{} more", readings.len() - shown).ok();
+                centered(
+                    display,
+                    more.as_str(),
+                    CARDS_TOP + shown as i32 * CARD_H + 18,
+                    label,
+                );
             }
         }
     }
+}
+
+// one sensor's card: device id and kind, its headline metric with a quality
+// word, and the secondary values, above a divider.
+fn draw_card(display: &mut Display, reading: &Reading, top: i32) {
+    let bold = MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK);
+    let label = MonoTextStyle::new(&FONT_9X15, Gray4::new(4));
+
+    Text::new(reading.id.as_str(), Point::new(40, top + 26), bold)
+        .draw(display)
+        .ok();
+    let kind = if reading.co2.is_some() {
+        "air"
+    } else if reading.tds_ppm.is_some() {
+        "water"
+    } else {
+        "sensor"
+    };
+    Text::with_alignment(kind, Point::new(500, top + 26), label, Alignment::Right)
+        .draw(display)
+        .ok();
+
+    let mut primary = FmtBuf::<40>::new();
+    let mut secondary = FmtBuf::<32>::new();
+    match (reading.co2, reading.tds_ppm) {
+        (Some(co2), _) => {
+            write!(primary, "CO2   {co2} ppm ({})", quality(co2)).ok();
+            write!(secondary, "{:.1} C", reading.temperature_c).ok();
+            if let Some(humidity) = reading.humidity {
+                write!(secondary, "     {humidity:.0} %RH").ok();
+            }
+        }
+        (None, Some(tds)) => {
+            write!(primary, "TDS   {tds:.0} ppm ({})", hardness(tds)).ok();
+            write!(secondary, "{:.1} C water", reading.temperature_c).ok();
+        }
+        (None, None) => {
+            write!(primary, "{:.1} C", reading.temperature_c).ok();
+        }
+    }
+    Text::new(primary.as_str(), Point::new(40, top + 66), bold)
+        .draw(display)
+        .ok();
+    Text::new(secondary.as_str(), Point::new(40, top + 98), label)
+        .draw(display)
+        .ok();
+
+    Rectangle::new(
+        Point::new(30, top + CARD_H - 18),
+        Size::new((SCREEN_W - 60) as u32, 2),
+    )
+    .into_styled(PrimitiveStyle::with_fill(Gray4::new(8)))
+    .draw(display)
+    .ok();
 }
