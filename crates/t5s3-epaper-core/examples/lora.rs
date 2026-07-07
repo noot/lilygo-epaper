@@ -69,11 +69,13 @@ fn main() -> ! {
     delay.delay_millis(1500);
 
     let config = Config::default();
-    let bus = t5s3_epaper_core::sdcard::shared_bus(
+    let bus = t5s3_epaper_core::spi::Bus::new(
         peripherals.SPI2,
         peripherals.GPIO14,
         peripherals.GPIO13,
         peripherals.GPIO21,
+        peripherals.GPIO12,
+        peripherals.GPIO46,
     )
     .expect("to build spi bus");
     let mut radio = match Lora::new(&bus, lora_pin_config!(peripherals), &config) {

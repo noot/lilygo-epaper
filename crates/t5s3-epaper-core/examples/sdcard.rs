@@ -42,14 +42,16 @@ fn main() -> ! {
     )
     .expect("to initialize display");
 
-    let bus = t5s3_epaper_core::sdcard::shared_bus(
+    let bus = t5s3_epaper_core::spi::Bus::new(
         peripherals.SPI2,
         peripherals.GPIO14,
         peripherals.GPIO13,
         peripherals.GPIO21,
+        peripherals.GPIO12,
+        peripherals.GPIO46,
     )
     .expect("to build sd bus");
-    let sdcard = SdCard::new(peripherals.GPIO12, &bus).expect("to initialize sd card");
+    let sdcard = SdCard::new(&bus).expect("to initialize sd card");
     let card_size = sdcard.card_size_bytes();
 
     sdcard

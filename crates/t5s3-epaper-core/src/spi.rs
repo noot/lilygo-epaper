@@ -6,26 +6,70 @@ use embedded_hal::{
 };
 use esp_hal::{
     delay::Delay,
-    gpio::Output,
-    spi::master::{Config as SpiConfig, ConfigError, Spi},
+    gpio::{Level, Output, OutputConfig},
+    peripherals,
+    spi::{
+        master::{Config as SpiConfig, ConfigError, Spi},
+        Mode as SpiMode,
+    },
     Blocking,
 };
 
-// one device on an SPI bus shared by reference. the bus (SPI2 plus the
-// sclk/mosi/miso lines) is owned once by the caller inside a RefCell; each chip
-// gets one of these, carrying its own chip-select and clock/mode. borrowing the
-// bus through the RefCell is what serialises access: a second concurrent user
-// panics instead of silently corrupting the bus.
+/// The shared SPI2 bus plus every chip-select on it.
+///
+/// The bus (SPI2 and the sclk/mosi/miso lines) is owned once, and so are both
+/// devices' chip-selects, parked high except while their device is
+/// mid-transaction. "Device not in use" is therefore a first-class state: an
+/// idle chip can never see a floating select and respond to another device's
+/// traffic. (A floating LoRa select used to make SD-card init intermittently
+/// fail with `CardNotFound` — the idle SX1262 held MISO — and a floating SD
+/// select would let radio traffic clock noise into the card.)
+pub struct Bus<'d> {
+    pub(crate) spi: RefCell<Spi<'d, Blocking>>,
+    pub(crate) sd_cs: RefCell<Output<'d>>,
+    pub(crate) lora_cs: RefCell<Output<'d>>,
+}
+
+impl<'d> Bus<'d> {
+    /// Build the shared bus, taking ownership of the SD-card and LoRa
+    /// chip-selects and parking them high. The returned bus must outlive any
+    /// device created from it.
+    pub fn new(
+        spi: peripherals::SPI2<'d>,
+        sclk: peripherals::GPIO14<'d>,
+        mosi: peripherals::GPIO13<'d>,
+        miso: peripherals::GPIO21<'d>,
+        sd_cs: peripherals::GPIO12<'d>,
+        lora_cs: peripherals::GPIO46<'d>,
+    ) -> core::result::Result<Self, ConfigError> {
+        let spi = Spi::new(spi, SpiConfig::default().with_mode(SpiMode::_0))?
+            .with_sck(sclk)
+            .with_mosi(mosi)
+            .with_miso(miso);
+        Ok(Self {
+            spi: RefCell::new(spi),
+            sd_cs: RefCell::new(Output::new(sd_cs, Level::High, OutputConfig::default())),
+            lora_cs: RefCell::new(Output::new(lora_cs, Level::High, OutputConfig::default())),
+        })
+    }
+}
+
+// one device on the shared SPI bus. the bus and the device's chip-select are
+// both owned by [`Bus`] and borrowed here by reference, carrying the device's
+// clock/mode. borrowing the bus through the RefCell is what serialises access:
+// a second concurrent user panics instead of silently corrupting the bus. the
+// chip-select is only ever toggled inside a transaction, so it parks high (in
+// the Bus) whenever the device is idle or dropped.
 pub(crate) struct SharedSpiDevice<'a, 'd> {
     bus: &'a RefCell<Spi<'d, Blocking>>,
-    cs: Output<'d>,
+    cs: &'a RefCell<Output<'d>>,
     config: SpiConfig,
 }
 
 impl<'a, 'd> SharedSpiDevice<'a, 'd> {
     pub(crate) fn new(
         bus: &'a RefCell<Spi<'d, Blocking>>,
-        cs: Output<'d>,
+        cs: &'a RefCell<Output<'d>>,
         config: SpiConfig,
     ) -> Self {
         Self { bus, cs, config }
@@ -66,7 +110,8 @@ impl SpiDevice for SharedSpiDevice<'_, '_> {
         // the previous user may have left the bus at a different clock/mode.
         bus.apply_config(&self.config).map_err(Error::Config)?;
 
-        self.cs.set_low();
+        let mut cs = self.cs.borrow_mut();
+        cs.set_low();
         let op_res = ops.iter_mut().try_for_each(|op| match op {
             Operation::Read(buf) => bus.read(buf),
             Operation::Write(buf) => bus.write(buf),
@@ -82,7 +127,7 @@ impl SpiDevice for SharedSpiDevice<'_, '_> {
         });
         // flush before releasing chip-select so the last word is clocked out.
         let flush_res = bus.flush();
-        self.cs.set_high();
+        cs.set_high();
 
         op_res.and(flush_res).map_err(Error::Spi)
     }

@@ -1,20 +1,17 @@
-use core::cell::RefCell;
-
 use embedded_hal::spi::SpiDevice as _;
 use esp_hal::{
     delay::Delay,
     gpio::{Input, InputConfig, Level, Output, OutputConfig, RtcPin},
     peripherals,
     spi::{
-        master::{Config as SpiConfig, ConfigError as SpiConfigError, Spi},
+        master::{Config as SpiConfig, ConfigError as SpiConfigError},
         Mode as SpiMode,
     },
     time::Rate,
-    Blocking,
 };
 use log::debug;
 
-use crate::bus::SharedSpiDevice;
+use crate::spi::{Bus, SharedSpiDevice};
 
 const SPI_FREQUENCY_KHZ: u32 = 2000;
 const BUSY_TIMEOUT_ITERS: u32 = 1000;
@@ -173,7 +170,6 @@ impl Default for Config {
 }
 
 pub struct PinConfig<'d> {
-    pub cs: peripherals::GPIO46<'d>,
     pub rst: peripherals::GPIO1<'d>,
     pub busy: peripherals::GPIO47<'d>,
     pub dio1: peripherals::GPIO10<'d>,
@@ -203,19 +199,16 @@ impl<'a, 'd> Lora<'a, 'd> {
     /// driver. Resets the radio, enables the TCXO, calibrates, and applies the
     /// RF and modulation settings from `config`, leaving the chip in standby
     /// ready to transmit.
-    pub fn new(
-        bus: &'a RefCell<Spi<'d, Blocking>>,
-        pins: PinConfig<'d>,
-        config: &Config,
-    ) -> Result<Self, Error> {
+    pub fn new(bus: &'a Bus<'d>, pins: PinConfig<'d>, config: &Config) -> Result<Self, Error> {
         // deep sleep holds RST low to stop the unpowered SX1262 being
         // back-powered through its reset pull-up; release that hold before
         // driving the line again.
         pins.rst.rtcio_pad_hold(false);
 
+        // the radio's chip-select is owned (and parked) by the bus.
         let device = SharedSpiDevice::new(
-            bus,
-            Output::new(pins.cs, Level::High, OutputConfig::default()),
+            &bus.spi,
+            &bus.lora_cs,
             SpiConfig::default()
                 .with_frequency(Rate::from_khz(SPI_FREQUENCY_KHZ))
                 .with_mode(SpiMode::_0),
@@ -633,10 +626,10 @@ impl<'a, 'd> Lora<'a, 'd> {
 }
 
 // fold the shared-bus device error into the driver's error type.
-fn bus_err(e: crate::bus::Error) -> Error {
+fn bus_err(e: crate::spi::Error) -> Error {
     match e {
-        crate::bus::Error::Spi(e) => Error::Spi(e),
-        crate::bus::Error::Config(e) => Error::SpiConfig(e),
+        crate::spi::Error::Spi(e) => Error::Spi(e),
+        crate::spi::Error::Config(e) => Error::SpiConfig(e),
     }
 }
 

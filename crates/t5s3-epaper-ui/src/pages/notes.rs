@@ -4,7 +4,6 @@ use alloc::{
     string::{String, ToString as _},
     vec::Vec,
 };
-use core::cell::RefCell;
 
 use embedded_graphics::{
     mono_font::{
@@ -16,8 +15,7 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
-use esp_hal::{spi::master::Spi, Blocking};
-use t5s3_epaper_core::{sdcard::Error, Display};
+use t5s3_epaper_core::{sdcard::Error, spi::Bus, Display, SdCard};
 
 use crate::{
     keyboard,
@@ -89,8 +87,8 @@ fn preview(text: &str) -> Option<String> {
 // list the notes folder newest-first (names are numbered monotonically), with
 // each note's first line as its preview. a missing folder is an empty list,
 // not an error, so the page works before the first note is ever saved.
-pub(crate) fn load_list(bus: &RefCell<Spi<'static, Blocking>>) -> Result<Vec<Entry>, Error> {
-    let card = crate::sd::mount(bus)?;
+pub(crate) fn load_list(bus: &Bus<'static>) -> Result<Vec<Entry>, Error> {
+    let card = SdCard::new(bus)?;
     let entries = match card.exists(NOTES_DIR)? {
         true => card.list_dir(NOTES_DIR)?,
         false => Vec::new(),
@@ -142,11 +140,8 @@ pub(crate) fn next_name(entries: &[Entry]) -> Option<String> {
         .map(|n| format!("NOTE{n:04}.TXT"))
 }
 
-pub(crate) fn load_note(
-    bus: &RefCell<Spi<'static, Blocking>>,
-    name: &str,
-) -> Result<String, Error> {
-    let card = crate::sd::mount(bus)?;
+pub(crate) fn load_note(bus: &Bus<'static>, name: &str) -> Result<String, Error> {
+    let card = SdCard::new(bus)?;
     let bytes = card.read_file(&note_path(name))?;
     Ok(match String::from_utf8_lossy(&bytes) {
         Cow::Borrowed(s) => s.to_string(),
@@ -157,8 +152,8 @@ pub(crate) fn load_note(
 // write the note's text to its file, creating the folder on first use. an
 // empty buffer for a note that was never written is skipped, so backing out
 // of an untouched new note leaves no empty file behind.
-pub(crate) fn save(bus: &RefCell<Spi<'static, Blocking>>, name: &str, text: &str) {
-    let card = match crate::sd::mount(bus) {
+pub(crate) fn save(bus: &Bus<'static>, name: &str, text: &str) {
+    let card = match SdCard::new(bus) {
         Ok(mounted) => mounted,
         Err(e) => {
             esp_println::println!("notes: save mount failed: {e:?}");
@@ -177,8 +172,8 @@ pub(crate) fn save(bus: &RefCell<Spi<'static, Blocking>>, name: &str, text: &str
 
 // remove the note's file from the card. a note that was never saved has no
 // file yet, so deleting it just discards the buffer.
-pub(crate) fn delete(bus: &RefCell<Spi<'static, Blocking>>, name: &str) {
-    let card = match crate::sd::mount(bus) {
+pub(crate) fn delete(bus: &Bus<'static>, name: &str) {
+    let card = match SdCard::new(bus) {
         Ok(mounted) => mounted,
         Err(e) => {
             esp_println::println!("notes: delete mount failed: {e:?}");

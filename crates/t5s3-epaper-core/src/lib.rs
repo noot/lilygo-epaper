@@ -99,13 +99,13 @@ extern crate alloc;
 
 pub mod bq25896;
 pub mod bq27220;
-mod bus;
 pub mod display;
 pub mod frontlight;
 pub mod input;
 pub mod power;
 pub mod rtc;
 pub mod sdcard;
+pub mod spi;
 pub mod touchscreen;
 
 #[cfg(feature = "embedded-graphics")]
@@ -263,7 +263,6 @@ macro_rules! gps_pin_config {
 macro_rules! lora_pin_config {
     ($name:expr) => {{
         t5s3_epaper_core::lora::PinConfig {
-            cs: $name.GPIO46,
             rst: $name.GPIO1,
             busy: $name.GPIO47,
             dio1: $name.GPIO10,

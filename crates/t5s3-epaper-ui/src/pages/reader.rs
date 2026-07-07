@@ -1,5 +1,4 @@
 use alloc::{format, string::String, vec, vec::Vec};
-use core::cell::RefCell;
 
 use embedded_graphics::{
     mono_font::{ascii::FONT_9X15, MonoTextStyle},
@@ -19,8 +18,7 @@ use epub_reader::{
     Span,
     Style,
 };
-use esp_hal::{spi::master::Spi, Blocking};
-use t5s3_epaper_core::{Display, SdCard};
+use t5s3_epaper_core::{spi::Bus, Display, SdCard};
 use u8g2_fonts::{
     fonts,
     types::{FontColor, VerticalPosition},
@@ -279,8 +277,8 @@ impl ReaderDoc {
     // content hash so it survives the file being moved or renamed. the current
     // section's page count is stored too, so the library can draw a page-refined
     // overall-progress bar without having to paginate the book itself.
-    pub(crate) fn save(&self, bus: &RefCell<Spi<'static, Blocking>>) {
-        let Ok(card) = crate::sd::mount(bus) else {
+    pub(crate) fn save(&self, bus: &Bus<'static>) {
+        let Ok(card) = SdCard::new(bus) else {
             return;
         };
         card.create_dir_all(PROGRESS_DIR).ok();
@@ -310,11 +308,11 @@ pub(crate) fn is_reader(name: &str) -> bool {
 // the card the same self-contained way as the file browser. returns a short
 // human-readable message on failure so the caller can show why it failed.
 pub(crate) fn load_document(
-    bus: &RefCell<Spi<'static, Blocking>>,
+    bus: &Bus<'static>,
     path: &str,
     style: ReaderStyle,
 ) -> Result<ReaderDoc, String> {
-    let card = crate::sd::mount(bus).map_err(|e| format!("SD init failed: {e:?}"))?;
+    let card = SdCard::new(bus).map_err(|e| format!("SD init failed: {e:?}"))?;
     let bytes = card
         .read_file(path)
         .map_err(|e| format!("read failed: {e:?}"))?;

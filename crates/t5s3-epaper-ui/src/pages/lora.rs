@@ -1,5 +1,4 @@
 use alloc::{format, string::String};
-use core::cell::RefCell;
 
 use embedded_graphics::{
     mono_font::{
@@ -11,9 +10,9 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
-use esp_hal::{spi::master::Spi, Blocking};
 use t5s3_epaper_core::{
     lora::{Config as LoraConfig, Lora},
+    spi::Bus,
     Display,
 };
 
@@ -161,15 +160,14 @@ pub(crate) fn received_native_rect() -> t5s3_epaper_core::display::Rectangle {
 }
 
 // build the lora radio used by the send/receive page. it shares SPI2 with the
-// SD card, which is only touched at sleep (after the main loop), so the bus is
-// free while this page is open. steal the bus + radio pins (mirroring the wifi
-// re-sync); dropping the returned radio releases them. the 3.3v rail powered up
-// at boot, so no settle delay is needed.
+// SD card via the bus, which owns and parks both chip-selects. steal the
+// radio's control pins (mirroring the wifi re-sync); dropping the returned
+// radio releases them. the 3.3v rail powered up at boot, so no settle delay
+// is needed.
 pub(crate) fn make_radio<'a>(
-    bus: &'a RefCell<Spi<'static, Blocking>>,
+    bus: &'a Bus<'static>,
 ) -> Result<Lora<'a, 'static>, t5s3_epaper_core::lora::Error> {
     let pins = t5s3_epaper_core::lora::PinConfig {
-        cs: unsafe { esp_hal::peripherals::GPIO46::steal() },
         rst: unsafe { esp_hal::peripherals::GPIO1::steal() },
         busy: unsafe { esp_hal::peripherals::GPIO47::steal() },
         dio1: unsafe { esp_hal::peripherals::GPIO10::steal() },

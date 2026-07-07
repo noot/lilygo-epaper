@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use core::{cell::RefCell, fmt::Write as _};
+use core::fmt::Write as _;
 
 use embedded_graphics::{
     image::Image,
@@ -12,8 +12,8 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
-use esp_hal::{rng::Rng, spi::master::Spi, time::Instant, Blocking};
-use t5s3_epaper_core::Display;
+use esp_hal::{rng::Rng, time::Instant};
+use t5s3_epaper_core::{spi::Bus, Display, SdCard};
 use tinybmp::Bmp;
 
 use crate::{fmt::FmtBuf, layout::SCREEN_W, widgets::draw_back_button};
@@ -186,8 +186,8 @@ pub(crate) fn draw_power_off_screen(display: &mut Display, pct: u16) {
 // load the wallpaper bitmap from the SD card and draw it full-screen. returns
 // false if the card, file, or bitmap is missing or unreadable so the caller can
 // fall back to the drawn screensaver.
-pub(crate) fn show_wallpaper(display: &mut Display, bus: &RefCell<Spi<'static, Blocking>>) -> bool {
-    let sdcard = match crate::sd::mount(bus) {
+pub(crate) fn show_wallpaper(display: &mut Display, bus: &Bus<'static>) -> bool {
+    let sdcard = match SdCard::new(bus) {
         Ok(sdcard) => sdcard,
         Err(e) => {
             esp_println::println!("wallpaper: sd init failed: {e:?}");

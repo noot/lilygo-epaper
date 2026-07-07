@@ -1,5 +1,4 @@
 use alloc::{format, string::String, vec::Vec};
-use core::cell::RefCell;
 
 use embedded_graphics::{
     image::Image,
@@ -12,10 +11,11 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
-use esp_hal::{spi::master::Spi, Blocking};
 use t5s3_epaper_core::{
     sdcard::{DirectoryEntry, Error},
+    spi::Bus,
     Display,
+    SdCard,
 };
 use tinybmp::Bmp;
 
@@ -47,11 +47,8 @@ pub(crate) enum Row {
 // mount the SD card on the shared `bus` (via `sd::mount`, which holds the
 // LoRa chip-select for the session) and list a directory, sorted
 // directories-first then by name. the session drops when this returns.
-pub(crate) fn load_dir(
-    bus: &RefCell<Spi<'static, Blocking>>,
-    path: &str,
-) -> Result<Vec<DirectoryEntry>, Error> {
-    let card = crate::sd::mount(bus)?;
+pub(crate) fn load_dir(bus: &Bus<'static>, path: &str) -> Result<Vec<DirectoryEntry>, Error> {
+    let card = SdCard::new(bus)?;
     let mut entries = card.list_dir(path)?;
     entries.sort_by(|a, b| {
         b.is_directory
@@ -70,12 +67,8 @@ pub(crate) fn is_bmp(name: &str) -> bool {
 // mounts the card the same self-contained way as `load_dir`. returns false if
 // the card, file, or bitmap is missing or unreadable so the caller can show a
 // message.
-pub(crate) fn view_image(
-    bus: &RefCell<Spi<'static, Blocking>>,
-    display: &mut Display,
-    path: &str,
-) -> bool {
-    let card = match crate::sd::mount(bus) {
+pub(crate) fn view_image(bus: &Bus<'static>, display: &mut Display, path: &str) -> bool {
+    let card = match SdCard::new(bus) {
         Ok(card) => card,
         Err(e) => {
             esp_println::println!("files: view sd init failed: {e:?}");

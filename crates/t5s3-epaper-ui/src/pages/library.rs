@@ -1,5 +1,4 @@
 use alloc::{format, string::String, vec::Vec};
-use core::cell::RefCell;
 
 use embedded_graphics::{
     mono_font::{
@@ -12,8 +11,7 @@ use embedded_graphics::{
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use epub_reader::{chapter_number, decode_image, Epub, GrayImage};
-use esp_hal::{spi::master::Spi, Blocking};
-use t5s3_epaper_core::{Display, SdCard};
+use t5s3_epaper_core::{spi::Bus, Display, SdCard};
 
 use crate::{
     layout::SCREEN_W,
@@ -94,8 +92,8 @@ pub(crate) fn is_epub(name: &str) -> bool {
 // scan the card for epubs, resolve each one's metadata + cover thumbnail (from
 // the cache when possible), read its bookmark, and return the shelf sorted with
 // in-progress books first. self-contained mount, mirroring the file browser.
-pub(crate) fn load_library(bus: &RefCell<Spi<'static, Blocking>>) -> View {
-    let card = match crate::sd::mount(bus) {
+pub(crate) fn load_library(bus: &Bus<'static>) -> View {
+    let card = match SdCard::new(bus) {
         Ok(pair) => pair,
         Err(e) => {
             esp_println::println!("library: sd init failed: {e:?}");
