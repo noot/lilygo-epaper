@@ -315,6 +315,10 @@ async fn main(spawner: Spawner) -> ! {
     // input (touch + all three buttons) runs on the shared i2c bus,
     // independent of the display driver.
     let mut input_ctl = Controller::new(&i2c_bus, input_pin_config!(peripherals));
+    // battery-backed external rtc, also on the shared i2c bus: restored from
+    // below whenever the internal clock was reset, written back on every
+    // successful ntp sync.
+    let rtc_ext = t5s3_epaper_core::pcf85063::Rtc::new(&i2c_bus);
 
     display.set_rotation(DisplayRotation::Rotate270);
 
@@ -408,11 +412,25 @@ async fn main(spawner: Spawner) -> ! {
     // the fast-retry cadence below until the first success.
     let mut clock_synced = woke;
 
-    // on a cold boot, sync the clock over wifi (best effort, with a timeout so
-    // it still boots when offline; skipped entirely when no network is
-    // configured), then the radio powers down. on wake the RTC already holds
-    // the time, so we skip wifi for a fast resume.
-    if !woke && !settings.wifi_ssid().is_empty() {
+    // any other reset (cold boot, reflash, crash) lost the internal clock, but
+    // the battery-backed external rtc keeps ticking: restore from it, so wifi
+    // is only needed when that too has lost time (first boot / battery pull).
+    if !clock_synced {
+        match rtc_ext.read_unix() {
+            Ok(Some(unix)) => {
+                clock.set_now_us(unix * 1_000_000);
+                clock_synced = true;
+                esp_println::println!("clock: restored from external rtc");
+            }
+            Ok(None) => esp_println::println!("clock: external rtc holds no valid time"),
+            Err(e) => esp_println::println!("clock: external rtc read failed: {e}"),
+        }
+    }
+
+    // sync the clock over wifi only when neither rtc had it (best effort,
+    // with a timeout so it still boots when offline; skipped entirely when no
+    // network is configured), then the radio powers down.
+    if !clock_synced && !settings.wifi_ssid().is_empty() {
         Text::with_alignment(
             "syncing clock over wifi...",
             Point::new(SCREEN_W / 2, 400),
@@ -431,6 +449,9 @@ async fn main(spawner: Spawner) -> ! {
             WifiEvent::TimeSynced(Some(unix)) => {
                 set_utc_time(&mut clock, unix);
                 clock_synced = true;
+                if let Err(e) = rtc_ext.set_unix(unix) {
+                    esp_println::println!("clock: external rtc write failed: {e}");
+                }
             }
             _ => esp_println::println!("clock: wifi/ntp sync failed, time unavailable"),
         }
@@ -617,6 +638,9 @@ async fn main(spawner: Spawner) -> ! {
                             clock_synced = true;
                             needs_redraw = true;
                             resync_retry_secs = RETRY_INTERVAL_SECS;
+                            if let Err(e) = rtc_ext.set_unix(unix) {
+                                esp_println::println!("clock: external rtc write failed: {e}");
+                            }
                         }
                         None => {
                             resync_retry_secs = (resync_retry_secs * 2).min(RESYNC_INTERVAL_SECS);

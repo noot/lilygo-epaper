@@ -109,6 +109,7 @@ pub mod display;
 pub mod frontlight;
 pub mod i2c;
 pub mod input;
+pub mod pcf85063;
 pub mod power;
 pub mod rtc;
 pub mod sdcard;
