@@ -39,6 +39,14 @@ serde-json-core = { workspace = true }
 heapless = { workspace = true }
 libm = { workspace = true }
 nmea = { workspace = true, optional = true }
+embedded-tls = { version = "0.19.0", default-features = false, features = [
+    "alloc",
+    "rsa",
+    "p384",
+    "log",
+] }
+rand_core = { version = "0.6", default-features = false }
+allocator-api2 = { version = "0.3", default-features = false, features = ["alloc"] }
 
 [features]
 default = []

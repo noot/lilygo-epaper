@@ -12,6 +12,7 @@ mod pages;
 mod screen;
 mod settings;
 mod state;
+mod tls;
 mod widgets;
 mod wifi;
 
@@ -1126,6 +1127,12 @@ async fn main(spawner: Spawner) -> ! {
         // powers down again. correct against RTC drift without leaving the radio
         // on to interfere with gps. (steal WIFI: the previous controller was
         // dropped, so the peripheral is free to re-init.)
+        // keep the tls layer's wall-clock view fresh for certificate checks.
+        let now_secs = clock.now_us() / 1_000_000;
+        if clock_synced {
+            tls::set_now_unix(now_secs);
+        }
+
         let resync_interval = if clock_synced {
             RESYNC_INTERVAL_SECS
         } else {
@@ -1133,7 +1140,7 @@ async fn main(spawner: Spawner) -> ! {
         };
         if wifi_pending.is_none()
             && !settings.wifi_ssid().is_empty()
-            && clock.now_us() / 1_000_000 >= last_resync_secs + resync_interval
+            && now_secs >= last_resync_secs + resync_interval
         {
             esp_println::println!("clock: periodic re-sync");
             if wifi::send(saved_request(&settings, wifi::Op::SyncTime)) {
