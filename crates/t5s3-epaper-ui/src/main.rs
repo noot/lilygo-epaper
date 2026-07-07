@@ -510,6 +510,9 @@ async fn main(_spawner: Spawner) -> ! {
     let mut wifi_status = String::from("tap Scan to find networks");
     let mut wifi_scan_dirty = false;
     let mut wifi_join_dirty = false;
+    // set when Sync clock is tapped: force an ntp sync over the saved network
+    // on the next pass, doubling as an internet-access check.
+    let mut wifi_sync_dirty = false;
     let mut wifi_pw_mode = false;
     let mut wifi_pw_ssid = String::new();
     let mut wifi_pw_buf = String::new();
@@ -682,13 +685,14 @@ async fn main(_spawner: Spawner) -> ! {
                             &mut display,
                             &wifi_pw_ssid,
                             &wifi_pw_buf,
+                            &wifi_status,
                             kb_symbols,
                             kb_shift,
                         );
                     } else {
                         settings_page::wifi::draw_status(
                             &mut display,
-                            settings.wifi_ssid(),
+                            &settings,
                             &wifi_status,
                             &wifi_networks,
                         );
@@ -1377,6 +1381,7 @@ async fn main(_spawner: Spawner) -> ! {
                             if back_button_hit(sx, sy) {
                                 // cancel password entry, back to the status view.
                                 wifi_pw_mode = false;
+                                wifi_status = String::from("join cancelled");
                                 needs_redraw = true;
                             } else if let Some(key) = keyboard::hit(sx, sy, kb_symbols, kb_shift) {
                                 match key {
@@ -1434,14 +1439,26 @@ async fn main(_spawner: Spawner) -> ! {
                                     wifi_scan_dirty = true;
                                     needs_redraw = true;
                                 }
+                                Some(settings_page::wifi::Hit::Sync) => {
+                                    if settings.wifi_ssid().is_empty() {
+                                        wifi_status =
+                                            String::from("no saved network - join one first");
+                                    } else {
+                                        wifi_status = String::from("checking internet...");
+                                        wifi_sync_dirty = true;
+                                    }
+                                    needs_redraw = true;
+                                }
                                 Some(settings_page::wifi::Hit::Network(i)) => {
                                     if let Some(entry) = wifi_networks.get(i) {
-                                        if entry.ssid == settings.wifi_ssid() {
-                                            // already the saved network: reconnect
+                                        if let Some(saved) =
+                                            settings.saved_wifi_password(&entry.ssid)
+                                        {
+                                            // already a saved network: reconnect
                                             // with the stored password instead of
                                             // re-prompting.
                                             wifi_pw_ssid = entry.ssid.clone();
-                                            wifi_pw_buf = String::from(settings.wifi_password());
+                                            wifi_pw_buf = String::from(saved);
                                             wifi_reconnect = true;
                                             wifi_join_dirty = true;
                                             wifi_status = String::from("reconnecting...");
@@ -1454,6 +1471,8 @@ async fn main(_spawner: Spawner) -> ! {
                                                 kb_symbols = false;
                                                 kb_shift = false;
                                                 wifi_pw_mode = true;
+                                                wifi_status =
+                                                    String::from("enter password, then SAVE");
                                             } else {
                                                 // open network: join straight away.
                                                 wifi_join_dirty = true;
@@ -2002,21 +2021,50 @@ async fn main(_spawner: Spawner) -> ! {
             let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
             if try_connect(wifi, &wifi_pw_ssid, &wifi_pw_buf).await {
                 settings.set_wifi(&wifi_pw_ssid, &wifi_pw_buf);
-                settings_dirty = true;
+                // write the just-proven credentials to flash immediately (a
+                // successful join is rare, so wear is no concern) rather than
+                // waiting for the leave-settings save.
+                settings.save();
+                settings_dirty = false;
                 // a working network was just proven, so retry the clock sync
                 // on the normal cadence again.
                 resync_retry_secs = RETRY_INTERVAL_SECS;
                 wifi_status = format!("connected: {wifi_pw_ssid}");
-            } else if reconnect {
-                // the saved password no longer works: drop into the keyboard
-                // (pre-filled with it) so the user can correct it.
+            } else if !wifi_pw_buf.is_empty() {
+                // the password may be wrong (stale for a reconnect, a typo for
+                // a fresh join): drop into the keyboard pre-filled with it so
+                // it can be corrected rather than retyped.
                 kb_symbols = false;
                 kb_shift = false;
                 wifi_pw_mode = true;
-                wifi_status = String::from("reconnect failed - re-enter password");
+                wifi_status = if reconnect {
+                    String::from("reconnect failed - re-enter password")
+                } else {
+                    String::from("join failed - check password")
+                };
             } else {
-                wifi_status = String::from("join failed - check password");
+                wifi_status = String::from("join failed");
             }
+            needs_redraw = true;
+        }
+
+        // force a clock re-sync over the saved network when Sync clock is
+        // tapped, doubling as an internet-access check. same `!needs_redraw`
+        // guard so the "checking internet..." view paints before the blocking
+        // wifi session.
+        if current_screen == Screen::SettingsWifi && wifi_sync_dirty && !needs_redraw {
+            wifi_sync_dirty = false;
+            let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
+            match sync_time(wifi, settings.wifi_ssid(), settings.wifi_password()).await {
+                Some(unix) => {
+                    set_utc_time(&mut clock, unix);
+                    clock_synced = true;
+                    resync_retry_secs = RETRY_INTERVAL_SECS;
+                    wifi_status = String::from("internet ok - clock synced");
+                }
+                None => wifi_status = String::from("check failed - no internet?"),
+            }
+            last_resync_secs = clock.now_us() / 1_000_000;
             needs_redraw = true;
         }
 

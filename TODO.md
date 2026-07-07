@@ -62,4 +62,5 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 - [x] sleep doesn't properly deep sleep - battery still drains quite a lot
 - [x] battery percentage only refreshes when a new page is loaded
 - [ ] keyboard "send" button is unresponsive at times (lower right corner issue?)
-- [ ] if clock fails to sync it doesn't resync - have button in info to try to sync
+- [x] if clock fails to sync it doesn't resync - have button in info to try to sync (Sync clock button on the wifi settings page forces a re-sync / internet check)
+- [x] saved wifi networks don't store password on disconnect - last 5 joined networks are now remembered, tap to reconnect

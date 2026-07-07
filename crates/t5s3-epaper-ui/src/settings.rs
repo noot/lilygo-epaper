@@ -284,6 +284,10 @@ const DEFAULT_PASSWORD: &str = match option_env!("PASSWORD") {
 // size.
 const SSID_CAP: usize = 32;
 const PASSWORD_CAP: usize = 64;
+// how many joined networks are remembered (most recently used first), so
+// switching between e.g. home wifi and a phone hotspot never re-prompts for a
+// passphrase.
+const WIFI_NETWORK_CAP: usize = 5;
 
 // copy `src` into `dst`, truncating to the array's capacity, and return the
 // number of bytes written.
@@ -291,6 +295,42 @@ fn copy_str(dst: &mut [u8], src: &str) -> u8 {
     let n = src.len().min(dst.len());
     dst[..n].copy_from_slice(&src.as_bytes()[..n]);
     n as u8
+}
+
+// one remembered wifi network: fixed-capacity ssid + passphrase so `Settings`
+// stays `Copy`.
+#[derive(Clone, Copy)]
+struct WifiNetwork {
+    ssid: [u8; SSID_CAP],
+    ssid_len: u8,
+    password: [u8; PASSWORD_CAP],
+    password_len: u8,
+}
+
+impl WifiNetwork {
+    const EMPTY: Self = Self {
+        ssid: [0; SSID_CAP],
+        ssid_len: 0,
+        password: [0; PASSWORD_CAP],
+        password_len: 0,
+    };
+
+    fn new(ssid: &str, password: &str) -> Self {
+        let mut net = Self::EMPTY;
+        net.ssid_len = copy_str(&mut net.ssid, ssid);
+        net.password_len = copy_str(&mut net.password, password);
+        net
+    }
+
+    fn ssid(&self) -> &str {
+        let len = (self.ssid_len as usize).min(SSID_CAP);
+        core::str::from_utf8(&self.ssid[..len]).unwrap_or("")
+    }
+
+    fn password(&self) -> &str {
+        let len = (self.password_len as usize).min(PASSWORD_CAP);
+        core::str::from_utf8(&self.password[..len]).unwrap_or("")
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -303,18 +343,18 @@ pub(crate) struct Settings {
     pub(crate) reader_line_spacing: LineSpacing,
     pub(crate) icon_style: IconStyle,
     pub(crate) icon_size: IconSize,
-    wifi_ssid: [u8; SSID_CAP],
-    wifi_ssid_len: u8,
-    wifi_password: [u8; PASSWORD_CAP],
-    wifi_password_len: u8,
+    wifi_networks: [WifiNetwork; WIFI_NETWORK_CAP],
+    wifi_network_count: u8,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        let mut wifi_ssid = [0u8; SSID_CAP];
-        let wifi_ssid_len = copy_str(&mut wifi_ssid, DEFAULT_SSID);
-        let mut wifi_password = [0u8; PASSWORD_CAP];
-        let wifi_password_len = copy_str(&mut wifi_password, DEFAULT_PASSWORD);
+        let mut wifi_networks = [WifiNetwork::EMPTY; WIFI_NETWORK_CAP];
+        let mut wifi_network_count = 0;
+        if !DEFAULT_SSID.is_empty() {
+            wifi_networks[0] = WifiNetwork::new(DEFAULT_SSID, DEFAULT_PASSWORD);
+            wifi_network_count = 1;
+        }
         Self {
             tz_offset_hours: DEFAULT_TZ_OFFSET,
             time_24h: true,
@@ -324,26 +364,33 @@ impl Default for Settings {
             reader_line_spacing: LineSpacing::Normal,
             icon_style: IconStyle::Lucide,
             icon_size: IconSize::Regular,
-            wifi_ssid,
-            wifi_ssid_len,
-            wifi_password,
-            wifi_password_len,
+            wifi_networks,
+            wifi_network_count,
         }
     }
 }
 
 // on-flash layout: a 2-byte magic, a version, the fields in order, and an xor
 // checksum over the preceding bytes. anything that doesn't validate (blank
-// flash, older/newer layout, corruption) falls back to defaults.
+// flash, older/newer layout, corruption) falls back to defaults, except the
+// immediately previous version which is migrated (see `decode_v5`).
 const MAGIC: [u8; 2] = [0x54, 0x35];
-const VERSION: u8 = 5;
-// 11 scalar bytes, then the SSID (len + 32) and password (len + 64), then a
-// trailing xor checksum.
-const SSID_OFF: usize = 12;
-const PASSWORD_LEN_OFF: usize = SSID_OFF + SSID_CAP;
-const PASSWORD_OFF: usize = PASSWORD_LEN_OFF + 1;
-const CHECKSUM_OFF: usize = PASSWORD_OFF + PASSWORD_CAP;
+const VERSION: u8 = 6;
+// 11 scalar bytes, a saved-network count, then WIFI_NETWORK_CAP fixed-size
+// network entries (ssid len + 32, password len + 64), then a trailing xor
+// checksum.
+const NETWORKS_OFF: usize = 12;
+const NETWORK_SIZE: usize = 1 + SSID_CAP + 1 + PASSWORD_CAP;
+const CHECKSUM_OFF: usize = NETWORKS_OFF + WIFI_NETWORK_CAP * NETWORK_SIZE;
 const BLOB_LEN: usize = CHECKSUM_OFF + 1;
+
+// the version-5 single-network layout, kept so an upgraded firmware migrates
+// the previously saved settings instead of dropping them.
+const V5_VERSION: u8 = 5;
+const V5_SSID_OFF: usize = 12;
+const V5_PASSWORD_LEN_OFF: usize = V5_SSID_OFF + SSID_CAP;
+const V5_PASSWORD_OFF: usize = V5_PASSWORD_LEN_OFF + 1;
+const V5_CHECKSUM_OFF: usize = V5_PASSWORD_OFF + PASSWORD_CAP;
 
 // the flash peripheral is a singleton held by `esp_hal::init`; settings access
 // is brief and self-contained, so steal it here the same way the SD card and
@@ -366,26 +413,41 @@ impl Settings {
         buf[8] = self.reader_line_spacing.to_byte();
         buf[9] = self.icon_style.to_byte();
         buf[10] = self.icon_size.to_byte();
-        buf[11] = self.wifi_ssid_len.min(SSID_CAP as u8);
-        buf[SSID_OFF..PASSWORD_LEN_OFF].copy_from_slice(&self.wifi_ssid);
-        buf[PASSWORD_LEN_OFF] = self.wifi_password_len.min(PASSWORD_CAP as u8);
-        buf[PASSWORD_OFF..CHECKSUM_OFF].copy_from_slice(&self.wifi_password);
+        buf[11] = self.wifi_network_count.min(WIFI_NETWORK_CAP as u8);
+        for (i, net) in self.wifi_networks.iter().enumerate() {
+            let off = NETWORKS_OFF + i * NETWORK_SIZE;
+            buf[off] = net.ssid_len.min(SSID_CAP as u8);
+            buf[off + 1..off + 1 + SSID_CAP].copy_from_slice(&net.ssid);
+            buf[off + 1 + SSID_CAP] = net.password_len.min(PASSWORD_CAP as u8);
+            buf[off + 2 + SSID_CAP..off + NETWORK_SIZE].copy_from_slice(&net.password);
+        }
         buf[CHECKSUM_OFF] = buf[0..CHECKSUM_OFF].iter().fold(0u8, |acc, &b| acc ^ b);
         buf
     }
 
     fn decode(buf: &[u8; BLOB_LEN]) -> Option<Self> {
-        if buf[0..2] != MAGIC || buf[2] != VERSION {
+        if buf[0..2] != MAGIC {
+            return None;
+        }
+        if buf[2] == V5_VERSION {
+            return Self::decode_v5(buf);
+        }
+        if buf[2] != VERSION {
             return None;
         }
         let checksum = buf[0..CHECKSUM_OFF].iter().fold(0u8, |acc, &b| acc ^ b);
         if checksum != buf[CHECKSUM_OFF] {
             return None;
         }
-        let mut wifi_ssid = [0u8; SSID_CAP];
-        wifi_ssid.copy_from_slice(&buf[SSID_OFF..PASSWORD_LEN_OFF]);
-        let mut wifi_password = [0u8; PASSWORD_CAP];
-        wifi_password.copy_from_slice(&buf[PASSWORD_OFF..CHECKSUM_OFF]);
+        let mut wifi_networks = [WifiNetwork::EMPTY; WIFI_NETWORK_CAP];
+        for (i, net) in wifi_networks.iter_mut().enumerate() {
+            let off = NETWORKS_OFF + i * NETWORK_SIZE;
+            net.ssid_len = buf[off].min(SSID_CAP as u8);
+            net.ssid.copy_from_slice(&buf[off + 1..off + 1 + SSID_CAP]);
+            net.password_len = buf[off + 1 + SSID_CAP].min(PASSWORD_CAP as u8);
+            net.password
+                .copy_from_slice(&buf[off + 2 + SSID_CAP..off + NETWORK_SIZE]);
+        }
         Some(Self {
             tz_offset_hours: buf[3] as i8,
             time_24h: buf[4] != 0,
@@ -395,31 +457,92 @@ impl Settings {
             reader_line_spacing: LineSpacing::from_byte(buf[8]),
             icon_style: IconStyle::from_byte(buf[9]),
             icon_size: IconSize::from_byte(buf[10]),
-            wifi_ssid,
-            wifi_ssid_len: buf[11].min(SSID_CAP as u8),
-            wifi_password,
-            wifi_password_len: buf[PASSWORD_LEN_OFF].min(PASSWORD_CAP as u8),
+            wifi_networks,
+            wifi_network_count: buf[11].min(WIFI_NETWORK_CAP as u8),
         })
     }
 
-    // the saved SSID as a string, or "" if none is configured (or the stored
-    // bytes are not valid utf-8).
+    // migrate a version-5 blob: identical scalars, and its single stored
+    // network becomes the first (most recently used) table entry.
+    fn decode_v5(buf: &[u8; BLOB_LEN]) -> Option<Self> {
+        let checksum = buf[0..V5_CHECKSUM_OFF].iter().fold(0u8, |acc, &b| acc ^ b);
+        if checksum != buf[V5_CHECKSUM_OFF] {
+            return None;
+        }
+        let mut net = WifiNetwork::EMPTY;
+        net.ssid_len = buf[11].min(SSID_CAP as u8);
+        net.ssid
+            .copy_from_slice(&buf[V5_SSID_OFF..V5_PASSWORD_LEN_OFF]);
+        net.password_len = buf[V5_PASSWORD_LEN_OFF].min(PASSWORD_CAP as u8);
+        net.password
+            .copy_from_slice(&buf[V5_PASSWORD_OFF..V5_CHECKSUM_OFF]);
+        let mut wifi_networks = [WifiNetwork::EMPTY; WIFI_NETWORK_CAP];
+        let wifi_network_count = u8::from(net.ssid_len > 0);
+        wifi_networks[0] = net;
+        Some(Self {
+            tz_offset_hours: buf[3] as i8,
+            time_24h: buf[4] != 0,
+            brightness: buf[5].min(100),
+            reader_font_size: FontSize::from_byte(buf[6]),
+            reader_font_family: FontFamily::from_byte(buf[7]),
+            reader_line_spacing: LineSpacing::from_byte(buf[8]),
+            icon_style: IconStyle::from_byte(buf[9]),
+            icon_size: IconSize::from_byte(buf[10]),
+            wifi_networks,
+            wifi_network_count,
+        })
+    }
+
+    // the most recently used network's SSID, or "" if none is saved (or the
+    // stored bytes are not valid utf-8).
     pub(crate) fn wifi_ssid(&self) -> &str {
-        let len = (self.wifi_ssid_len as usize).min(SSID_CAP);
-        core::str::from_utf8(&self.wifi_ssid[..len]).unwrap_or("")
+        if self.wifi_network_count == 0 {
+            ""
+        } else {
+            self.wifi_networks[0].ssid()
+        }
     }
 
     pub(crate) fn wifi_password(&self) -> &str {
-        let len = (self.wifi_password_len as usize).min(PASSWORD_CAP);
-        core::str::from_utf8(&self.wifi_password[..len]).unwrap_or("")
+        if self.wifi_network_count == 0 {
+            ""
+        } else {
+            self.wifi_networks[0].password()
+        }
     }
 
-    // replace the saved wifi credentials, truncating to the field capacities.
+    // the stored passphrase for `ssid`, if that network was joined before.
+    pub(crate) fn saved_wifi_password(&self, ssid: &str) -> Option<&str> {
+        let count = (self.wifi_network_count as usize).min(WIFI_NETWORK_CAP);
+        self.wifi_networks[..count]
+            .iter()
+            .find(|net| net.ssid() == ssid)
+            .map(|net| net.password())
+    }
+
+    // save credentials as the most recently used network, truncating to the
+    // field capacities. an existing entry for the ssid is updated and moved to
+    // the front; otherwise the entry is inserted at the front, evicting the
+    // least recently used network when the table is full.
     pub(crate) fn set_wifi(&mut self, ssid: &str, password: &str) {
-        self.wifi_ssid = [0u8; SSID_CAP];
-        self.wifi_ssid_len = copy_str(&mut self.wifi_ssid, ssid);
-        self.wifi_password = [0u8; PASSWORD_CAP];
-        self.wifi_password_len = copy_str(&mut self.wifi_password, password);
+        let count = (self.wifi_network_count as usize).min(WIFI_NETWORK_CAP);
+        let (vacated, new_count) = match self.wifi_networks[..count]
+            .iter()
+            .position(|net| net.ssid() == ssid)
+        {
+            Some(i) => (i, count),
+            None => (
+                count.min(WIFI_NETWORK_CAP - 1),
+                (count + 1).min(WIFI_NETWORK_CAP),
+            ),
+        };
+        // shift the entries above the vacated slot down one, then write the
+        // new entry at the front.
+        for i in (1..=vacated).rev() {
+            self.wifi_networks[i] = self.wifi_networks[i - 1];
+        }
+        self.wifi_networks[0] = WifiNetwork::new(ssid, password);
+        self.wifi_network_count = new_count as u8;
     }
 
     pub(crate) fn reader_style(&self) -> ReaderStyle {
