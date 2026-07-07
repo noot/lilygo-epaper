@@ -673,6 +673,9 @@ async fn main(spawner: Spawner) -> ! {
                         // a working network was just proven, so retry the clock
                         // sync on the normal cadence again.
                         resync_retry_secs = RETRY_INTERVAL_SECS;
+                        // the new network may or may not be the one noot-server
+                        // lives on: probe again on the next fetch.
+                        wifi::reset_server_path();
                         wifi_status = format!("connected: {wifi_pw_ssid}");
                     } else if reconnect {
                         // the saved password no longer works: drop into the

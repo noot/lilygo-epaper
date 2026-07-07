@@ -2,7 +2,7 @@ use alloc::{string::String, vec::Vec};
 use core::{
     fmt::Write as _,
     net::Ipv4Addr,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
 use embassy_futures::select::{select, Either};
@@ -92,6 +92,22 @@ const FUNNEL_HOST: Option<&str> = match option_env!("FUNNEL_HOST") {
     Some(s) if !s.is_empty() => Some(s),
     _ => None,
 };
+// how noot-server was last reached: unknown (probe on the next request),
+// over the lan, or through the funnel. probed once per boot — the first
+// request tries the lan and falls back — so at-home traffic stays on the
+// fast direct path while the same build works anywhere via the funnel.
+// statics reset on deep-sleep wake, so a location change re-probes.
+const PATH_UNKNOWN: u8 = 0;
+const PATH_LAN: u8 = 1;
+const PATH_FUNNEL: u8 = 2;
+static SERVER_PATH: AtomicU8 = AtomicU8::new(PATH_UNKNOWN);
+
+// forget the probed path. called after joining a different network, which
+// may or may not be the lan noot-server lives on.
+pub(crate) fn reset_server_path() {
+    SERVER_PATH.store(PATH_UNKNOWN, Ordering::Relaxed);
+}
+
 // bearer token sent with every noot-server request when set. required once
 // the server is exposed to the internet via funnel, since anyone can reach
 // that hostname.
@@ -581,13 +597,68 @@ async fn music_session(
 // for a 2xx status (None otherwise, e.g. a 404 from the cover endpoint when the
 // track has no art). `max_body` caps how much body we buffer.
 async fn request(stack: Stack<'_>, method: &str, path: &str, max_body: usize) -> Option<Vec<u8>> {
-    // away from home, noot-server is reached through its tailscale funnel
-    // hostname over verified https; the endpoint is on the public internet,
-    // so every request carries the bearer token.
-    if let Some(funnel) = FUNNEL_HOST {
-        return request_tls(stack, funnel, method, path, max_body, SERVER_TOKEN).await;
-    }
+    let Some(funnel) = FUNNEL_HOST else {
+        return request_plain(stack, method, path, max_body).await;
+    };
 
+    // lan-first: at home talk to the server directly (fast, no hairpin
+    // through tailscale's relays); away, fall back to the funnel over
+    // verified https with the bearer token. the first attempt is the probe,
+    // and the outcome is latched so the fallback timeout is paid once per
+    // boot, not per request. any total failure clears the latch so the next
+    // request probes again.
+    match SERVER_PATH.load(Ordering::Relaxed) {
+        PATH_LAN => match request_plain(stack, method, path, max_body).await {
+            Some(body) => Some(body),
+            None => {
+                let result = request_tls(stack, funnel, method, path, max_body, SERVER_TOKEN).await;
+                SERVER_PATH.store(
+                    if result.is_some() {
+                        esp_println::println!("server: lan lost, switching to funnel");
+                        PATH_FUNNEL
+                    } else {
+                        PATH_UNKNOWN
+                    },
+                    Ordering::Relaxed,
+                );
+                result
+            }
+        },
+        PATH_FUNNEL => {
+            let result = request_tls(stack, funnel, method, path, max_body, SERVER_TOKEN).await;
+            if result.is_none() {
+                SERVER_PATH.store(PATH_UNKNOWN, Ordering::Relaxed);
+            }
+            result
+        }
+        _ => {
+            if let Some(body) = request_plain(stack, method, path, max_body).await {
+                esp_println::println!("server: reachable over lan");
+                SERVER_PATH.store(PATH_LAN, Ordering::Relaxed);
+                return Some(body);
+            }
+            let result = request_tls(stack, funnel, method, path, max_body, SERVER_TOKEN).await;
+            SERVER_PATH.store(
+                if result.is_some() {
+                    esp_println::println!("server: lan unreachable, using funnel");
+                    PATH_FUNNEL
+                } else {
+                    PATH_UNKNOWN
+                },
+                Ordering::Relaxed,
+            );
+            result
+        }
+    }
+}
+
+// one plain-http request to noot-server on the lan.
+async fn request_plain(
+    stack: Stack<'_>,
+    method: &str,
+    path: &str,
+    max_body: usize,
+) -> Option<Vec<u8>> {
     let addr = match SERVER_HOST.parse::<Ipv4Addr>() {
         Ok(ip) => IpAddress::Ipv4(ip),
         Err(_) => *stack
@@ -716,15 +787,14 @@ async fn request_tls(
     read_response(&mut connection, max_body).await
 }
 
-// one map-tile GET: through the funnel (verified https + token) when one is
-// configured and the map host is noot-server itself; plain http to the map
-// host otherwise (a LAN server or custom proxy).
+// one map-tile GET. when the map host is noot-server itself the request
+// rides the server path (lan-first, funnel fallback, bearer as needed);
+// a custom map host is reached over plain http as configured.
 async fn request_map(stack: Stack<'_>, path: &str, max_body: usize) -> Option<Vec<u8>> {
-    match FUNNEL_HOST {
-        Some(funnel) if MAP_HOST == SERVER_HOST => {
-            request_tls(stack, funnel, "GET", path, max_body, SERVER_TOKEN).await
-        }
-        _ => request_host(stack, MAP_HOST, MAP_PORT, path, max_body).await,
+    if MAP_HOST == SERVER_HOST {
+        request(stack, "GET", path, max_body).await
+    } else {
+        request_host(stack, MAP_HOST, MAP_PORT, path, max_body).await
     }
 }
 
