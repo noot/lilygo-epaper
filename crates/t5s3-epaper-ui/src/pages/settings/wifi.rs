@@ -4,7 +4,7 @@ use embedded_graphics::{
         MonoTextStyle,
     },
     prelude::*,
-    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
+    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle},
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
@@ -13,20 +13,32 @@ use t5s3_epaper_core::Display;
 use super::{button, in_rect, title, BTN_H};
 use crate::{
     layout::{screen_to_native_rect, SCREEN_W},
+    settings::Settings,
     widgets::draw_back_button,
     wifi::ScanEntry,
 };
 
 const NETWORK_Y: i32 = 165;
 const STATUS_Y: i32 = 205;
-const SCAN_BTN_X: i32 = 130;
+const SCAN_BTN_X: i32 = 30;
 const SCAN_BTN_Y: i32 = 245;
-const SCAN_BTN_W: u32 = 280;
+const SCAN_BTN_W: u32 = 230;
+// forces a clock sync over the saved network, doubling as an internet check.
+const SYNC_BTN_X: i32 = 280;
+const SYNC_BTN_W: u32 = 230;
 
 const LIST_TOP: i32 = 345;
 const ROW_H: i32 = 62;
 // how many scanned networks fit on the page below the scan button.
 pub(crate) const LIST_VISIBLE: usize = 9;
+
+// per-row Forget button, drawn only on saved networks (it doubles as the
+// saved marker). sits between the name (26 chars ends at x=278) and the
+// signal bars (x=410).
+const FORGET_BTN_X: i32 = 300;
+const FORGET_BTN_W: u32 = 90;
+const FORGET_BTN_H: u32 = 44;
+const FORGET_BTN_DY: i32 = (ROW_H - FORGET_BTN_H as i32) / 2;
 
 const PW_BOX_X: i32 = 30;
 const PW_BOX_Y: i32 = 195;
@@ -36,24 +48,49 @@ const PW_BOX_H: u32 = 60;
 pub(crate) enum Hit {
     Back,
     Scan,
+    Sync,
     Network(usize),
+    Forget(usize),
 }
 
 fn row_y(i: usize) -> i32 {
     LIST_TOP + i as i32 * ROW_H
 }
 
-pub(crate) fn status_hit(sx: i32, sy: i32, network_count: usize) -> Option<Hit> {
+pub(crate) fn status_hit(
+    sx: i32,
+    sy: i32,
+    networks: &[ScanEntry],
+    settings: &Settings,
+) -> Option<Hit> {
     if crate::widgets::back_button_hit(sx, sy) {
         return Some(Hit::Back);
     }
     if in_rect(sx, sy, SCAN_BTN_X, SCAN_BTN_Y, SCAN_BTN_W, BTN_H) {
         return Some(Hit::Scan);
     }
-    for i in 0..network_count.min(LIST_VISIBLE) {
-        if in_rect(sx, sy, 30, row_y(i), (SCREEN_W - 60) as u32, ROW_H as u32) {
-            return Some(Hit::Network(i));
+    if in_rect(sx, sy, SYNC_BTN_X, SCAN_BTN_Y, SYNC_BTN_W, BTN_H) {
+        return Some(Hit::Sync);
+    }
+    for (i, entry) in networks.iter().take(LIST_VISIBLE).enumerate() {
+        if !in_rect(sx, sy, 30, row_y(i), (SCREEN_W - 60) as u32, ROW_H as u32) {
+            continue;
         }
+        // the Forget button exists only on saved rows; anywhere else on the
+        // row (re)connects.
+        if settings.saved_wifi_password(&entry.ssid).is_some()
+            && in_rect(
+                sx,
+                sy,
+                FORGET_BTN_X,
+                row_y(i) + FORGET_BTN_DY,
+                FORGET_BTN_W,
+                FORGET_BTN_H,
+            )
+        {
+            return Some(Hit::Forget(i));
+        }
+        return Some(Hit::Network(i));
     }
     None
 }
@@ -111,12 +148,13 @@ fn draw_lock(display: &mut Display, x: i32, y: i32) {
 
 pub(crate) fn draw_status(
     display: &mut Display,
-    configured_ssid: &str,
+    settings: &Settings,
     status: &str,
     networks: &[ScanEntry],
 ) {
     draw_back_button(display);
     title(display, "Wi-Fi");
+    let configured_ssid = settings.wifi_ssid();
 
     let font = MonoTextStyle::new(&FONT_9X15, Gray4::BLACK);
     let mut network_line = alloc::string::String::from("Network: ");
@@ -137,13 +175,8 @@ pub(crate) fn draw_status(
     .draw(display)
     .ok();
 
-    button(
-        display,
-        SCAN_BTN_X,
-        SCAN_BTN_Y,
-        SCAN_BTN_W,
-        "Scan for networks",
-    );
+    button(display, SCAN_BTN_X, SCAN_BTN_Y, SCAN_BTN_W, "Scan");
+    button(display, SYNC_BTN_X, SCAN_BTN_Y, SYNC_BTN_W, "Sync clock");
 
     for (i, entry) in networks.iter().take(LIST_VISIBLE).enumerate() {
         let y = row_y(i);
@@ -156,7 +189,10 @@ pub(crate) fn draw_status(
         .draw(display)
         .ok();
 
-        let name = truncate(&entry.ssid, 34);
+        // a saved network joins on tap without a password prompt; its Forget
+        // button doubles as the saved marker and drops the stored credentials.
+        let saved = settings.saved_wifi_password(&entry.ssid).is_some();
+        let name = truncate(&entry.ssid, if saved { 26 } else { 34 });
         Text::with_alignment(
             name,
             Point::new(44, y + ROW_H / 2 + 5),
@@ -165,6 +201,32 @@ pub(crate) fn draw_status(
         )
         .draw(display)
         .ok();
+        if saved {
+            RoundedRectangle::with_equal_corners(
+                Rectangle::new(
+                    Point::new(FORGET_BTN_X, y + FORGET_BTN_DY),
+                    Size::new(FORGET_BTN_W, FORGET_BTN_H),
+                ),
+                Size::new(8, 8),
+            )
+            .into_styled(
+                PrimitiveStyleBuilder::new()
+                    .stroke_color(Gray4::BLACK)
+                    .stroke_width(2)
+                    .fill_color(Gray4::WHITE)
+                    .build(),
+            )
+            .draw(display)
+            .ok();
+            Text::with_alignment(
+                "Forget",
+                Point::new(FORGET_BTN_X + FORGET_BTN_W as i32 / 2, y + ROW_H / 2 + 5),
+                MonoTextStyle::new(&FONT_9X15, Gray4::BLACK),
+                Alignment::Center,
+            )
+            .draw(display)
+            .ok();
+        }
 
         if entry.secured {
             draw_lock(display, SCREEN_W - 60, y + ROW_H / 2 - 9);
@@ -190,6 +252,7 @@ pub(crate) fn draw_password(
     display: &mut Display,
     ssid: &str,
     password: &str,
+    hint: &str,
     symbols: bool,
     shift: bool,
 ) {
@@ -206,6 +269,15 @@ pub(crate) fn draw_password(
     .draw(display)
     .ok();
     draw_password_box(display, password);
+    // status line under the box, e.g. why the keyboard reopened after a
+    // failed join.
+    Text::new(
+        hint,
+        Point::new(PW_BOX_X, PW_BOX_Y + PW_BOX_H as i32 + 30),
+        MonoTextStyle::new(&FONT_9X15, Gray4::new(6)),
+    )
+    .draw(display)
+    .ok();
     crate::keyboard::draw(display, symbols, shift, "SAVE");
 }
 
