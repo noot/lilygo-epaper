@@ -8,7 +8,7 @@ use esp_hal::{
 };
 use log::*;
 
-use crate::{ed047tc1, input::InputState, touchscreen::TouchState, Error, Result};
+use crate::{ed047tc1, Error, Result};
 
 const CONTRAST_CYCLES_4BPP: &[u16; 15] = &[
     30, 30, 20, 20, 30, 30, 30, 40, 40, 50, 50, 50, 100, 200, 300,
@@ -86,8 +86,8 @@ const DU_LUT_PHASE: [[u8; 4]; 16] = [
     [0xAA, 0xAA, 0xAA, 0xA8],
 ];
 
-pub struct Display<'a> {
-    epd: ed047tc1::ED047TC1<'a>,
+pub struct Display<'a, 'd> {
+    epd: ed047tc1::ED047TC1<'a, 'd>,
     skipping: u16,
     framebuffer: Box<[u8; FRAMEBUFFER_SIZE]>,
     previous_framebuffer: Box<[u8; FRAMEBUFFER_SIZE]>,
@@ -98,7 +98,7 @@ pub struct Display<'a> {
     lut: Vec<u8>,
 }
 
-impl<'a> Display<'a> {
+impl<'a, 'd> Display<'a, 'd> {
     /// Width of the screen.
     pub const WIDTH: u16 = 960;
     /// Height of the screen
@@ -111,11 +111,11 @@ impl<'a> Display<'a> {
         height: Self::HEIGHT,
     };
     pub fn new(
-        pins: ed047tc1::PinConfig<'a>,
-        i2c: peripherals::I2C0<'a>,
-        dma: peripherals::DMA_CH0<'a>,
-        lcd_cam: peripherals::LCD_CAM<'a>,
-        rmt: peripherals::RMT<'a>,
+        pins: ed047tc1::PinConfig<'d>,
+        i2c: &'a crate::i2c::Bus<'d>,
+        dma: peripherals::DMA_CH0<'d>,
+        lcd_cam: peripherals::LCD_CAM<'d>,
+        rmt: peripherals::RMT<'d>,
     ) -> Result<Self> {
         Ok(Display {
             epd: ed047tc1::ED047TC1::new(pins, i2c, dma, lcd_cam, rmt)?,
@@ -161,7 +161,13 @@ impl<'a> Display<'a> {
     ///
     /// The boot button (`GPIO0`) is always enabled as a wake source. If
     /// `timer` is provided, it is enabled as an additional wake source.
-    pub fn deep_sleep(mut self, lpwr: peripherals::LPWR<'a>, timer: Option<Duration>) -> ! {
+    pub fn deep_sleep(
+        mut self,
+        lpwr: peripherals::LPWR<'d>,
+        input: crate::input::Controller<'_, 'd>,
+        timer: Option<Duration>,
+    ) -> ! {
+        let mut input = input;
         if let Err(err) = self.power_off() {
             warn!("display power off before sleep failed: {:?}", err);
         }
@@ -169,7 +175,7 @@ impl<'a> Display<'a> {
         // put the GT911 touch controller to sleep; it lives on the always-on
         // 3.3 V rail and keeps scanning otherwise. its internal sleep state
         // survives the chip's deep sleep (a reset on the next boot wakes it).
-        if let Err(err) = self.epd.sleep_touch() {
+        if let Err(err) = input.sleep() {
             warn!("touch sleep before deep sleep failed: {:?}", err);
         }
 
@@ -191,8 +197,7 @@ impl<'a> Display<'a> {
         let _lora_rst = Output::new(lora_rst_pin, Level::Low, OutputConfig::default());
         unsafe { peripherals::GPIO1::steal() }.rtcio_pad_hold(true);
 
-        let boot_button = self.epd.into_boot_button();
-        crate::power::deep_sleep(lpwr, boot_button, timer)
+        crate::power::deep_sleep(lpwr, input.into_boot_button(), timer)
     }
 
     /// Read the panel temperature in degrees Celsius from the TPS65185 PMIC.
@@ -258,35 +263,11 @@ impl<'a> Display<'a> {
     }
 
     /// Return the touchscreen resolution reported by the GT911 controller.
-    pub fn touch_resolution(&self) -> (u16, u16) {
-        self.epd.touch_resolution()
-    }
-
     /// Read the current input state from the GT911 controller.
-    pub fn input(&mut self) -> Result<InputState> {
-        self.epd.input_state()
-    }
-
     /// Read the current touch state if the touchscreen is pressed.
-    pub fn touch(&mut self) -> Result<Option<TouchState>> {
-        Ok(self.input()?.touch)
-    }
-
     /// Return whether the circular home button is currently being reported.
-    pub fn home_button(&mut self) -> Result<bool> {
-        Ok(self.input()?.buttons.home)
-    }
-
     /// Return whether the board auxiliary button is currently pressed.
-    pub fn auxiliary_button(&mut self) -> Result<bool> {
-        Ok(self.input()?.buttons.auxiliary)
-    }
-
     /// Return whether the boot button is currently pressed.
-    pub fn boot_button(&mut self) -> Result<bool> {
-        Ok(self.input()?.buttons.boot)
-    }
-
     /// Sets a single pixel in the framebuffer without updating the display.
     ///
     /// If the provided coordinates are outside the screen, this method returns

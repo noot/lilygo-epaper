@@ -25,14 +25,21 @@ fn main() -> ! {
 
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
 
+    let i2c_bus =
+        t5s3_epaper_core::i2c::Bus::new(peripherals.I2C0, peripherals.GPIO39, peripherals.GPIO40)
+            .expect("to build i2c bus");
     let mut display = Display::new(
         pin_config!(peripherals),
-        peripherals.I2C0,
+        &i2c_bus,
         peripherals.DMA_CH0,
         peripherals.LCD_CAM,
         peripherals.RMT,
     )
     .expect("to initialize display");
+    let mut input_ctl = t5s3_epaper_core::input::Controller::new(
+        &i2c_bus,
+        t5s3_epaper_core::input_pin_config!(peripherals),
+    );
 
     let delay = Delay::new();
     display.power_on().expect("to power on display");
@@ -40,12 +47,12 @@ fn main() -> ! {
     display.clear().expect("to clear display");
     esp_println::println!(
         "Touch resolution {:?}, display bounds {:?}",
-        display.touch_resolution(),
+        input_ctl.touch_resolution(),
         display.bounding_box().size
     );
 
     loop {
-        let input = display.input().expect("to read input state");
+        let input = input_ctl.state().expect("to read input state");
         if input.buttons.home {
             esp_println::println!("home button pressed");
         }

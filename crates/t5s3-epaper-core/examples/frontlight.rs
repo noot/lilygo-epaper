@@ -31,14 +31,21 @@ fn main() -> ! {
 
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
 
+    let i2c_bus =
+        t5s3_epaper_core::i2c::Bus::new(peripherals.I2C0, peripherals.GPIO39, peripherals.GPIO40)
+            .expect("to build i2c bus");
     let mut display = Display::new(
         pin_config!(peripherals),
-        peripherals.I2C0,
+        &i2c_bus,
         peripherals.DMA_CH0,
         peripherals.LCD_CAM,
         peripherals.RMT,
     )
     .expect("to initialize display");
+    let mut input_ctl = t5s3_epaper_core::input::Controller::new(
+        &i2c_bus,
+        t5s3_epaper_core::input_pin_config!(peripherals),
+    );
 
     let mut light =
         FrontLight::new(peripherals.LEDC, peripherals.GPIO11).expect("to initialize front light");
@@ -85,7 +92,7 @@ fn main() -> ! {
     render_brightness(&mut display, &text_area, last_brightness);
 
     loop {
-        if let Some(touch) = display.touch().expect("to read touch") {
+        if let Some(touch) = input_ctl.state().expect("to read input state").touch {
             if let Some(point) = touch.first_point() {
                 let current = light.brightness();
                 let new_brightness = if point.y < midpoint {

@@ -37,10 +37,12 @@ use esp_hal::{
 };
 use t5s3_epaper_core::{
     display::DisplayRotation,
+    input_pin_config,
     lora::Lora,
     pin_config,
     sdcard::DirectoryEntry,
     Clock,
+    Controller,
     Display,
     DrawMode,
     FrontLight,
@@ -299,14 +301,20 @@ async fn main(spawner: Spawner) -> ! {
     // boot or if the stored blob is missing/invalid.
     let mut settings = Settings::load();
 
+    let i2c_bus =
+        t5s3_epaper_core::i2c::Bus::new(peripherals.I2C0, peripherals.GPIO39, peripherals.GPIO40)
+            .expect("to build i2c bus");
     let mut display = Display::new(
         pin_config!(peripherals),
-        peripherals.I2C0,
+        &i2c_bus,
         peripherals.DMA_CH0,
         peripherals.LCD_CAM,
         peripherals.RMT,
     )
     .expect("to initialize display");
+    // input (touch + all three buttons) runs on the shared i2c bus,
+    // independent of the display driver.
+    let mut input_ctl = Controller::new(&i2c_bus, input_pin_config!(peripherals));
 
     display.set_rotation(DisplayRotation::Rotate270);
 
@@ -1115,7 +1123,7 @@ async fn main(spawner: Spawner) -> ! {
         // poll touch/buttons every pass so input stays responsive. the GPS
         // work below is non-blocking, so it never stalls this poll. a transient
         // read error shouldn't reboot the ui, so log it and retry next pass.
-        let input = match display.input() {
+        let input = match input_ctl.state() {
             Ok(input) => input,
             Err(e) => {
                 esp_println::println!("input read failed: {e}");
@@ -2391,5 +2399,5 @@ async fn main(spawner: Spawner) -> ! {
     }
     display.flush(DrawMode::BlackOnWhite).expect("to flush");
     // hand LPWR back from the clock for the deep-sleep path.
-    display.deep_sleep(clock.into_inner(), None)
+    display.deep_sleep(clock.into_inner(), input_ctl, None)
 }

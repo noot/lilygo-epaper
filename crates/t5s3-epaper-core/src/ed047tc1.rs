@@ -1,8 +1,10 @@
+use core::cell::RefCell;
+
 use esp_hal::{
     dma::DmaTxBuf,
     dma_buffers,
-    gpio::{AnyPin, Flex, Input, InputConfig, Level, Output, OutputConfig, Pin, Pull, RtcPin},
-    i2c::master::{Config as I2cConfig, I2c},
+    gpio::{Level, Output, OutputConfig},
+    i2c::master::I2c,
     lcd_cam::{
         lcd::{i8080, i8080::Command},
         LcdCam,
@@ -12,13 +14,8 @@ use esp_hal::{
     time::Rate,
     Blocking,
 };
-use log::debug;
 
-use crate::{
-    input::{Buttons, InputState},
-    rmt,
-    touchscreen::TouchState,
-};
+use crate::rmt;
 
 macro_rules! pulse {
     ($high:expr, $low:expr) => {
@@ -37,7 +34,6 @@ macro_rules! pulse {
 }
 
 const DMA_BUFFER_SIZE: usize = 248;
-const I2C_FREQUENCY_KHZ: u32 = 100;
 const PCA9555_ADDR: u8 = 0x20;
 const TPS65185_ADDR: u8 = 0x68;
 const PCA9555_REG_INPUT_PORT1: u8 = 1;
@@ -54,21 +50,6 @@ const TPS_REG_VCOM2: u8 = 0x04;
 const TPS_REG_TMST1: u8 = 0x0D;
 const TPS_REG_PG: u8 = 0x0F;
 const TPS_TMST1_READ_THERM: u8 = 1 << 7;
-const GT911_ADDR_LOW: u8 = 0x5D;
-const GT911_ADDR_HIGH: u8 = 0x14;
-const GT911_PRODUCT_ID: u16 = 0x8140;
-const GT911_CONFIG_VERSION: u16 = 0x8047;
-const GT911_MODULE_SWITCH_1: u16 = 0x804D;
-const GT911_CONFIG_CHKSUM: u16 = 0x80FF;
-const GT911_CONFIG_FRESH: u16 = 0x8100;
-const GT911_CONFIG_LENGTH: usize = 186;
-const GT911_COMMAND: u16 = 0x8040;
-const GT911_CMD_SLEEP: u8 = 0x05;
-const GT911_POINT_INFO: u16 = 0x814E;
-const GT911_POINT_1: u16 = 0x814F;
-const GT911_X_RESOLUTION: u16 = 0x8146;
-const GT911_Y_RESOLUTION: u16 = 0x8148;
-const GT911_DEV_ID: u32 = 911;
 const VCOM_MV: u16 = 1600;
 // port 0 bit 0 gates the GPS/LoRa 3.3 V rail (active high); matches the factory
 // firmware's `io_extend_lora_gps_power_on`.
@@ -91,56 +72,25 @@ struct ConfigRegister {
     wakeup: bool,
 }
 
-struct ConfigWriter<'a> {
-    i2c: I2c<'a, Blocking>,
-    leh: Output<'a>,
-    stv: Output<'a>,
-    touch_rst: Output<'a>,
-    touch_int: Flex<'a>,
-    touch_initialized: bool,
-    touch_addr: u8,
-    touch_resolution: (u16, u16),
+struct ConfigWriter<'a, 'd> {
+    i2c: &'a RefCell<I2c<'d, Blocking>>,
+    leh: Output<'d>,
+    stv: Output<'d>,
     output_port0: u8,
     output_port1: u8,
     config: ConfigRegister,
 }
 
-impl<'a> ConfigWriter<'a> {
+impl<'a, 'd> ConfigWriter<'a, 'd> {
     fn new(
-        i2c: peripherals::I2C0<'a>,
-        sda: peripherals::GPIO39<'a>,
-        scl: peripherals::GPIO40<'a>,
-        leh: peripherals::GPIO42<'a>,
-        stv: peripherals::GPIO45<'a>,
-        touch_rst: peripherals::GPIO9<'a>,
-        touch_int: peripherals::GPIO3<'a>,
+        i2c: &'a RefCell<I2c<'d, Blocking>>,
+        leh: peripherals::GPIO42<'d>,
+        stv: peripherals::GPIO45<'d>,
     ) -> crate::Result<Self> {
-        let i2c = I2c::new(
-            i2c,
-            I2cConfig::default().with_frequency(Rate::from_khz(I2C_FREQUENCY_KHZ)),
-        )
-        .map_err(crate::Error::I2cConfig)?
-        .with_sda(sda)
-        .with_scl(scl);
-
-        touch_rst.rtcio_pad_hold(false);
-        touch_int.rtcio_pad_hold(false);
-
         let mut writer = ConfigWriter {
             i2c,
             leh: Output::new(leh, Level::Low, OutputConfig::default()),
             stv: Output::new(stv, Level::High, OutputConfig::default()),
-            touch_rst: Output::new(touch_rst, Level::High, OutputConfig::default()),
-            touch_int: {
-                let mut pin = Flex::new(touch_int);
-                pin.set_output_enable(false);
-                pin.set_input_enable(true);
-                pin.apply_input_config(&InputConfig::default());
-                pin
-            },
-            touch_initialized: false,
-            touch_addr: GT911_ADDR_LOW,
-            touch_resolution: (0, 0),
             output_port0: 0xFF,
             output_port1: 0,
             config: ConfigRegister::default(),
@@ -193,34 +143,6 @@ impl<'a> ConfigWriter<'a> {
             self.output_port0 &= !PCA_BIT_LORA_GPS_PWR;
         }
         self.write_register(PCA9555_ADDR, &[PCA9555_REG_OUTPUT_PORT0, self.output_port0])
-    }
-
-    fn sleep_touch(&mut self) -> crate::Result<()> {
-        if !self.touch_initialized {
-            return Ok(());
-        }
-        // GT911 sits on the always-on 3.3 V rail and keeps scanning (~3-4 mA)
-        // until told to sleep. It only latches the 0x05 sleep command with INT
-        // held low, so assert INT first.
-        self.touch_int.set_low();
-        self.touch_int.set_output_enable(true);
-        self.touch_int.set_input_enable(false);
-        busy_delay(30_000);
-        let cmd = self.write_register16(self.touch_addr, GT911_COMMAND, &[GT911_CMD_SLEEP]);
-
-        // The command alone is not enough: once the pin is released the INT
-        // pull-up floats high, which is the GT911 wake trigger, so it resumes
-        // scanning. Hold RST low instead, keeping the chip in reset for the
-        // whole deep sleep. `touch_reset_for_address` resets it on the next boot.
-        self.touch_rst.set_low();
-        busy_delay(30_000);
-        // SAFETY: GPIO9 is owned by `self.touch_rst`, which is driving it low
-        // right now. `rtcio_pad_hold` only sets the LP_AON hold latch and does
-        // not touch the output registers the live `Output` drives. The latch
-        // freezes the pad low across deep sleep and is cleared by the matching
-        // `rtcio_pad_hold(false)` in `new`.
-        unsafe { peripherals::GPIO9::steal() }.rtcio_pad_hold(true);
-        cmd
     }
 
     fn set_stv(&mut self, level: bool) {
@@ -279,273 +201,49 @@ impl<'a> ConfigWriter<'a> {
     fn read_register(&mut self, device: u8, reg: u8) -> crate::Result<u8> {
         let mut value = [0u8; 1];
         self.i2c
+            .borrow_mut()
             .write_read(device, &[reg], &mut value)
             .map_err(crate::Error::I2c)?;
         Ok(value[0])
     }
 
     fn write_register(&mut self, device: u8, payload: &[u8]) -> crate::Result<()> {
-        self.i2c.write(device, payload).map_err(crate::Error::I2c)
-    }
-
-    fn write_register16(&mut self, device: u8, reg: u16, payload: &[u8]) -> crate::Result<()> {
-        let mut buffer = [0u8; 41];
-        let len = payload.len() + 2;
-        buffer[0] = (reg >> 8) as u8;
-        buffer[1] = reg as u8;
-        buffer[2..len].copy_from_slice(payload);
         self.i2c
-            .write(device, &buffer[..len])
-            .map_err(crate::Error::I2c)
-    }
-
-    fn read_register16(&mut self, device: u8, reg: u16, payload: &mut [u8]) -> crate::Result<()> {
-        let reg = [(reg >> 8) as u8, reg as u8];
-        self.i2c
-            .write_read(device, &reg, payload)
+            .borrow_mut()
+            .write(device, payload)
             .map_err(crate::Error::I2c)
     }
 
     fn battery_voltage_mv(&mut self) -> crate::Result<u16> {
-        crate::bq27220::voltage_mv(&mut self.i2c)
+        crate::bq27220::voltage_mv(&mut self.i2c.borrow_mut())
     }
 
     fn battery_state_of_charge(&mut self) -> crate::Result<u16> {
-        crate::bq27220::state_of_charge(&mut self.i2c)
+        crate::bq27220::state_of_charge(&mut self.i2c.borrow_mut())
     }
 
     fn battery_time_to_full_minutes(&mut self) -> crate::Result<Option<u16>> {
-        crate::bq27220::time_to_full_minutes(&mut self.i2c)
+        crate::bq27220::time_to_full_minutes(&mut self.i2c.borrow_mut())
     }
 
     fn fuel_gauge_diagnostics(&mut self) -> crate::Result<crate::bq27220::Diagnostics> {
-        crate::bq27220::diagnostics(&mut self.i2c)
+        crate::bq27220::diagnostics(&mut self.i2c.borrow_mut())
     }
 
     fn fuel_gauge_exit_config_update(&mut self) -> crate::Result<()> {
-        crate::bq27220::exit_config_update(&mut self.i2c)
+        crate::bq27220::exit_config_update(&mut self.i2c.borrow_mut())
     }
 
     fn fuel_gauge_program_capacity(&mut self, capacity_mah: u16) -> crate::Result<()> {
-        crate::bq27220::program_capacity(&mut self.i2c, capacity_mah)
+        crate::bq27220::program_capacity(&mut self.i2c.borrow_mut(), capacity_mah)
     }
 
     fn shutdown(&mut self) -> crate::Result<()> {
-        crate::bq25896::disable_batfet(&mut self.i2c)
+        crate::bq25896::disable_batfet(&mut self.i2c.borrow_mut())
     }
 
     fn charger_status(&mut self) -> crate::Result<crate::bq25896::Status> {
-        crate::bq25896::read_status(&mut self.i2c)
-    }
-
-    fn auxiliary_button_pressed(&mut self) -> crate::Result<bool> {
-        Ok(self.read_register(PCA9555_ADDR, PCA9555_REG_INPUT_PORT1)? & PCA_BIT_BUTTON == 0)
-    }
-
-    fn init_touch(&mut self) -> crate::Result<()> {
-        debug!("touch init: probing GT911");
-        self.touch_reset_for_address(GT911_ADDR_LOW)?;
-
-        let mut product_id = [0u8; 4];
-        if self
-            .read_register16(GT911_ADDR_LOW, GT911_PRODUCT_ID, &mut product_id)
-            .is_ok()
-            && parse_gt911_chip_id(product_id) == GT911_DEV_ID
-        {
-            debug!(
-                "touch init: addr 0x{:02X} product_id={:?}",
-                GT911_ADDR_LOW, product_id
-            );
-            self.touch_addr = GT911_ADDR_LOW;
-        } else {
-            debug!(
-                "touch init: addr 0x{:02X} probe failed product_id={:?}",
-                GT911_ADDR_LOW, product_id
-            );
-            self.touch_reset_for_address(GT911_ADDR_HIGH)?;
-            self.read_register16(GT911_ADDR_HIGH, GT911_PRODUCT_ID, &mut product_id)?;
-            debug!(
-                "touch init: addr 0x{:02X} product_id={:?}",
-                GT911_ADDR_HIGH, product_id
-            );
-            self.touch_addr = GT911_ADDR_HIGH;
-        }
-
-        let chip_id = parse_gt911_chip_id(product_id);
-        if chip_id != GT911_DEV_ID {
-            debug!("touch init: unexpected chip id {}", chip_id);
-            return Err(crate::Error::TouchInitFailed);
-        }
-
-        let x_res = self.touch_read_u16(GT911_X_RESOLUTION)?;
-        let y_res = self.touch_read_u16(GT911_Y_RESOLUTION)?;
-        // the GT911 reports an inconsistent resolution depending on whether it
-        // has been configured before: zero on a cold boot, non-zero after a
-        // deep-sleep wake (its config survives). that flips the coordinate
-        // mapping below. the panel is a fixed 540x960, so pin it to keep touch
-        // stable across boots.
-        debug!(
-            "touch init: reported resolution {}x{}, pinning to 540x960",
-            x_res, y_res
-        );
-        self.touch_resolution = (
-            crate::display::Display::HEIGHT,
-            crate::display::Display::WIDTH,
-        );
-        self.touch_set_interrupt_mode_low_level_query()?;
-        debug!(
-            "touch init: resolution={}x{}",
-            self.touch_resolution.0, self.touch_resolution.1
-        );
-        self.touch_initialized = true;
-
-        Ok(())
-    }
-
-    fn ensure_touch(&mut self) -> crate::Result<()> {
-        if self.touch_initialized {
-            return Ok(());
-        }
-        debug!("touch init: lazy init");
-        self.init_touch()
-    }
-
-    fn touch_reset_for_address(&mut self, address: u8) -> crate::Result<()> {
-        self.touch_rst.set_low();
-        busy_delay(30_000);
-
-        match address {
-            GT911_ADDR_HIGH => {
-                self.touch_int.set_high();
-            }
-            _ => {
-                self.touch_int.set_low();
-            }
-        }
-        self.touch_int.set_output_enable(true);
-        self.touch_int.set_input_enable(false);
-        busy_delay(30_000);
-        self.touch_rst.set_high();
-        busy_delay(4_500_000);
-        self.touch_int.set_output_enable(false);
-        self.touch_int.set_input_enable(true);
-        self.touch_int.apply_input_config(&InputConfig::default());
-        busy_delay(5_000_000);
-        Ok(())
-    }
-
-    fn touch_pressed(&self) -> bool {
-        self.touch_int.is_low()
-    }
-
-    fn touch_read_u16(&mut self, reg: u16) -> crate::Result<u16> {
-        let mut value = [0u8; 2];
-        self.read_register16(self.touch_addr, reg, &mut value)?;
-        Ok(u16::from_le_bytes(value))
-    }
-
-    fn touch_set_interrupt_mode_low_level_query(&mut self) -> crate::Result<()> {
-        let mut value = [0u8; 1];
-        self.read_register16(self.touch_addr, GT911_MODULE_SWITCH_1, &mut value)?;
-        value[0] = (value[0] & 0xFC) | 0x02;
-        self.write_register16(self.touch_addr, GT911_MODULE_SWITCH_1, &value)?;
-        self.touch_reload_config()
-    }
-
-    fn touch_reload_config(&mut self) -> crate::Result<()> {
-        let mut config = [0u8; GT911_CONFIG_LENGTH - 2];
-        self.read_register16(self.touch_addr, GT911_CONFIG_VERSION, &mut config)?;
-        let checksum = (!config
-            .iter()
-            .fold(0u8, |sum, value| sum.wrapping_add(*value)))
-        .wrapping_add(1);
-        self.write_register16(self.touch_addr, GT911_CONFIG_CHKSUM, &[checksum])?;
-        self.write_register16(self.touch_addr, GT911_CONFIG_FRESH, &[0x01])?;
-        Ok(())
-    }
-
-    fn input_state(&mut self) -> crate::Result<InputState> {
-        self.ensure_touch()?;
-
-        if !self.touch_pressed() {
-            return Ok(InputState::default());
-        }
-
-        let mut point_info = [0u8; 1];
-        self.read_register16(self.touch_addr, GT911_POINT_INFO, &mut point_info)?;
-        let status = point_info[0];
-        let home = status & 0x10 != 0;
-        let count = status & 0x0F;
-        let buffer_ready = status & 0x80 != 0;
-        if !buffer_ready && count == 0 {
-            return Ok(InputState::default());
-        }
-        debug!("touch state: point_info=0x{:02X}", status);
-        self.write_register16(self.touch_addr, GT911_POINT_INFO, &[0x00])?;
-
-        let mut input = InputState {
-            buttons: Buttons {
-                home,
-                auxiliary: self.auxiliary_button_pressed()?,
-                boot: false,
-            },
-            ..InputState::default()
-        };
-
-        if count == 0 {
-            return Ok(input);
-        }
-
-        let read_count = count.min(5) as usize;
-        let mut buffer = [0u8; 39];
-        self.read_register16(self.touch_addr, GT911_POINT_1, &mut buffer)?;
-
-        let mut state = TouchState {
-            count: read_count as u8,
-            ..TouchState::default()
-        };
-
-        for i in 0..read_count {
-            let offset = i * 8;
-            state.points[i].id = buffer[offset];
-            let raw_x = u16::from_le_bytes([buffer[offset + 1], buffer[offset + 2]]);
-            let raw_y = u16::from_le_bytes([buffer[offset + 3], buffer[offset + 4]]);
-            let (x, y) = if self.touch_resolution == (540, 960) {
-                let x = (u32::from(raw_y) * u32::from(crate::display::Display::WIDTH - 1)
-                    / u32::from(self.touch_resolution.1 - 1)) as u16;
-                let y = (u32::from(
-                    self.touch_resolution
-                        .0
-                        .saturating_sub(1)
-                        .saturating_sub(raw_x),
-                ) * u32::from(crate::display::Display::HEIGHT - 1)
-                    / u32::from(self.touch_resolution.0 - 1)) as u16;
-                (x, y)
-            } else if self.touch_resolution.0 > 1 && self.touch_resolution.1 > 1 {
-                let x = (u32::from(raw_x) * u32::from(crate::display::Display::WIDTH - 1)
-                    / u32::from(self.touch_resolution.0 - 1)) as u16;
-                let y = (u32::from(raw_y) * u32::from(crate::display::Display::HEIGHT - 1)
-                    / u32::from(self.touch_resolution.1 - 1)) as u16;
-                (x, y)
-            } else {
-                (raw_x, raw_y)
-            };
-            debug!(
-                "touch point raw=({}, {}) mapped=({}, {})",
-                raw_x, raw_y, x, y
-            );
-            state.points[i].x = x;
-            state.points[i].y = y;
-            state.points[i].size = u16::from_le_bytes([buffer[offset + 5], buffer[offset + 6]]);
-        }
-
-        input.touch = Some(state);
-
-        Ok(input)
-    }
-
-    fn touch_resolution(&self) -> (u16, u16) {
-        self.touch_resolution
+        crate::bq25896::read_status(&mut self.i2c.borrow_mut())
     }
 }
 
@@ -558,45 +256,31 @@ pub struct PinConfig<'a> {
     pub data5: peripherals::GPIO17<'a>,
     pub data6: peripherals::GPIO18<'a>,
     pub data7: peripherals::GPIO8<'a>,
-    pub i2c_sda: peripherals::GPIO39<'a>,
-    pub i2c_scl: peripherals::GPIO40<'a>,
     pub leh: peripherals::GPIO42<'a>,
     pub lcd_dc: peripherals::GPIO41<'a>,
     pub lcd_wrx: peripherals::GPIO4<'a>,
     pub rmt: peripherals::GPIO48<'a>,
     pub stv: peripherals::GPIO45<'a>,
-    pub touch_int: peripherals::GPIO3<'a>,
-    pub touch_rst: peripherals::GPIO9<'a>,
-    pub boot_btn: peripherals::GPIO0<'a>,
 }
 
-pub(crate) struct ED047TC1<'a> {
-    i8080: Option<i8080::I8080<'a, Blocking>>,
-    cfg_writer: ConfigWriter<'a>,
-    rmt: rmt::Rmt<'a>,
+pub(crate) struct ED047TC1<'a, 'd> {
+    i8080: Option<i8080::I8080<'d, Blocking>>,
+    cfg_writer: ConfigWriter<'a, 'd>,
+    rmt: rmt::Rmt<'d>,
     dma_buf: Option<DmaTxBuf>,
-    boot_btn: AnyPin<'a>,
 }
 
-impl<'a> ED047TC1<'a> {
+impl<'a, 'd> ED047TC1<'a, 'd> {
     pub(crate) fn new(
-        pins: PinConfig<'a>,
-        i2c: peripherals::I2C0<'a>,
-        dma: peripherals::DMA_CH0<'a>,
-        lcd_cam: peripherals::LCD_CAM<'a>,
-        rmt: peripherals::RMT<'a>,
+        pins: PinConfig<'d>,
+        i2c: &'a crate::i2c::Bus<'d>,
+        dma: peripherals::DMA_CH0<'d>,
+        lcd_cam: peripherals::LCD_CAM<'d>,
+        rmt: peripherals::RMT<'d>,
     ) -> crate::Result<Self> {
         let lcd_cam = LcdCam::new(lcd_cam);
 
-        let mut cfg_writer = ConfigWriter::new(
-            i2c,
-            pins.i2c_sda,
-            pins.i2c_scl,
-            pins.leh,
-            pins.stv,
-            pins.touch_rst,
-            pins.touch_int,
-        )?;
+        let mut cfg_writer = ConfigWriter::new(&i2c.i2c, pins.leh, pins.stv)?;
         cfg_writer.write()?;
 
         let (_, _, tx_buffer, tx_descriptors) = dma_buffers!(0, DMA_BUFFER_SIZE);
@@ -627,7 +311,6 @@ impl<'a> ED047TC1<'a> {
             cfg_writer,
             rmt: rmt::Rmt::new(rmt, pins.rmt),
             dma_buf,
-            boot_btn: pins.boot_btn.degrade(),
         };
         Ok(ctrl)
     }
@@ -660,7 +343,6 @@ impl<'a> ED047TC1<'a> {
             }
             busy_delay(240_000);
         }
-        let _ = self.cfg_writer.ensure_touch();
         Ok(())
     }
 
@@ -715,29 +397,6 @@ impl<'a> ED047TC1<'a> {
 
     pub(crate) fn lora_gps_power_off(&mut self) -> crate::Result<()> {
         self.cfg_writer.set_lora_gps_power(false)
-    }
-
-    pub(crate) fn sleep_touch(&mut self) -> crate::Result<()> {
-        self.cfg_writer.sleep_touch()
-    }
-
-    pub(crate) fn input_state(&mut self) -> crate::Result<InputState> {
-        let mut input = self.cfg_writer.input_state()?;
-        input.buttons.auxiliary = self.cfg_writer.auxiliary_button_pressed()?;
-        let boot_btn = Input::new(
-            self.boot_btn.reborrow(),
-            InputConfig::default().with_pull(Pull::Up),
-        );
-        input.buttons.boot = boot_btn.is_low();
-        Ok(input)
-    }
-
-    pub(crate) fn into_boot_button(self) -> AnyPin<'a> {
-        self.boot_btn
-    }
-
-    pub(crate) fn touch_resolution(&self) -> (u16, u16) {
-        self.cfg_writer.touch_resolution()
     }
 
     pub(crate) fn frame_start(&mut self) -> crate::Result<()> {
@@ -855,22 +514,8 @@ impl<'a> ED047TC1<'a> {
     }
 }
 
-fn parse_gt911_chip_id(product_id: [u8; 4]) -> u32 {
-    let mut value = 0u32;
-    for digit in product_id {
-        if digit == 0 {
-            break;
-        }
-        if !digit.is_ascii_digit() {
-            return 0;
-        }
-        value = value * 10 + (digit - b'0') as u32;
-    }
-    value
-}
-
 #[inline(always)]
-fn busy_delay(wait_cycles: u32) {
+pub(crate) fn busy_delay(wait_cycles: u32) {
     // compare elapsed cycles with wrapping subtraction: the 32-bit cycle
     // counter wraps roughly every ~18s at 240MHz, so a plain `start + wait`
     // target can sit above any value the counter reaches and spin forever.

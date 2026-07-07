@@ -49,10 +49,16 @@
 //!     let delay = Delay::new();
 //!     // Create PSRAM allocator
 //!     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
-//!     // Initialise the display
+//!     // Build the shared I2C bus, then initialise the display on it
+//!     let i2c_bus = t5s3_epaper_core::i2c::Bus::new(
+//!         peripherals.I2C0,
+//!         peripherals.GPIO39,
+//!         peripherals.GPIO40,
+//!     )
+//!     .expect("to build i2c bus");
 //!     let mut display = Display::new(
 //!         pin_config!(peripherals),
-//!         peripherals.I2C0,
+//!         &i2c_bus,
 //!         peripherals.DMA_CH0,
 //!         peripherals.LCD_CAM,
 //!         peripherals.RMT,
@@ -101,6 +107,7 @@ pub mod bq25896;
 pub mod bq27220;
 pub mod display;
 pub mod frontlight;
+pub mod i2c;
 pub mod input;
 pub mod power;
 pub mod rtc;
@@ -211,7 +218,7 @@ pub use crate::{
     display::{Display, DrawMode},
     ed047tc1::PinConfig,
     frontlight::FrontLight,
-    input::{Buttons, InputState},
+    input::{Buttons, Controller, InputState},
     power::WakeStatus,
     rtc::Clock,
     sdcard::{DirectoryEntry as SdDirectoryEntry, SdCard},
@@ -231,13 +238,20 @@ macro_rules! pin_config {
             data5: $name.GPIO17,
             data6: $name.GPIO18,
             data7: $name.GPIO8,
-            i2c_sda: $name.GPIO39,
-            i2c_scl: $name.GPIO40,
             leh: $name.GPIO42,
             lcd_dc: $name.GPIO41,
             lcd_wrx: $name.GPIO4,
             rmt: $name.GPIO48,
             stv: $name.GPIO45,
+        }
+    }};
+}
+
+/// Convenience macro to build the input controller's pin config struct.
+#[macro_export]
+macro_rules! input_pin_config {
+    ($name:expr) => {{
+        t5s3_epaper_core::input::PinConfig {
             touch_int: $name.GPIO3,
             touch_rst: $name.GPIO9,
             boot_btn: $name.GPIO0,

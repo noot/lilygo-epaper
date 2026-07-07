@@ -61,14 +61,21 @@ fn main() -> ! {
     let (year, month, day, hour, minute, second) = format_uk_datetime(now_us / 1_000_000);
     let uptime = clock.uptime();
 
+    let i2c_bus =
+        t5s3_epaper_core::i2c::Bus::new(peripherals.I2C0, peripherals.GPIO39, peripherals.GPIO40)
+            .expect("to build i2c bus");
     let mut display = Display::new(
         pin_config!(peripherals),
-        peripherals.I2C0,
+        &i2c_bus,
         peripherals.DMA_CH0,
         peripherals.LCD_CAM,
         peripherals.RMT,
     )
     .expect("to initialize display");
+    let input_ctl = t5s3_epaper_core::input::Controller::new(
+        &i2c_bus,
+        t5s3_epaper_core::input_pin_config!(peripherals),
+    );
 
     let delay = Delay::new();
 
@@ -112,5 +119,5 @@ fn main() -> ! {
     delay.delay_millis(100);
 
     let lpwr = clock.into_inner();
-    display.deep_sleep(lpwr, Some(Duration::from_secs(30)));
+    display.deep_sleep(lpwr, input_ctl, Some(Duration::from_secs(30)));
 }
