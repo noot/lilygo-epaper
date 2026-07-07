@@ -64,27 +64,6 @@ const fn parse_port(s: &str) -> u16 {
     }
 }
 
-// where map tiles are fetched from. defaults to noot-server on the LAN, but can
-// be pointed at a public map proxy (set MAP_HOST/MAP_PORT at build time) so
-// maps download anywhere the device has internet, not only on the home network.
-// an empty env value falls back to noot-server, so leaving it unset is safe.
-const MAP_HOST: &str = pick_str(option_env!("MAP_HOST"), SERVER_HOST);
-const MAP_PORT: u16 = pick_port(option_env!("MAP_PORT"), SERVER_PORT);
-
-const fn pick_str(env: Option<&'static str>, fallback: &'static str) -> &'static str {
-    match env {
-        Some(s) if !s.is_empty() => s,
-        _ => fallback,
-    }
-}
-
-const fn pick_port(env: Option<&'static str>, fallback: u16) -> u16 {
-    match env {
-        Some(s) if !s.is_empty() => parse_port(s),
-        _ => fallback,
-    }
-}
-
 // tailscale funnel hostname for reaching noot-server away from home (e.g.
 // "machine.tailnet.ts.net"). when set, all noot-server traffic goes to it
 // over verified https instead of plain http to SERVER_HOST.
@@ -149,11 +128,9 @@ pub(crate) enum Op {
 
 // which server an `Op::Get` targets.
 pub(crate) enum Host {
-    // noot-server (music and environment json).
+    // noot-server (music, environment json, and map tiles).
     Server,
-    // the configured map host.
-    Map,
-    // an arbitrary public host over plain http on port 80 (weather api).
+    // an arbitrary public host over verified https (weather api).
     External(&'static str),
 }
 
@@ -451,7 +428,6 @@ async fn http_get(
         }
         match host {
             Host::Server => request(stack, "GET", path, max_body).await,
-            Host::Map => request_map(stack, path, max_body).await,
             Host::External(h) => request_tls(stack, h, "GET", path, max_body, None).await,
         }
     })
@@ -468,7 +444,7 @@ async fn http_get(
 // tile).
 const MAX_CONSECUTIVE_MISSES: usize = 5;
 
-// GET each map path from the configured map host in one session, then power
+// GET each map path from noot-server in one session, then power
 // the radio back down. doing a whole area in one bring-up (rather than one per
 // tile) keeps a bulk download to a single ~20s radio start. each fetched tile
 // is streamed to the ui as an `Event::Tile` so it can be written to the sd
@@ -507,7 +483,7 @@ async fn download_maps(
                 esp_println::println!("wifi: bulk download cancelled");
                 break;
             }
-            match request_map(stack, path, max_body).await {
+            match request(stack, "GET", path, max_body).await {
                 Some(body) => {
                     misses = 0;
                     fetched += 1;
@@ -785,51 +761,6 @@ async fn request_tls(
     connection.flush().await.ok()?;
 
     read_response(&mut connection, max_body).await
-}
-
-// one map-tile GET. when the map host is noot-server itself the request
-// rides the server path (lan-first, funnel fallback, bearer as needed);
-// a custom map host is reached over plain http as configured.
-async fn request_map(stack: Stack<'_>, path: &str, max_body: usize) -> Option<Vec<u8>> {
-    if MAP_HOST == SERVER_HOST {
-        request(stack, "GET", path, max_body).await
-    } else {
-        request_host(stack, MAP_HOST, MAP_PORT, path, max_body).await
-    }
-}
-
-// one plain-http GET to `host:port` (HTTP/1.0 so the body comes back
-// connection-close rather than chunked, which this minimal read-until-close
-// client can't decode), returning the response body for a 2xx status. `host` is
-// used verbatim if it parses as an IPv4 address, otherwise resolved over DNS.
-// `max_body` caps how much body is buffered.
-async fn request_host(
-    stack: Stack<'_>,
-    host: &str,
-    port: u16,
-    path: &str,
-    max_body: usize,
-) -> Option<Vec<u8>> {
-    let addr = match host.parse::<Ipv4Addr>() {
-        Ok(ip) => IpAddress::Ipv4(ip),
-        Err(_) => *stack.dns_query(host, DnsQueryType::A).await.ok()?.first()?,
-    };
-
-    let mut rx = [0u8; 1536];
-    let mut tx = [0u8; 1536];
-    let mut socket = TcpSocket::new(stack, &mut rx, &mut tx);
-    socket.set_timeout(Some(Duration::from_secs(8)));
-    socket.connect(IpEndpoint::new(addr, port)).await.ok()?;
-
-    let mut req = String::new();
-    write!(
-        req,
-        "GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-    )
-    .ok()?;
-    socket.write_all(req.as_bytes()).await.ok()?;
-
-    read_response(&mut socket, max_body).await
 }
 
 // buffer a response until the server closes the connection, then strip the

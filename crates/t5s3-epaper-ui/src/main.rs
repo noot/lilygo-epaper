@@ -2064,19 +2064,17 @@ async fn main(spawner: Spawner) -> ! {
             && env.is_dirty()
             && !needs_redraw
             && wifi_pending.is_none()
-        {
-            let path = environment::path();
-            if wifi::send(saved_request(
+            && wifi::send(saved_request(
                 &settings,
                 wifi::Op::Get {
                     host: wifi::Host::Server,
-                    path: String::from(path.as_str()),
+                    path: String::from(environment::path()),
                     max_body: 8192,
                 },
-            )) {
-                env.clear();
-                wifi_pending = Some(Pending::Environment);
-            }
+            ))
+        {
+            env.clear();
+            wifi_pending = Some(Pending::Environment);
         }
 
         // load the map for the gps page's current fix. cache-first: the cell the
@@ -2125,7 +2123,7 @@ async fn main(spawner: Spawner) -> ! {
                             if wifi::send(saved_request(
                                 &settings,
                                 wifi::Op::Get {
-                                    host: wifi::Host::Map,
+                                    host: wifi::Host::Server,
                                     path: String::from(path.as_str()),
                                     max_body: MAP_MAX_BYTES,
                                 },
