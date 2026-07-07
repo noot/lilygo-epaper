@@ -9,13 +9,13 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 - [x] **GPS** — MIA-M10Q (u-blox) or L76K (Quectel), UART TX=GPIO43 RX=GPIO44, power via PCA9535 IO0_0
 - [x] **LoRa** — SX1262, SPI CS=GPIO46 IRQ=GPIO10 RST=GPIO1 BUSY=GPIO47, shares SPI bus with SD card
 - [x] **front light** — PT4103B23F, PWM on GPIO11
-- [ ] **external RTC** — PCF85063 (or PCF8563), I2C 0x51 IRQ=GPIO2 (lib currently uses ESP32 internal RTC only)
+- [x] **external RTC** — PCF85063 (or PCF8563), I2C 0x51 IRQ=GPIO2 (lib currently uses ESP32 internal RTC only)
 
 ### medium priority
 
 - [x] **SPI bus arbitration** — LoRa CS must be held high during SD card access (shared bus)
-- [ ] **BQ25896 full driver** — charge current config, charge status, input power path management (currently shutdown only)
-- [ ] **BQ27220 full driver** — current draw, temperature, state of health, remaining/full capacity (currently voltage + SOC only)
+- [x] **BQ25896 full driver** — charge current config, charge status, input power path management (currently shutdown only)
+- [x] **BQ27220 full driver** — current draw, temperature, state of health, remaining/full capacity (currently voltage + SOC only)
 - [x] LoRa user message (with keyboard) and broadcast
 
 ### low priority / nice to have
@@ -56,10 +56,11 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 - [x] pull weather data and display on ui page
 - [x] pull home environment data (temp, humidity, co2)
 - [x] notes app - stores notes on sd card
+- [ ] settings page should have "check internet access" or "force wifi clock sync" to check wifi
+- [ ] TLS implementation with esp-mbedtls
 
 # bug fixes
 
 - [x] sleep doesn't properly deep sleep - battery still drains quite a lot
 - [x] battery percentage only refreshes when a new page is loaded
-- [ ] keyboard "send" button is unresponsive at times (lower right corner issue?)
-- [ ] if clock fails to sync it doesn't resync - have button in info to try to sync
+- [ ] saved wifi networks don't store password upon disconnect; have to type password again to connect (should just be able to click)
