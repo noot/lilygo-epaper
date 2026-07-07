@@ -323,7 +323,7 @@ async fn main(spawner: Spawner) -> ! {
     // battery-backed external rtc, also on the shared i2c bus: restored from
     // below whenever the internal clock was reset, written back on every
     // successful ntp sync.
-    let rtc_ext = t5s3_epaper_core::pcf85063::Rtc::new(&i2c_bus);
+    let rtc_ext = t5s3_epaper_core::pcf8563::Rtc::new(&i2c_bus);
 
     display.set_rotation(DisplayRotation::Rotate270);
 

@@ -15,7 +15,7 @@ const FREQUENCY_KHZ: u32 = 100;
 /// GT911 touch controller, BQ27220 fuel gauge, BQ25896 charger) lives on this
 /// one bus. Owning it once and lending it out by reference is what lets the
 /// display, the input controller, and any future peripheral (e.g. the
-/// PCF85063 external RTC) coexist without threading everything through one
+/// PCF8563 external RTC) coexist without threading everything through one
 /// driver.
 pub struct Bus<'d> {
     pub(crate) i2c: RefCell<I2c<'d, Blocking>>,

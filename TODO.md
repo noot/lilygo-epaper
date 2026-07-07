@@ -9,7 +9,7 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 - [x] **GPS** — MIA-M10Q (u-blox) or L76K (Quectel), UART TX=GPIO43 RX=GPIO44, power via PCA9535 IO0_0
 - [x] **LoRa** — SX1262, SPI CS=GPIO46 IRQ=GPIO10 RST=GPIO1 BUSY=GPIO47, shares SPI bus with SD card
 - [x] **front light** — PT4103B23F, PWM on GPIO11
-- [x] **external RTC** — PCF85063 (or PCF8563), I2C 0x51 IRQ=GPIO2 (lib currently uses ESP32 internal RTC only)
+- [x] **external RTC** — PCF8563, I2C 0x51 IRQ=GPIO2 (seconds..years block at 0x02; drives the clock across cold boots)
 
 ### medium priority
 
