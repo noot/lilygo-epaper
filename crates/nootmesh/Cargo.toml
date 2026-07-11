@@ -1,0 +1,16 @@
+[package]
+name = "nootmesh"
+description = "no_std mesh protocol over LoRa: TDMA sync, slot assignment, and (later) messaging"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+repository = "https://github.com/noot/t5s3-epaper"
+
+[dependencies]
+heapless = "0.8"
+thiserror = { version = "2.0", default-features = false }
+
+# isolated from the embedded repo root (workspace-excluded) so its tests build
+# for the host with a stable toolchain rather than the esp32 target the root
+# .cargo/config forces on everything beneath it. consumed by the firmware as a
+# no_std path dependency.

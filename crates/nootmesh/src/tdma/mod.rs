@@ -1,0 +1,223 @@
+//! GPS-rooted TDMA on a shared LoRa channel.
+//!
+//! Time is divided into frames of [`Config::slots_per_frame`] slots. One
+//! elected root (GPS-fixed nodes outrank the rest, then lowest id) anchors the
+//! frame origin to UTC and floods it outward in [`Beacon`]s relayed by
+//! stratum; see [`Sync`]. Data slots are then claimed collision-free via
+//! distributed 2-hop graph coloring; see [`Coloring`].
+//!
+//! Frame layout: beacon slots first (the root transmits in slot 0, stratum-k
+//! relays in slot `min(k, beacon_slots - 1)`), then contention slots where
+//! nodes without a data slot send [`Hello`]s, then data slots. In-slot
+//! transmissions start `guard_us` after the slot boundary so receivers with
+//! slightly offset clocks still capture the whole packet.
+
+mod slots;
+mod sync;
+
+pub use slots::{Coloring, Hello, MAX_NEIGHBORS};
+pub use sync::{Beacon, Sync};
+
+const MAX_SLOTS_PER_FRAME: u16 = 256;
+
+/// TDMA frame layout and timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Config {
+    slot_us: u64,
+    slots_per_frame: u16,
+    guard_us: u64,
+    beacon_slots: u16,
+    contention_slots: u16,
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum Error {
+    #[error("slot ({slot_us} us) must be longer than twice the guard ({guard_us} us)")]
+    SlotTooShort { slot_us: u64, guard_us: u64 },
+    #[error("frame ({frame_us} us) must be a whole number of seconds to anchor to GPS time")]
+    FrameNotWholeSeconds { frame_us: u64 },
+    #[error("need at least one beacon slot")]
+    NoBeaconSlots,
+    #[error(
+        "beacon ({beacon}) + contention ({contention}) slots leave no data slots in a {slots_per_frame}-slot frame"
+    )]
+    NoDataSlots {
+        beacon: u16,
+        contention: u16,
+        slots_per_frame: u16,
+    },
+    #[error("{0} slots per frame exceeds the maximum of {MAX_SLOTS_PER_FRAME}")]
+    TooManySlots(u16),
+}
+
+/// Which purpose a slot index serves within the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotKind {
+    Beacon,
+    Contention,
+    Data,
+}
+
+/// Where a local clock reading falls on the synchronized timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FramePosition {
+    pub frame_number: u64,
+    pub slot: u16,
+    /// Microseconds elapsed since the start of `slot`.
+    pub offset_us: u64,
+}
+
+impl Config {
+    pub fn new(
+        slot_us: u64,
+        slots_per_frame: u16,
+        guard_us: u64,
+        beacon_slots: u16,
+        contention_slots: u16,
+    ) -> Result<Self, Error> {
+        if slot_us <= 2 * guard_us {
+            return Err(Error::SlotTooShort { slot_us, guard_us });
+        }
+        if slots_per_frame > MAX_SLOTS_PER_FRAME {
+            return Err(Error::TooManySlots(slots_per_frame));
+        }
+        if beacon_slots == 0 {
+            return Err(Error::NoBeaconSlots);
+        }
+        if beacon_slots + contention_slots >= slots_per_frame {
+            return Err(Error::NoDataSlots {
+                beacon: beacon_slots,
+                contention: contention_slots,
+                slots_per_frame,
+            });
+        }
+        let config = Self {
+            slot_us,
+            slots_per_frame,
+            guard_us,
+            beacon_slots,
+            contention_slots,
+        };
+        if !config.frame_us().is_multiple_of(1_000_000) {
+            return Err(Error::FrameNotWholeSeconds {
+                frame_us: config.frame_us(),
+            });
+        }
+        Ok(config)
+    }
+
+    pub fn slot_us(&self) -> u64 {
+        self.slot_us
+    }
+
+    pub fn slots_per_frame(&self) -> u16 {
+        self.slots_per_frame
+    }
+
+    /// Delay after a slot boundary before in-slot transmission starts.
+    pub fn guard_us(&self) -> u64 {
+        self.guard_us
+    }
+
+    pub fn frame_us(&self) -> u64 {
+        self.slot_us * u64::from(self.slots_per_frame)
+    }
+
+    fn frame_seconds(&self) -> u64 {
+        self.frame_us() / 1_000_000
+    }
+
+    fn beacon_slots(&self) -> u16 {
+        self.beacon_slots
+    }
+
+    /// Index of the first data slot; data slots run from here to the end of
+    /// the frame.
+    pub fn first_data_slot(&self) -> u16 {
+        self.beacon_slots + self.contention_slots
+    }
+
+    pub fn slot_kind(&self, slot: u16) -> SlotKind {
+        if slot < self.beacon_slots {
+            SlotKind::Beacon
+        } else if slot < self.first_data_slot() {
+            SlotKind::Contention
+        } else {
+            SlotKind::Data
+        }
+    }
+}
+
+impl Default for Config {
+    /// Sized for the SF7/125 kHz defaults: a 64-byte payload flies in 118 ms,
+    /// so a 160 ms slot leaves a 15 ms guard on each side with margin. 100
+    /// slots make a 16-second frame (whole seconds, anchoring at
+    /// `utc % 16 == 0`) at a ~0.7% duty cycle per slot held.
+    fn default() -> Self {
+        Self {
+            slot_us: 160_000,
+            slots_per_frame: 100,
+            guard_us: 15_000,
+            beacon_slots: 4,
+            contention_slots: 6,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_is_valid_and_16s() {
+        let config = Config::new(160_000, 100, 15_000, 4, 6).unwrap();
+        assert_eq!(config, Config::default());
+        assert_eq!(config.frame_us(), 16_000_000);
+        assert_eq!(config.frame_seconds(), 16);
+        assert_eq!(config.first_data_slot(), 10);
+    }
+
+    #[test]
+    fn slot_kinds() {
+        let config = Config::default();
+        assert_eq!(config.slot_kind(0), SlotKind::Beacon);
+        assert_eq!(config.slot_kind(3), SlotKind::Beacon);
+        assert_eq!(config.slot_kind(4), SlotKind::Contention);
+        assert_eq!(config.slot_kind(9), SlotKind::Contention);
+        assert_eq!(config.slot_kind(10), SlotKind::Data);
+        assert_eq!(config.slot_kind(99), SlotKind::Data);
+    }
+
+    #[test]
+    fn rejects_invalid_layouts() {
+        assert_eq!(
+            Config::new(30_000, 100, 15_000, 4, 6),
+            Err(Error::SlotTooShort {
+                slot_us: 30_000,
+                guard_us: 15_000,
+            })
+        );
+        assert_eq!(
+            Config::new(165_000, 100, 15_000, 4, 6),
+            Err(Error::FrameNotWholeSeconds {
+                frame_us: 16_500_000,
+            })
+        );
+        assert_eq!(
+            Config::new(160_000, 100, 15_000, 0, 6),
+            Err(Error::NoBeaconSlots)
+        );
+        assert_eq!(
+            Config::new(160_000, 10, 15_000, 4, 6),
+            Err(Error::NoDataSlots {
+                beacon: 4,
+                contention: 6,
+                slots_per_frame: 10,
+            })
+        );
+        assert_eq!(
+            Config::new(160_000, 500, 15_000, 4, 6),
+            Err(Error::TooManySlots(500))
+        );
+    }
+}

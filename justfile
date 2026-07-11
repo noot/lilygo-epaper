@@ -31,3 +31,7 @@ lint:
 # root's -nostartfiles link arg doesn't leak into the host test binary)
 test-epub:
     cd crates/epub-reader && RUSTFLAGS= cargo +stable test
+
+# host unit tests for the standalone nootmesh crate (same RUSTFLAGS caveat)
+test-nootmesh:
+    cd crates/nootmesh && RUSTFLAGS= cargo +stable test
