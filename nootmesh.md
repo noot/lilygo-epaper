@@ -33,6 +33,14 @@ Data slots: distributed 2-hop greedy coloring, first pick seeded by
 `fnv1a(node_id)` so simultaneous cold boots spread out, conflicts resolved
 lower-id-wins.
 
+## wire format (implemented in `crates/nootmesh/src/wire.rs`)
+
+`| version byte | postcard(Message) |` — postcard over protobuf because frames
+are Rust-to-Rust (bridges translate for other consumers at the edge), it has a
+stable wire spec, and it costs zero field-tag bytes on air. Compatibility
+rules: bump the version byte on layout changes to existing variants; only
+append variants to the `Message` enum. A beacon is 13 bytes on air.
+
 ## message types
 
 ```

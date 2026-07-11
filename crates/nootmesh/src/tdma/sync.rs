@@ -23,7 +23,7 @@ const REANCHOR_THRESHOLD_US: u64 = 200_000;
 /// A receiver recovers the frame origin from its RxDone timestamp alone: the
 /// sender's beacon slot is `min(stratum, beacon_slots - 1)` and the airtime is
 /// computable, so no timestamp field is needed on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Beacon {
     pub root: NodeId,
     pub root_has_gps: bool,

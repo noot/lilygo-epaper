@@ -15,7 +15,7 @@ const NEIGHBOR_TTL_FRAMES: u64 = 4;
 ///
 /// Nodes without a data slot send hellos in contention slots; once assigned,
 /// they piggyback the same information on transmissions in their own slot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Hello {
     pub sender: NodeId,
     pub slot: Option<u16>,

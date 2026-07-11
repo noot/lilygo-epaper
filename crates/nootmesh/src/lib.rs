@@ -8,8 +8,11 @@
 
 pub mod airtime;
 pub mod tdma;
+pub mod wire;
 
 /// Node identity. Will become a public-key fingerprint once identities land;
 /// for now a plain integer that must be unique across the mesh.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct NodeId(pub u32);
