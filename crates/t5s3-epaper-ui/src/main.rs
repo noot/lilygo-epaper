@@ -503,6 +503,11 @@ async fn main(spawner: Spawner) -> ! {
     let mut radio: Option<Lora<'_, 'static>> = None;
     let mut lora_mesh: Option<mesh::Mesh> = None;
     let mut radio_tried = false;
+    // rate-limit mesh status flushes: the panel blocks the radio for hundreds
+    // of ms per refresh, so only the key parts of the status (role/slot)
+    // trigger one immediately; counters catch up on a slow cadence.
+    let mut lora_status_key: (Option<(u32, u8)>, Option<u16>) = (None, None);
+    let mut lora_status_at_secs: u64 = 0;
     let mut kb_symbols = false;
     let mut kb_shift = false;
     // ticks since the info page was last refreshed (uptime/temp/voltage).
@@ -2400,9 +2405,14 @@ async fn main(spawner: Spawner) -> ! {
                     draw_list(&mut display, RECV_Y, "received", &lora_recv);
                     display.flush_partial_fast(received_native_rect()).ok();
                 }
-                let status = m.status_line();
-                if status != lora_status && !needs_redraw {
-                    lora_status = status;
+                let key = m.status_key();
+                let now_secs = clock.now_us() / 1_000_000;
+                if (key != lora_status_key || now_secs.saturating_sub(lora_status_at_secs) >= 8)
+                    && !needs_redraw
+                {
+                    lora_status_key = key;
+                    lora_status_at_secs = now_secs;
+                    lora_status = m.status_line();
                     draw_lora_status(&mut display, &lora_status);
                     display.flush_partial_fast(lora_status_native_rect()).ok();
                 }

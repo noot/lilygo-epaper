@@ -1,5 +1,27 @@
-use super::{Config, FramePosition};
+use super::{Config, FramePosition, mix};
 use crate::NodeId;
+
+const SALT_BEACON_TIME: u64 = 6;
+
+/// Deterministic per-frame offset added to a beacon's in-slot transmit time
+/// (on top of the guard). Derived from the root id and frame number carried
+/// in the beacon itself, so receivers reconstruct it exactly when recovering
+/// the frame origin.
+///
+/// Without it, two contending roots anchored to the same timeline — two
+/// GPS-fixed nodes both anchor to the UTC grid by construction — transmit
+/// their slot-0 beacons at the same instant every frame, collide forever, and
+/// never hear each other to resolve the election. The jitter decorrelates
+/// them frame by frame, so the losing root hears the winner within a few
+/// frames. (Same-root relays share this value; the engine's random skip
+/// decorrelates those.)
+pub(crate) fn beacon_tx_jitter_us(config: &Config, root: NodeId, frame_number: u64) -> u64 {
+    let range = (config.slot_us() - 2 * config.guard_us()) / 2;
+    if range == 0 {
+        return 0;
+    }
+    mix(u64::from(root.0), frame_number, SALT_BEACON_TIME) % range
+}
 
 /// Frames of holdover before a beacon-synced node considers itself unsynced.
 /// At +/-20 ppm crystal drift, 8 default frames (128 s) accrue ~2.6 ms of
@@ -179,11 +201,14 @@ impl Sync {
         if !adopt {
             return;
         }
-        // the sender transmitted starting at its beacon slot's start + guard,
-        // so the frame origin is recoverable from RxDone alone
+        // the sender transmitted at its beacon slot's start + guard + a
+        // jitter reconstructible from the beacon's own fields, so the frame
+        // origin is recoverable from RxDone alone
         let sender_slot = u16::from(beacon.stratum).min(self.config.beacon_slots() - 1);
-        let offset_us =
-            airtime_us + self.config.guard_us() + u64::from(sender_slot) * self.config.slot_us();
+        let offset_us = airtime_us
+            + self.config.guard_us()
+            + beacon_tx_jitter_us(&self.config, beacon.root, beacon.frame_number)
+            + u64::from(sender_slot) * self.config.slot_us();
         let Some(frame_origin_us) = rx_end_us.checked_sub(offset_us) else {
             return;
         };
@@ -273,7 +298,8 @@ mod tests {
         };
         // sender began at origin + guard; rx ends one airtime later
         let origin = 5_000_000;
-        let rx_end = origin + 15_000 + 41_216;
+        let jitter = beacon_tx_jitter_us(&test_config(), NodeId(1), 42);
+        let rx_end = origin + 15_000 + jitter + 41_216;
         sync.on_beacon(rx_end, 41_216, &beacon);
 
         let position = sync.position(origin + 200_000).unwrap();

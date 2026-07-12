@@ -16,11 +16,23 @@ pub mod engine;
 mod slots;
 mod sync;
 
-pub use engine::{Action, Engine};
+pub use engine::{Action, Engine, Received};
 pub use slots::{Coloring, Hello, MAX_NEIGHBORS};
 pub use sync::{Beacon, Sync};
 
 const MAX_SLOTS_PER_FRAME: u16 = 256;
+
+/// splitmix64 finalizer: a stable per-frame coin, so repeated decisions
+/// within one frame agree with each other and both ends of a link can
+/// reconstruct the same value.
+pub(crate) fn mix(seed: u64, frame_number: u64, salt: u64) -> u64 {
+    let mut z = seed
+        ^ frame_number.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ salt.wrapping_mul(0xd1b5_4a32_d192_ed03);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
 
 /// TDMA frame layout and timing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

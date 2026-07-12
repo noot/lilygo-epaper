@@ -12,9 +12,12 @@
 //! the variant index; appending keeps old packets decoding identically, and
 //! old firmware cleanly rejects unknown new discriminants).
 
-use crate::tdma::{Beacon, Hello};
+use crate::{
+    NodeId,
+    tdma::{Beacon, Hello},
+};
 
-pub const VERSION: u8 = 0;
+pub const VERSION: u8 = 1;
 
 /// Wire capacity for a [`Text`] body. Runtime limits are tighter: the whole
 /// packet must fit the slot's airtime budget (see
@@ -31,12 +34,22 @@ pub enum Message {
     Text(Text),
 }
 
-/// Chat text broadcast in the sender's data slot. Embeds the sender's
-/// [`Hello`] so a frame that carries text still refreshes the sender's slot
-/// claim in every receiver's neighbor table.
+/// Chat text broadcast in a data slot and flooded across the mesh: every
+/// node re-broadcasts each text it has not seen before (once, in its own data
+/// slot) until the hop cap. Embeds the transmitter's [`Hello`] so a frame
+/// that carries text still refreshes its slot claim in every receiver's
+/// neighbor table.
+///
+/// `hello.sender` is whoever transmitted *this* packet (author or relay);
+/// `origin` is the author. `(origin, msg_id)` identifies the message for
+/// deduplication, and `hops` counts relays so far (0 = straight from the
+/// author).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Text {
     pub hello: Hello,
+    pub origin: NodeId,
+    pub msg_id: u16,
+    pub hops: u8,
     pub body: heapless::Vec<u8, TEXT_CAP>,
 }
 
@@ -122,10 +135,13 @@ mod tests {
                 slot: Some(42),
                 neighbors,
             },
+            origin: NodeId(5),
+            msg_id: 300,
+            hops: 1,
             body,
         }));
-        // ver 1 + disc 1 + sender 1 + slot 2 + neighbors 3 + body 1+10
-        assert_eq!(len, 19);
+        // ver 1 + disc 1 + hello 6 + origin 1 + msg_id 2 + hops 1 + body 1+10
+        assert_eq!(len, 23);
     }
 
     #[test]

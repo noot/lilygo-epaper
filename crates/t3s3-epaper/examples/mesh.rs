@@ -206,8 +206,8 @@ fn main() -> ! {
                     got_packet = true;
                     rx_count = rx_count.wrapping_add(1);
                     match engine.on_packet(t, &buf[..info.len]) {
-                        Ok(()) => println!(
-                            "rx {}B rssi {} dBm snr {} dB",
+                        Ok(received) => println!(
+                            "rx {}B {received} rssi {} dBm snr {} dB",
                             info.len, info.rssi_dbm, info.snr_db
                         ),
                         Err(e) => println!("rx {}B undecodable: {e}", info.len),
@@ -259,13 +259,21 @@ fn main() -> ! {
                 true
             }
             Ok(wire::Message::Text(t)) => {
-                println!("tx text {}B", t.body.len());
+                println!(
+                    "tx text {}B from {:08x} hops {}",
+                    t.body.len(),
+                    t.origin.0,
+                    t.hops
+                );
                 true
             }
             Err(_) => false,
         };
         match radio.transmit(engine.packet()) {
-            Ok(()) => tx_count = tx_count.wrapping_add(1),
+            Ok(()) => {
+                engine.on_transmitted();
+                tx_count = tx_count.wrapping_add(1);
+            }
             Err(e) => println!("tx error: {e:?}"),
         }
         if let Err(e) = radio.start_receive() {

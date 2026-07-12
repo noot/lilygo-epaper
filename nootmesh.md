@@ -29,7 +29,13 @@ Frame layout: `| 0..3 beacon | 3..6 contention (hellos) | 6..20 data |`
 
 Time sync: one elected root (GPS fix beats none, then lowest id) anchors the
 frame to UTC and floods it via beacons; stratum-k relays rebeacon in slot
-`min(k, 3)`, receivers recover the origin from RxDone − airtime − guard.
+`min(k, beacon_slots-1)`, receivers recover the origin from
+RxDone − airtime − guard − jitter. Beacons carry a deterministic per-frame
+transmit jitter derived from `(root id, frame number)` — reconstructible by
+receivers from the beacon payload — because two GPS roots share the UTC slot
+grid by construction and would otherwise collide slot-0-on-slot-0 every frame
+and never hear each other to resolve the election (observed on hardware as
+"every node says ROOT").
 Because the T5S3 GPS is NMEA-only (no PPS wired), the root free-runs on its
 crystal and only re-anchors on gross (>200 ms) disagreement, so NMEA jitter
 never steps the mesh timeline — GPS supplies frame *numbering*, beacons supply
@@ -58,14 +64,19 @@ slot holders hello every frame (TTL keepalive), saturated nodes fall back to
 random contention-slot hellos. Hellos are trimmed to the slot's airtime budget
 (71 bytes at SF7 defaults).
 
-## chat texts (wire `Text` + engine outbox/inbox)
+## chat texts + flooding (wire `Text` + engine outbox/inbox, wire v1)
 
-`Message::Text { hello, body }` — broadcast in the sender's data slot instead
-of the bare hello, embedding it so the slot claim stays fresh. One queued
-message at a time (`queue_text` → `on_transmitted` confirms + releases), body
-capped to the slot's airtime budget (63 bytes at SF7 with defaults; per-slot
-fragmentation is future work). Received texts land in a small inbox drained
-by the app. The t5s3-epaper-ui lora page is the first consumer (see
+`Message::Text { hello, origin, msg_id, hops, body }` — broadcast in a data
+slot instead of the bare hello (embedding it keeps the transmitter's slot
+claim fresh). Texts flood: every node re-broadcasts each unseen message once
+in its own data slot until `hops` reaches 3, so chat crosses multi-hop
+topologies at ≤1 frame per hop. Dedup is `(origin, msg_id)` — an explicit id
+rather than a content hash, so identical bodies sent twice are distinct — in
+a 32-entry seen-cache that also silences relayed echoes of one's own
+messages; delivery to the app is exactly-once via the inbox. Outgoing queue
+holds 4 (own + forwards; forwards drop silently when full). Body capped to
+the slot budget (82 bytes at the current profile). Per-slot fragmentation is
+still future work. The t5s3-epaper-ui lora page is the first consumer (see
 `t5s3-epaper-ui/src/mesh.rs` for the servicing-slice pattern that gives the
 50 ms ui loop millisecond-precise mesh timing).
 

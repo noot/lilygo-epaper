@@ -20,8 +20,10 @@ use nootmesh::{
 use t5s3_epaper_core::lora::Lora;
 
 /// rx-polling budget per ui pass; touch latency grows by about this much
-/// while the lora page is open.
-const SLICE_BUDGET_US: u64 = 20_000;
+/// while the lora page is open. Sized so beacons have a decent chance of
+/// landing inside an active slice (packets latched between slices carry
+/// stale timestamps, so beacons among them must be discarded).
+const SLICE_BUDGET_US: u64 = 30_000;
 
 /// a tx deadline within this horizon is waited for inside the slice rather
 /// than deferred to a later pass (which could overshoot the slot's guard).
@@ -100,6 +102,21 @@ impl Mesh {
         })
     }
 
+    /// The parts of the status whose change warrants an immediate display
+    /// refresh: role/root/stratum and the slot claim. Counters and the frame
+    /// number are excluded — refreshing the e-paper blocks the radio for
+    /// hundreds of milliseconds, so flushing on every received packet would
+    /// deafen the node (enough to make two contending roots never hear each
+    /// other's beacons).
+    pub(crate) fn status_key(&self) -> (Option<(u32, u8)>, Option<u16>) {
+        (
+            self.engine
+                .root(now_us())
+                .map(|(root, stratum)| (root.0, stratum)),
+            self.engine.slot(),
+        )
+    }
+
     /// One-line mesh status for the lora page.
     pub(crate) fn status_line(&self) -> String {
         let now = now_us();
@@ -147,7 +164,12 @@ impl Mesh {
                             esp_println::println!("mesh tx hello slot {:?}", h.slot)
                         }
                         Ok(wire::Message::Text(t)) => {
-                            esp_println::println!("mesh tx text {}B", t.body.len())
+                            esp_println::println!(
+                                "mesh tx text {}B from {:08x} hops {}",
+                                t.body.len(),
+                                t.origin.0,
+                                t.hops
+                            )
                         }
                         Err(_) => {}
                     }
@@ -205,8 +227,8 @@ impl Mesh {
                         }
                     }
                     match self.engine.on_packet(t, &buf[..n]) {
-                        Ok(()) => esp_println::println!(
-                            "mesh rx {n}B rssi {} dBm snr {} dB",
+                        Ok(received) => esp_println::println!(
+                            "mesh rx {n}B {received} rssi {} dBm snr {} dB",
                             radio.rssi(),
                             radio.snr()
                         ),
