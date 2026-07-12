@@ -343,6 +343,9 @@ pub(crate) struct Settings {
     pub(crate) reader_line_spacing: LineSpacing,
     pub(crate) icon_style: IconStyle,
     pub(crate) icon_size: IconSize,
+    /// keep the lora radio and mesh membership alive on every screen (at a
+    /// standing rx current cost), instead of only while the lora page is open.
+    pub(crate) mesh_background: bool,
     wifi_networks: [WifiNetwork; WIFI_NETWORK_CAP],
     wifi_network_count: u8,
 }
@@ -364,6 +367,7 @@ impl Default for Settings {
             reader_line_spacing: LineSpacing::Normal,
             icon_style: IconStyle::Lucide,
             icon_size: IconSize::Regular,
+            mesh_background: false,
             wifi_networks,
             wifi_network_count,
         }
@@ -375,14 +379,20 @@ impl Default for Settings {
 // flash, older/newer layout, corruption) falls back to defaults, except the
 // immediately previous version which is migrated (see `decode_v5`).
 const MAGIC: [u8; 2] = [0x54, 0x35];
-const VERSION: u8 = 6;
-// 11 scalar bytes, a saved-network count, then WIFI_NETWORK_CAP fixed-size
+const VERSION: u8 = 7;
+// 12 scalar bytes, a saved-network count, then WIFI_NETWORK_CAP fixed-size
 // network entries (ssid len + 32, password len + 64), then a trailing xor
 // checksum.
-const NETWORKS_OFF: usize = 12;
+const NETWORKS_OFF: usize = 13;
 const NETWORK_SIZE: usize = 1 + SSID_CAP + 1 + PASSWORD_CAP;
 const CHECKSUM_OFF: usize = NETWORKS_OFF + WIFI_NETWORK_CAP * NETWORK_SIZE;
 const BLOB_LEN: usize = CHECKSUM_OFF + 1;
+
+// the version-6 layout: identical except it lacked the mesh-background byte,
+// so the network table sat one byte earlier.
+const V6_VERSION: u8 = 6;
+const V6_NETWORKS_OFF: usize = 12;
+const V6_CHECKSUM_OFF: usize = V6_NETWORKS_OFF + WIFI_NETWORK_CAP * NETWORK_SIZE;
 
 // the version-5 single-network layout, kept so an upgraded firmware migrates
 // the previously saved settings instead of dropping them.
@@ -413,7 +423,8 @@ impl Settings {
         buf[8] = self.reader_line_spacing.to_byte();
         buf[9] = self.icon_style.to_byte();
         buf[10] = self.icon_size.to_byte();
-        buf[11] = self.wifi_network_count.min(WIFI_NETWORK_CAP as u8);
+        buf[11] = u8::from(self.mesh_background);
+        buf[12] = self.wifi_network_count.min(WIFI_NETWORK_CAP as u8);
         for (i, net) in self.wifi_networks.iter().enumerate() {
             let off = NETWORKS_OFF + i * NETWORK_SIZE;
             buf[off] = net.ssid_len.min(SSID_CAP as u8);
@@ -431,6 +442,9 @@ impl Settings {
         }
         if buf[2] == V5_VERSION {
             return Self::decode_v5(buf);
+        }
+        if buf[2] == V6_VERSION {
+            return Self::decode_v6(buf);
         }
         if buf[2] != VERSION {
             return None;
@@ -457,6 +471,38 @@ impl Settings {
             reader_line_spacing: LineSpacing::from_byte(buf[8]),
             icon_style: IconStyle::from_byte(buf[9]),
             icon_size: IconSize::from_byte(buf[10]),
+            mesh_background: buf[11] != 0,
+            wifi_networks,
+            wifi_network_count: buf[12].min(WIFI_NETWORK_CAP as u8),
+        })
+    }
+
+    // migrate a version-6 blob: identical scalars, network table one byte
+    // earlier, and no mesh-background flag (defaults off).
+    fn decode_v6(buf: &[u8; BLOB_LEN]) -> Option<Self> {
+        let checksum = buf[0..V6_CHECKSUM_OFF].iter().fold(0u8, |acc, &b| acc ^ b);
+        if checksum != buf[V6_CHECKSUM_OFF] {
+            return None;
+        }
+        let mut wifi_networks = [WifiNetwork::EMPTY; WIFI_NETWORK_CAP];
+        for (i, net) in wifi_networks.iter_mut().enumerate() {
+            let off = V6_NETWORKS_OFF + i * NETWORK_SIZE;
+            net.ssid_len = buf[off].min(SSID_CAP as u8);
+            net.ssid.copy_from_slice(&buf[off + 1..off + 1 + SSID_CAP]);
+            net.password_len = buf[off + 1 + SSID_CAP].min(PASSWORD_CAP as u8);
+            net.password
+                .copy_from_slice(&buf[off + 2 + SSID_CAP..off + NETWORK_SIZE]);
+        }
+        Some(Self {
+            tz_offset_hours: buf[3] as i8,
+            time_24h: buf[4] != 0,
+            brightness: buf[5].min(100),
+            reader_font_size: FontSize::from_byte(buf[6]),
+            reader_font_family: FontFamily::from_byte(buf[7]),
+            reader_line_spacing: LineSpacing::from_byte(buf[8]),
+            icon_style: IconStyle::from_byte(buf[9]),
+            icon_size: IconSize::from_byte(buf[10]),
+            mesh_background: false,
             wifi_networks,
             wifi_network_count: buf[11].min(WIFI_NETWORK_CAP as u8),
         })
@@ -488,6 +534,7 @@ impl Settings {
             reader_line_spacing: LineSpacing::from_byte(buf[8]),
             icon_style: IconStyle::from_byte(buf[9]),
             icon_size: IconSize::from_byte(buf[10]),
+            mesh_background: false,
             wifi_networks,
             wifi_network_count,
         })

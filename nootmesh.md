@@ -11,7 +11,6 @@ details:
 - message encryption (optionally, can be required per-user) handshake to determine shared key (dh? noise protocol to prove remote actually has the key?)
 - routing/peer discovery
 
-
 ## tdma (implemented in `crates/nootmesh/src/tdma`)
 
 The fleet profile is the single point of truth: `nootmesh::tdma::Config::default()`

@@ -1681,6 +1681,17 @@ async fn main(spawner: Spawner) -> ! {
                                 .flush_partial_fast(settings_page::system::icon_size_button_rect())
                                 .ok();
                         }
+                        Some(settings_page::system::Hit::ToggleMesh) => {
+                            settings.mesh_background = !settings.mesh_background;
+                            settings_dirty = true;
+                            settings_page::system::redraw_mesh(
+                                &mut display,
+                                settings.mesh_background,
+                            );
+                            display
+                                .flush_partial_fast(settings_page::system::mesh_button_rect())
+                                .ok();
+                        }
                         None => {}
                     },
                     Screen::SettingsReader => match settings_page::reader::hit_test(sx, sy) {
@@ -2335,20 +2346,24 @@ async fn main(spawner: Spawner) -> ! {
         // scan the SD card for the book shelf when the library is opened (or
         // re-entered from the reader). the `!needs_redraw` guard lets the
         // "scanning" view paint first, since the scan can be slow on first run
-        // (it parses each new epub and decodes its cover). self-contained mount,
-        // so it never conflicts with the radio, which is dropped off-screen.
+        // (it parses each new epub and decodes its cover). self-contained mount:
+        // the scan shares SPI2 with a live radio safely (single-threaded, and
+        // the bus applies per-device config), but it does block the loop, so
+        // a background mesh is deaf for its duration — the sync holdover
+        // absorbs that.
         if current_screen == Screen::Library && library.is_dirty() && !needs_redraw {
             library.clear();
             library.view = library::load_library(&bus);
             needs_redraw = true;
         }
 
-        // the radio listens only while the lora screen is open: bring it up in
-        // receive mode on entry, set it to standby and drop it on leave (frees
-        // SPI2 for the SD wallpaper at sleep and avoids drawing rx current).
-        // `radio_tried` keeps a failed init from re-resetting the chip every
-        // pass; it re-arms when the screen is left.
-        if current_screen == Screen::Lora {
+        // the radio listens while the lora screen is open — or on every screen
+        // when the mesh-radio setting is "Always on" (a standing rx-current
+        // cost the user opted into). off-mesh it goes to standby and is
+        // dropped, freeing SPI2 for the SD wallpaper at sleep. `radio_tried`
+        // keeps a failed init from re-resetting the chip every pass; it
+        // re-arms when the mesh goes down.
+        if current_screen == Screen::Lora || settings.mesh_background {
             if radio.is_none() && !radio_tried {
                 radio_tried = true;
                 match make_radio(&bus) {
@@ -2384,32 +2399,31 @@ async fn main(spawner: Spawner) -> ! {
 
         // service the mesh: a short precise-timing slice that receives,
         // beacons, hellos and sends queued texts in this node's data slot.
-        // received texts land in the page's log; the status line tracks the
-        // sync state (root election, stratum, slot claim).
-        if current_screen == Screen::Lora {
-            if let (Some(r), Some(m)) = (&mut radio, &mut lora_mesh) {
-                m.service(r);
-                let mut recv_dirty = false;
-                while let Some((from, text)) = m.take_text() {
-                    esp_println::println!("mesh text from {from:08x}: {text}");
-                    lora_recv.push(format!(
-                        "{}{from:08x}: {text}",
-                        lora_stamp(&mut clock, &settings)
-                    ));
-                    if lora_recv.len() > LIST_MAX {
-                        lora_recv.remove(0);
-                    }
-                    recv_dirty = true;
+        // runs on every screen while the mesh is up; received texts always
+        // land in the page's log (bounded, so backgrounded chat keeps the
+        // latest few), but only the lora page draws them.
+        if let (Some(r), Some(m)) = (&mut radio, &mut lora_mesh) {
+            m.service(r);
+            let mut recv_dirty = false;
+            while let Some((from, text)) = m.take_text() {
+                esp_println::println!("mesh text from {from:08x}: {text}");
+                lora_recv.push(format!(
+                    "{}{from:08x}: {text}",
+                    lora_stamp(&mut clock, &settings)
+                ));
+                if lora_recv.len() > LIST_MAX {
+                    lora_recv.remove(0);
                 }
-                if recv_dirty && !needs_redraw {
+                recv_dirty = true;
+            }
+            if current_screen == Screen::Lora && !needs_redraw {
+                if recv_dirty {
                     draw_list(&mut display, RECV_Y, "received", &lora_recv);
                     display.flush_partial_fast(received_native_rect()).ok();
                 }
                 let key = m.status_key();
                 let now_secs = clock.now_us() / 1_000_000;
-                if (key != lora_status_key || now_secs.saturating_sub(lora_status_at_secs) >= 8)
-                    && !needs_redraw
-                {
+                if key != lora_status_key || now_secs.saturating_sub(lora_status_at_secs) >= 8 {
                     lora_status_key = key;
                     lora_status_at_secs = now_secs;
                     lora_status = m.status_line();

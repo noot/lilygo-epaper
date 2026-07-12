@@ -28,6 +28,7 @@ const TZ_VAL_W: u32 = 90;
 const FMT_Y: i32 = 300;
 const ICONS_Y: i32 = 390;
 const ICON_SIZE_Y: i32 = 480;
+const MESH_Y: i32 = 570;
 
 pub(crate) enum Hit {
     Back,
@@ -36,6 +37,7 @@ pub(crate) enum Hit {
     ToggleFormat,
     CycleIcons,
     CycleIconSize,
+    ToggleMesh,
 }
 
 pub(crate) fn hit_test(sx: i32, sy: i32) -> Option<Hit> {
@@ -51,6 +53,8 @@ pub(crate) fn hit_test(sx: i32, sy: i32) -> Option<Hit> {
         Some(Hit::CycleIcons)
     } else if in_rect(sx, sy, WIDE_BTN_X, ICON_SIZE_Y, WIDE_BTN_W, BTN_H) {
         Some(Hit::CycleIconSize)
+    } else if in_rect(sx, sy, WIDE_BTN_X, MESH_Y, WIDE_BTN_W, BTN_H) {
+        Some(Hit::ToggleMesh)
     } else {
         None
     }
@@ -76,6 +80,11 @@ pub(crate) fn draw(display: &mut Display, settings: &Settings) {
 
     label(display, "Icon size", ICON_SIZE_Y);
     draw_icon_size_button(display, settings);
+
+    // lora mesh radio: page-scoped (default), or always listening in the
+    // background at a standing rx current cost.
+    label(display, "Mesh radio", MESH_Y);
+    draw_mesh_button(display, settings.mesh_background);
 }
 
 fn draw_tz_value(display: &mut Display, offset_hours: i8) {
@@ -125,6 +134,20 @@ fn draw_icon_size_button(display: &mut Display, settings: &Settings) {
     );
 }
 
+fn draw_mesh_button(display: &mut Display, background: bool) {
+    button(
+        display,
+        WIDE_BTN_X,
+        MESH_Y,
+        WIDE_BTN_W,
+        if background {
+            "Always on"
+        } else {
+            "Lora page only"
+        },
+    );
+}
+
 pub(crate) fn tz_value_rect() -> t5s3_epaper_core::display::Rectangle {
     screen_to_native_rect(TZ_VAL_X, TZ_Y, TZ_VAL_W as i32, BTN_H as i32)
 }
@@ -155,4 +178,12 @@ pub(crate) fn redraw_icons(display: &mut Display, settings: &Settings) {
 
 pub(crate) fn redraw_icon_size(display: &mut Display, settings: &Settings) {
     draw_icon_size_button(display, settings);
+}
+
+pub(crate) fn mesh_button_rect() -> t5s3_epaper_core::display::Rectangle {
+    screen_to_native_rect(WIDE_BTN_X, MESH_Y, WIDE_BTN_W as i32, BTN_H as i32)
+}
+
+pub(crate) fn redraw_mesh(display: &mut Display, background: bool) {
+    draw_mesh_button(display, background);
 }
