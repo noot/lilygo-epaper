@@ -46,7 +46,10 @@ pub(crate) struct Mesh {
 }
 
 impl Mesh {
-    pub(crate) fn new() -> Result<Self, nootmesh::tdma::engine::Error> {
+    /// `store`: retain recent texts and answer recap requests, like the
+    /// relay nodes do — sensible only with the always-on radio setting, since
+    /// a store node that naps is a mailbox nobody can reach.
+    pub(crate) fn new(store: bool) -> Result<Self, nootmesh::tdma::engine::Error> {
         // stable per-board identity from the efuse mac; trng entropy for the
         // engine's randomized skips and root-fallback jitter.
         let mac =
@@ -61,6 +64,9 @@ impl Mesh {
             node_id,
             seed,
         )?;
+        if store {
+            engine.enable_store();
+        }
         // catch up on chat missed while off-mesh: store nodes in range replay
         // their retained history, and dedup drops what we already saw
         engine.request_recap();

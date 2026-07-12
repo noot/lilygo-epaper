@@ -1,4 +1,4 @@
-use alloc::{format, string::String};
+use alloc::{format, string::String, vec::Vec as AVec};
 
 use embedded_graphics::{
     mono_font::{
@@ -17,10 +17,21 @@ use t5s3_epaper_core::{
     Display,
 };
 
-use crate::{
-    layout::{screen_to_native_rect, SCREEN_W},
-    widgets::draw_back_button,
-};
+use crate::{layout::screen_to_native_rect, widgets::draw_back_button};
+
+/// Which half of the mesh chat page is open: composing (keyboard) or the
+/// scrollable received-message log.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tab {
+    Send,
+    Recv,
+}
+
+const TAB_Y: i32 = 64;
+const TAB_H: u32 = 48;
+const TAB_W: u32 = 180;
+const TAB_SEND_X: i32 = 120;
+const TAB_RECV_X: i32 = 310;
 
 const MSG_X: i32 = 30;
 const MSG_Y: i32 = 150;
@@ -29,11 +40,107 @@ const MSG_H: u32 = 170;
 const LORA_STATUS_Y: i32 = 338;
 pub(crate) const MSG_MAX: usize = 200;
 
-// sent + received message logs, stacked between the status line and keyboard.
+// the send tab's sent-message log, between the status line and the keyboard.
 pub(crate) const SENT_Y: i32 = 368;
-pub(crate) const RECV_Y: i32 = 476;
 const LIST_H: u32 = 102;
 pub(crate) const LIST_MAX: usize = 3;
+
+// the receive tab: a status line, then a tall scrollable log.
+const RECV_STATUS_Y: i32 = 130;
+const RECV_TOP: i32 = 180;
+const RECV_ROW_H: i32 = 20;
+const RECV_ROWS: i32 = 37;
+const RECV_TEXT_X: i32 = 24;
+/// wrap width in characters (FONT_6X10 in the text column).
+const RECV_CHARS: usize = 70;
+const SCROLL_X: i32 = 470;
+const SCROLL_W: u32 = 60;
+const SCROLL_BTN_H: u32 = 100;
+const SCROLL_UP_Y: i32 = RECV_TOP;
+const SCROLL_DOWN_Y: i32 = RECV_TOP + (RECV_ROWS - 5) * RECV_ROW_H;
+
+/// received messages kept in ram (and as the sd log's retained tail).
+pub(crate) const RECV_MAX: usize = 120;
+
+pub(crate) fn tab_send_hit(sx: i32, sy: i32) -> bool {
+    (TAB_SEND_X..TAB_SEND_X + TAB_W as i32).contains(&sx)
+        && (TAB_Y..TAB_Y + TAB_H as i32).contains(&sy)
+}
+
+pub(crate) fn tab_recv_hit(sx: i32, sy: i32) -> bool {
+    (TAB_RECV_X..TAB_RECV_X + TAB_W as i32).contains(&sx)
+        && (TAB_Y..TAB_Y + TAB_H as i32).contains(&sy)
+}
+
+pub(crate) fn recv_scroll_up_hit(sx: i32, sy: i32) -> bool {
+    (SCROLL_X..SCROLL_X + SCROLL_W as i32).contains(&sx)
+        && (SCROLL_UP_Y..SCROLL_UP_Y + SCROLL_BTN_H as i32).contains(&sy)
+}
+
+pub(crate) fn recv_scroll_down_hit(sx: i32, sy: i32) -> bool {
+    (SCROLL_X..SCROLL_X + SCROLL_W as i32).contains(&sx)
+        && (SCROLL_DOWN_Y..SCROLL_DOWN_Y + SCROLL_BTN_H as i32).contains(&sy)
+}
+
+/// lines the receive log scrolls over: each entry wrapped to at most two rows
+/// (a stamped max-length text fits in two), continuation rows indented.
+pub(crate) fn recv_lines(entries: &[String]) -> AVec<String> {
+    let mut lines = AVec::new();
+    for entry in entries {
+        let chars: AVec<char> = entry.chars().collect();
+        let first: String = chars.iter().take(RECV_CHARS).collect();
+        lines.push(first);
+        if chars.len() > RECV_CHARS {
+            let rest: String = chars[RECV_CHARS..]
+                .iter()
+                .take(RECV_CHARS.saturating_sub(2))
+                .collect();
+            lines.push(format!("  {rest}"));
+        }
+    }
+    lines
+}
+
+/// rows the receive log shows at once; scroll moves by a page minus one row.
+pub(crate) fn recv_visible_rows() -> usize {
+    RECV_ROWS as usize
+}
+
+/// the scroll offset that pins the newest line to the bottom of the view.
+pub(crate) fn recv_scroll_end(entries: &[String]) -> usize {
+    recv_lines(entries).len().saturating_sub(RECV_ROWS as usize)
+}
+
+fn draw_tabs(display: &mut Display, tab: Tab) {
+    let bold = MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK);
+    let bold_inv = MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::WHITE);
+    for (label, x, active) in [
+        ("Send", TAB_SEND_X, tab == Tab::Send),
+        ("Receive", TAB_RECV_X, tab == Tab::Recv),
+    ] {
+        let style = if active {
+            PrimitiveStyle::with_fill(Gray4::BLACK)
+        } else {
+            PrimitiveStyleBuilder::new()
+                .stroke_color(Gray4::BLACK)
+                .stroke_width(2)
+                .fill_color(Gray4::WHITE)
+                .build()
+        };
+        Rectangle::new(Point::new(x, TAB_Y), Size::new(TAB_W, TAB_H))
+            .into_styled(style)
+            .draw(display)
+            .ok();
+        Text::with_alignment(
+            label,
+            Point::new(x + TAB_W as i32 / 2, TAB_Y + TAB_H as i32 / 2 + 6),
+            if active { bold_inv } else { bold },
+            Alignment::Center,
+        )
+        .draw(display)
+        .ok();
+    }
+}
 
 pub(crate) fn draw_message(display: &mut Display, message: &str) {
     Rectangle::new(Point::new(MSG_X, MSG_Y), Size::new(MSG_W, MSG_H))
@@ -71,14 +178,14 @@ pub(crate) fn draw_message(display: &mut Display, message: &str) {
     }
 }
 
-pub(crate) fn draw_lora_status(display: &mut Display, status: &str) {
-    Rectangle::new(Point::new(MSG_X, LORA_STATUS_Y), Size::new(MSG_W, 26))
+fn draw_status_at(display: &mut Display, status: &str, y: i32) {
+    Rectangle::new(Point::new(MSG_X, y), Size::new(MSG_W, 26))
         .into_styled(PrimitiveStyle::with_fill(Gray4::WHITE))
         .draw(display)
         .ok();
     Text::with_alignment(
         status,
-        Point::new(SCREEN_W / 2, LORA_STATUS_Y + 18),
+        Point::new(crate::layout::SCREEN_W / 2, y + 18),
         MonoTextStyle::new(&FONT_9X15, Gray4::BLACK),
         Alignment::Center,
     )
@@ -86,8 +193,14 @@ pub(crate) fn draw_lora_status(display: &mut Display, status: &str) {
     .ok();
 }
 
-// a titled message log (newest first), each entry truncated to one line. used
-// for both the sent and received lists; `y` is the top of its section.
+pub(crate) fn draw_lora_status(display: &mut Display, status: &str, tab: Tab) {
+    match tab {
+        Tab::Send => draw_status_at(display, status, LORA_STATUS_Y),
+        Tab::Recv => draw_status_at(display, status, RECV_STATUS_Y),
+    }
+}
+
+// the send tab's sent-message log (newest first), truncated to one line each.
 pub(crate) fn draw_list(display: &mut Display, y: i32, header: &str, items: &[String]) {
     Rectangle::new(Point::new(MSG_X, y), Size::new(MSG_W, LIST_H))
         .into_styled(PrimitiveStyle::with_fill(Gray4::WHITE))
@@ -118,53 +231,129 @@ pub(crate) fn draw_list(display: &mut Display, y: i32, header: &str, items: &[St
     }
 }
 
-pub(crate) fn draw_lora_screen(
-    display: &mut Display,
-    message: &str,
-    status: &str,
-    sent: &[String],
-    received: &[String],
-    symbols: bool,
-    shift: bool,
-) {
+/// the receive tab's scrollable log: `scroll` is the first visible wrapped
+/// line. draws the text column, the scroll buttons and a position hint.
+pub(crate) fn draw_recv_list(display: &mut Display, entries: &[String], scroll: usize) {
+    Rectangle::new(
+        Point::new(0, RECV_TOP - 4),
+        Size::new(540, (RECV_ROWS * RECV_ROW_H + 8) as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(Gray4::WHITE))
+    .draw(display)
+    .ok();
+
+    let lines = recv_lines(entries);
+    let scroll = scroll.min(lines.len().saturating_sub(1));
+    let font = MonoTextStyle::new(&FONT_6X10, Gray4::BLACK);
+    if lines.is_empty() {
+        Text::new(
+            "no messages yet",
+            Point::new(RECV_TEXT_X, RECV_TOP + 16),
+            font,
+        )
+        .draw(display)
+        .ok();
+    }
+    let mut y = RECV_TOP + 14;
+    for line in lines.iter().skip(scroll).take(RECV_ROWS as usize) {
+        Text::new(line, Point::new(RECV_TEXT_X, y), font)
+            .draw(display)
+            .ok();
+        y += RECV_ROW_H;
+    }
+
+    // scroll controls, with a "shown/total" hint between them.
     let bold = MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK);
-    draw_back_button(display);
+    for (label, by) in [("^", SCROLL_UP_Y), ("v", SCROLL_DOWN_Y)] {
+        Rectangle::new(Point::new(SCROLL_X, by), Size::new(SCROLL_W, SCROLL_BTN_H))
+            .into_styled(
+                PrimitiveStyleBuilder::new()
+                    .stroke_color(Gray4::BLACK)
+                    .stroke_width(2)
+                    .fill_color(Gray4::WHITE)
+                    .build(),
+            )
+            .draw(display)
+            .ok();
+        Text::with_alignment(
+            label,
+            Point::new(
+                SCROLL_X + SCROLL_W as i32 / 2,
+                by + SCROLL_BTN_H as i32 / 2 + 6,
+            ),
+            bold,
+            Alignment::Center,
+        )
+        .draw(display)
+        .ok();
+    }
+    let shown = (scroll + RECV_ROWS as usize).min(lines.len());
     Text::with_alignment(
-        "nootmesh  915 MHz",
-        Point::new(SCREEN_W / 2, 120),
-        bold,
+        &format!("{shown}/{}", lines.len()),
+        Point::new(
+            SCROLL_X + SCROLL_W as i32 / 2,
+            RECV_TOP + (RECV_ROWS / 2) * RECV_ROW_H,
+        ),
+        MonoTextStyle::new(&FONT_6X10, Gray4::BLACK),
         Alignment::Center,
     )
     .draw(display)
     .ok();
-    draw_message(display, message);
-    draw_lora_status(display, status);
-    draw_list(display, SENT_Y, "sent", sent);
-    draw_list(display, RECV_Y, "received", received);
-    crate::keyboard::draw(display, symbols, shift, "SEND");
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_lora_screen(
+    display: &mut Display,
+    tab: Tab,
+    message: &str,
+    status: &str,
+    sent: &[String],
+    received: &[String],
+    scroll: usize,
+    symbols: bool,
+    shift: bool,
+) {
+    draw_back_button(display);
+    draw_tabs(display, tab);
+    match tab {
+        Tab::Send => {
+            draw_message(display, message);
+            draw_lora_status(display, status, tab);
+            draw_list(display, SENT_Y, "sent", sent);
+            crate::keyboard::draw(display, symbols, shift, "SEND");
+        }
+        Tab::Recv => {
+            draw_lora_status(display, status, tab);
+            draw_recv_list(display, received, scroll);
+        }
+    }
 }
 
 pub(crate) fn message_box_native_rect() -> t5s3_epaper_core::display::Rectangle {
     screen_to_native_rect(MSG_X, MSG_Y, MSG_W as i32, MSG_H as i32)
 }
 
-pub(crate) fn lora_status_native_rect() -> t5s3_epaper_core::display::Rectangle {
-    screen_to_native_rect(MSG_X, LORA_STATUS_Y, MSG_W as i32, 26)
+pub(crate) fn lora_status_native_rect(tab: Tab) -> t5s3_epaper_core::display::Rectangle {
+    let y = match tab {
+        Tab::Send => LORA_STATUS_Y,
+        Tab::Recv => RECV_STATUS_Y,
+    };
+    screen_to_native_rect(MSG_X, y, MSG_W as i32, 26)
 }
 
 pub(crate) fn sent_native_rect() -> t5s3_epaper_core::display::Rectangle {
     screen_to_native_rect(MSG_X, SENT_Y, MSG_W as i32, LIST_H as i32)
 }
 
-pub(crate) fn received_native_rect() -> t5s3_epaper_core::display::Rectangle {
-    screen_to_native_rect(MSG_X, RECV_Y, MSG_W as i32, LIST_H as i32)
+pub(crate) fn recv_native_rect() -> t5s3_epaper_core::display::Rectangle {
+    screen_to_native_rect(0, RECV_TOP - 4, 540, RECV_ROWS * RECV_ROW_H + 8)
 }
 
-// build the lora radio used by the send/receive page. it shares SPI2 with the
-// SD card via the bus, which owns and parks both chip-selects. steal the
-// radio's control pins (mirroring the wifi re-sync); dropping the returned
-// radio releases them. the 3.3v rail powered up at boot, so no settle delay
-// is needed.
+// build the lora radio used by the mesh page. it shares SPI2 with the SD card
+// via the bus, which owns and parks both chip-selects. steal the radio's
+// control pins (mirroring the wifi re-sync); dropping the returned radio
+// releases them. the 3.3v rail powered up at boot, so no settle delay is
+// needed.
 pub(crate) fn make_radio<'a>(
     bus: &'a Bus<'static>,
 ) -> Result<Lora<'a, 'static>, t5s3_epaper_core::lora::Error> {

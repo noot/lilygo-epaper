@@ -4,6 +4,7 @@
 extern crate alloc;
 extern crate t5s3_epaper_core;
 
+mod chatlog;
 mod datetime;
 mod fmt;
 mod keyboard;
@@ -130,14 +131,22 @@ use crate::{
             draw_lora_screen,
             draw_lora_status,
             draw_message,
+            draw_recv_list,
             lora_status_native_rect,
             make_radio,
             message_box_native_rect,
-            received_native_rect,
+            recv_native_rect,
+            recv_scroll_down_hit,
+            recv_scroll_end,
+            recv_scroll_up_hit,
+            recv_visible_rows,
             sent_native_rect,
+            tab_recv_hit,
+            tab_send_hit,
+            Tab as LoraTab,
             LIST_MAX,
             MSG_MAX,
-            RECV_Y,
+            RECV_MAX,
             SENT_Y,
         },
         music,
@@ -529,6 +538,12 @@ async fn main(spawner: Spawner) -> ! {
     // trigger one immediately; counters catch up on a slow cadence.
     let mut lora_status_key: (Option<(u32, u8)>, Option<u16>) = (None, None);
     let mut lora_status_at_secs: u64 = 0;
+    // the mesh page's send/receive tab, the receive log's scroll position
+    // (in wrapped lines), and the sd chat archive's load-once flag + size.
+    let mut lora_tab = LoraTab::Send;
+    let mut lora_scroll: usize = 0;
+    let mut chat_loaded = false;
+    let mut chat_size: u64 = 0;
     let mut kb_symbols = false;
     let mut kb_shift = false;
     // ticks since the info page was last refreshed (uptime/temp/voltage).
@@ -975,10 +990,12 @@ async fn main(spawner: Spawner) -> ! {
                 }
                 Screen::Lora => draw_lora_screen(
                     &mut display,
+                    lora_tab,
                     &lora_message,
                     &lora_status,
                     &lora_sent,
                     &lora_recv,
+                    lora_scroll,
                     kb_symbols,
                     kb_shift,
                 ),
@@ -1349,6 +1366,30 @@ async fn main(spawner: Spawner) -> ! {
                         if back_button_hit(sx, sy) {
                             current_screen = Screen::Home;
                             needs_redraw = true;
+                        } else if tab_send_hit(sx, sy) && lora_tab != LoraTab::Send {
+                            lora_tab = LoraTab::Send;
+                            needs_redraw = true;
+                        } else if tab_recv_hit(sx, sy) && lora_tab != LoraTab::Recv {
+                            lora_tab = LoraTab::Recv;
+                            // open pinned to the newest message
+                            lora_scroll = recv_scroll_end(&lora_recv);
+                            needs_redraw = true;
+                        } else if lora_tab == LoraTab::Recv {
+                            // page up/down through the wrapped log, one row of
+                            // overlap so context carries across pages
+                            let page = recv_visible_rows() - 1;
+                            let target = if recv_scroll_up_hit(sx, sy) {
+                                Some(lora_scroll.saturating_sub(page))
+                            } else if recv_scroll_down_hit(sx, sy) {
+                                Some((lora_scroll + page).min(recv_scroll_end(&lora_recv)))
+                            } else {
+                                None
+                            };
+                            if let Some(target) = target {
+                                lora_scroll = target;
+                                draw_recv_list(&mut display, &lora_recv, lora_scroll);
+                                display.flush_partial_fast(recv_native_rect()).ok();
+                            }
                         } else if let Some(key) = keyboard::hit(sx, sy, kb_symbols, kb_shift) {
                             match key {
                                 Key::Shift => {
@@ -1374,13 +1415,24 @@ async fn main(spawner: Spawner) -> ! {
                                                     "mesh queued: {lora_message}"
                                                 );
                                                 lora_status = String::from("queued for our slot");
-                                                lora_sent.push(format!(
-                                                    "{}{lora_message}",
-                                                    lora_stamp(&mut clock, &settings)
-                                                ));
+                                                let stamp = lora_stamp(&mut clock, &settings);
+                                                lora_sent.push(format!("{stamp}{lora_message}"));
                                                 if lora_sent.len() > LIST_MAX {
                                                     lora_sent.remove(0);
                                                 }
+                                                // own messages join the receive
+                                                // tab's timeline and the sd log
+                                                let line = format!("{stamp}me: {lora_message}");
+                                                lora_recv.push(line.clone());
+                                                if lora_recv.len() > RECV_MAX {
+                                                    lora_recv.remove(0);
+                                                }
+                                                chatlog::append(
+                                                    &bus,
+                                                    &line,
+                                                    &lora_recv,
+                                                    &mut chat_size,
+                                                );
                                                 lora_message.clear();
                                             }
                                             Err(e) => {
@@ -1395,8 +1447,10 @@ async fn main(spawner: Spawner) -> ! {
                                     } else {
                                         lora_status = String::from("mesh not ready");
                                     }
-                                    draw_lora_status(&mut display, &lora_status);
-                                    display.flush_partial_fast(lora_status_native_rect()).ok();
+                                    draw_lora_status(&mut display, &lora_status, lora_tab);
+                                    display
+                                        .flush_partial_fast(lora_status_native_rect(lora_tab))
+                                        .ok();
                                 }
                                 other => {
                                     // cap typing at what one data slot can carry.
@@ -2387,13 +2441,26 @@ async fn main(spawner: Spawner) -> ! {
         if current_screen == Screen::Lora || settings.mesh_background {
             if radio.is_none() && !radio_tried {
                 radio_tried = true;
+                // restore the chat backlog from the sd archive once per boot,
+                // before live traffic starts appending to it
+                if !chat_loaded {
+                    chat_loaded = true;
+                    let (mut lines, size) = chatlog::load(&bus);
+                    chat_size = size;
+                    lines.append(&mut lora_recv);
+                    if lines.len() > RECV_MAX {
+                        lines.drain(..lines.len() - RECV_MAX);
+                    }
+                    lora_recv = lines;
+                    lora_scroll = recv_scroll_end(&lora_recv);
+                }
                 match make_radio(&bus) {
                     Ok(mut r) => {
                         if let Err(e) = r.start_receive() {
                             esp_println::println!("lora: start rx failed: {e}");
                         }
                         radio = Some(r);
-                        match mesh::Mesh::new() {
+                        match mesh::Mesh::new(settings.mesh_background) {
                             Ok(m) => {
                                 esp_println::println!("mesh: joining as {:08x}", m.node_id());
                                 lora_mesh = Some(m);
@@ -2428,19 +2495,24 @@ async fn main(spawner: Spawner) -> ! {
             let mut recv_dirty = false;
             while let Some((from, utc, text)) = m.take_text() {
                 esp_println::println!("mesh text from {from:08x}: {text}");
-                lora_recv.push(format!(
+                let line = format!(
                     "{}{from:08x}: {text}",
                     mesh_stamp(&mut clock, &settings, utc)
-                ));
-                if lora_recv.len() > LIST_MAX {
+                );
+                lora_recv.push(line.clone());
+                if lora_recv.len() > RECV_MAX {
                     lora_recv.remove(0);
                 }
+                chatlog::append(&bus, &line, &lora_recv, &mut chat_size);
                 recv_dirty = true;
             }
             if current_screen == Screen::Lora && !needs_redraw {
-                if recv_dirty {
-                    draw_list(&mut display, RECV_Y, "received", &lora_recv);
-                    display.flush_partial_fast(received_native_rect()).ok();
+                if recv_dirty && lora_tab == LoraTab::Recv {
+                    // follow the conversation: new arrivals pin the view to
+                    // the newest line
+                    lora_scroll = recv_scroll_end(&lora_recv);
+                    draw_recv_list(&mut display, &lora_recv, lora_scroll);
+                    display.flush_partial_fast(recv_native_rect()).ok();
                 }
                 let key = m.status_key();
                 let now_secs = clock.now_us() / 1_000_000;
@@ -2448,8 +2520,10 @@ async fn main(spawner: Spawner) -> ! {
                     lora_status_key = key;
                     lora_status_at_secs = now_secs;
                     lora_status = m.status_line();
-                    draw_lora_status(&mut display, &lora_status);
-                    display.flush_partial_fast(lora_status_native_rect()).ok();
+                    draw_lora_status(&mut display, &lora_status, lora_tab);
+                    display
+                        .flush_partial_fast(lora_status_native_rect(lora_tab))
+                        .ok();
                 }
             }
         }

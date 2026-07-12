@@ -8,7 +8,11 @@ details:
 - message storage and redelivery in case of non-receipt (have relays store x most recent messages and users pull on demand)
 
 todo:
-- store received messages on sd card for persistence (long time period on t5s3, smaller window on t3s3 relays)
+- store received messages on sd card for persistence — done on t5s3 (ui
+  appends the chat timeline to MESH/CHAT.LOG, reloads the tail at boot,
+  compacts past 128KB); t3s3 replay-ring persistence still open: its sd slot
+  is CS=GPIO13/MISO=GPIO2 sharing MOSI=11/SCLK=14 with the e-paper, so the
+  t3s3 crate needs a shared-spi-bus rework first
 - message "to:user" and "to:all" options (nodes simply don't display messages that aren't to them)
 - pubkey identities for remote peer verification
 - message encryption (optionally, can be required per-user) handshake to determine shared key (dh? noise protocol to prove remote actually has the key?)
