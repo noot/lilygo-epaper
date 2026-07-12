@@ -137,7 +137,10 @@ needs no marker: every consumer already does the right thing from fields that
 are present (`(origin, msg_id)` for dedup/storage, `hops` for forwarding).
 
 Duplicate-responder suppression: each store node staggers its replay start by
-1–6 seeded frames, and *hearing* any transmission of a message (another
+1–6 frames' worth of *local-clock time* (never a frame-number deadline: a
+root change restarts frame numbers, which left a frame-based deadline minutes
+in the new timeline's future — observed on hardware as a ~5-minute replay
+stall; the engine's listen window guards against the same timeline step), and *hearing* any transmission of a message (another
 responder's replay, a live flood, or its own forward going out) crosses that
 message off its pending session — so the earliest responder does most of the
 talking and the others fill gaps. Suppression assumes shared audibility;

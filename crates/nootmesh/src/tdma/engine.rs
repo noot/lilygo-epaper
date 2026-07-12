@@ -169,7 +169,7 @@ pub struct Engine {
     inbox: heapless::Deque<Incoming, 4>,
     store_enabled: bool,
     store: heapless::Deque<Stored, STORE_CAP>,
-    replay_start_frame: u64,
+    replay_start_us: u64,
     recap_sends_left: u8,
     tx_buf: [u8; MAX_PACKET],
     tx_len: usize,
@@ -276,7 +276,7 @@ impl Engine {
             inbox: heapless::Deque::new(),
             store_enabled: false,
             store: heapless::Deque::new(),
-            replay_start_frame: 0,
+            replay_start_us: 0,
             recap_sends_left: 0,
             tx_buf: [0; MAX_PACKET],
             tx_len: 0,
@@ -362,12 +362,15 @@ impl Engine {
                 // retransmits would otherwise restart the session from the top)
                 if self.store_enabled && !self.store.iter().any(|entry| entry.pending) {
                     self.prune_store(rx_end_us);
-                    if !self.store.is_empty()
-                        && let Some(position) = self.sync.position(rx_end_us)
-                    {
+                    if !self.store.is_empty() {
+                        // the stagger deadline is local-clock, NOT a frame
+                        // number: a root change can restart frame numbers
+                        // near zero, which would leave a frame-based deadline
+                        // minutes-to-hours in the new timeline's future
+                        // (observed on hardware as a ~5-minute replay stall)
                         let stagger = 1 + mix(u64::from(self.node_id.0), 0, SALT_REPLAY_STAGGER)
                             % REPLAY_STAGGER_FRAMES;
-                        self.replay_start_frame = position.frame_number + stagger;
+                        self.replay_start_us = rx_end_us + stagger * self.config.frame_us();
                         for entry in self.store.iter_mut() {
                             entry.pending = true;
                         }
@@ -545,7 +548,14 @@ impl Engine {
                 position
             }
         };
-        let synced_since = *self.synced_since.get_or_insert(position.frame_number);
+        let mut synced_since = *self.synced_since.get_or_insert(position.frame_number);
+        // a root change can step the timeline to smaller frame numbers; a
+        // listen-window origin from the old timeline would then gag this
+        // node's data slots until the new count catches up
+        if position.frame_number < synced_since {
+            synced_since = position.frame_number;
+            self.synced_since = Some(synced_since);
+        }
         let slot_us = self.config.slot_us();
         let frame_us = self.config.frame_us();
         let frame_start = now_us - position.offset_us - u64::from(position.slot) * slot_us;
@@ -657,8 +667,7 @@ impl Engine {
         Option<u64>,
         heapless::Vec<u8, { wire::TEXT_CAP }>,
     )> {
-        let position = self.sync.position(at_us)?;
-        if position.frame_number < self.replay_start_frame {
+        if at_us < self.replay_start_us {
             return None;
         }
         self.prune_store(at_us);
@@ -1148,6 +1157,64 @@ mod tests {
             now = at + 60_000;
         }
         panic!("replay of m2 never went out");
+    }
+
+    /// A root change restarts frame numbers, so deadlines held as frame
+    /// numbers from the old timeline would stall for minutes-to-hours
+    /// (observed on hardware as a ~5-minute replay delay). Both the replay
+    /// stagger and the listen window must ride out the step.
+    #[test]
+    fn replay_survives_a_root_change() {
+        let mut author = engine(1, 7);
+        let mut relay = engine(2, 8);
+        relay.enable_store();
+
+        author.queue_text(5_000_000, b"m1").unwrap();
+        let _ = step_to_data_tx(&mut author, 20_000_000);
+        relay.on_packet(20_500_000, author.packet()).unwrap();
+
+        // relay roots itself via gps (frame numbers ~1900), drains its forward
+        let mut at_r = 30_000_000;
+        loop {
+            at_r = step_to_data_tx(&mut relay, at_r);
+            let idle = matches!(wire::decode(relay.packet()), Ok(wire::Message::Hello(_)));
+            relay.on_transmitted();
+            at_r += 60_000;
+            if idle {
+                break;
+            }
+        }
+
+        let mut req = [0u8; 255];
+        let req_len = recap_packet(3, &mut req);
+        relay.on_packet(at_r, &req[..req_len]).unwrap();
+
+        // an outranking root whose timeline restarted near zero takes over
+        // between the recap and the replay
+        let coup = wire::Message::Beacon(crate::tdma::Beacon {
+            root: NodeId(1),
+            root_has_gps: true,
+            stratum: 0,
+            frame_number: 3,
+        });
+        let mut buf = [0u8; 255];
+        let coup_len = wire::encode(&coup, &mut buf).unwrap().len();
+        relay.on_packet(at_r + 100_000, &buf[..coup_len]).unwrap();
+
+        // the replay still arrives within the stagger window on the new
+        // timeline rather than stalling behind the old frame numbers
+        let mut now = at_r + 200_000;
+        for _ in 0..12 {
+            let at = step_to_data_tx(&mut relay, now);
+            if let Ok(wire::Message::Text(t)) = wire::decode(relay.packet()) {
+                assert_eq!(t.body.as_slice(), b"m1");
+                assert_eq!(t.hops, MAX_TEXT_HOPS);
+                return;
+            }
+            relay.on_transmitted();
+            now = at + 60_000;
+        }
+        panic!("replay stalled after the root change");
     }
 
     #[test]
