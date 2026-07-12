@@ -39,7 +39,7 @@ use t5s3_epaper_core::{
     display::Rectangle,
     gps::Gps,
     gps_pin_config,
-    lora::{Config, Lora, SpreadingFactor},
+    lora::{Bandwidth, CodingRate, Config, Lora, SpreadingFactor},
     lora_pin_config,
     pin_config,
     Display,
@@ -54,6 +54,35 @@ esp_bootloader_esp_idf::esp_app_desc!();
 /// microseconds since boot; the engine's monotonic clock.
 fn now_us() -> u64 {
     Instant::now().duration_since_epoch().as_micros()
+}
+
+/// derive the radio configuration from the fleet profile, so the modulation
+/// the airtime math assumes is the modulation the radio actually uses (this
+/// driver's own default is SF10, which the T3-S3 nodes cannot demodulate).
+fn radio_config(modulation: &Modulation) -> Config {
+    Config {
+        spreading_factor: match modulation.spreading_factor() {
+            8 => SpreadingFactor::Sf8,
+            9 => SpreadingFactor::Sf9,
+            10 => SpreadingFactor::Sf10,
+            11 => SpreadingFactor::Sf11,
+            12 => SpreadingFactor::Sf12,
+            _ => SpreadingFactor::Sf7,
+        },
+        bandwidth: match modulation.bandwidth_hz() {
+            250_000 => Bandwidth::Bw250,
+            500_000 => Bandwidth::Bw500,
+            _ => Bandwidth::Bw125,
+        },
+        coding_rate: match modulation.coding_rate_denominator() {
+            6 => CodingRate::Cr4_6,
+            7 => CodingRate::Cr4_7,
+            8 => CodingRate::Cr4_8,
+            _ => CodingRate::Cr4_5,
+        },
+        preamble_length: modulation.preamble_symbols(),
+        ..Config::default()
+    }
 }
 
 /// fix types trustworthy enough to anchor the mesh timeline to UTC.
@@ -104,13 +133,13 @@ fn main() -> ! {
         peripherals.GPIO46,
     )
     .expect("to build spi bus");
-    // SF7 to interoperate with the T3-S3 nodes (this driver defaults to SF10).
-    let radio_config = Config {
-        spreading_factor: SpreadingFactor::Sf7,
-        ..Config::default()
-    };
-    let mut radio =
-        Lora::new(&bus, lora_pin_config!(peripherals), &radio_config).expect("to initialize LoRa");
+    let modulation = Modulation::default();
+    let mut radio = Lora::new(
+        &bus,
+        lora_pin_config!(peripherals),
+        &radio_config(&modulation),
+    )
+    .expect("to initialize LoRa");
 
     let mut gps = Gps::detect(peripherals.UART1, gps_pin_config!(peripherals), &mut delay)
         .expect("to detect and initialize GPS");
@@ -124,13 +153,8 @@ fn main() -> ! {
     let rng = Rng::new();
     let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
 
-    let mut engine = Engine::new(
-        nootmesh::tdma::Config::default(),
-        Modulation::default(),
-        node_id,
-        seed,
-    )
-    .expect("slot budget fits the modulation");
+    let mut engine = Engine::new(nootmesh::tdma::Config::default(), modulation, node_id, seed)
+        .expect("slot budget fits the modulation");
 
     println!("nootmesh node {:08x} up (gps root candidate)", node_id.0);
 

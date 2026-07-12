@@ -74,9 +74,29 @@ impl Modulation {
     }
 }
 
+impl Modulation {
+    pub fn spreading_factor(&self) -> u8 {
+        self.spreading_factor
+    }
+
+    pub fn bandwidth_hz(&self) -> u32 {
+        self.bandwidth_hz
+    }
+
+    pub fn coding_rate_denominator(&self) -> u8 {
+        self.coding_rate_denominator
+    }
+
+    pub fn preamble_symbols(&self) -> u16 {
+        self.preamble_symbols
+    }
+}
+
 impl Default for Modulation {
-    /// The t3s3 sx1262 driver defaults: SF7, 125 kHz, CR 4/5, 8-symbol
-    /// preamble.
+    /// The fleet profile every node must share: SF7, 125 kHz, CR 4/5,
+    /// 8-symbol preamble. Radio drivers derive their configuration from these
+    /// accessors rather than hardcoding, so changing the profile here changes
+    /// every firmware target together.
     fn default() -> Self {
         Self {
             spreading_factor: 7,

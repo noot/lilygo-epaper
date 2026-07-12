@@ -151,18 +151,32 @@ impl Config {
 }
 
 impl Default for Config {
-    /// Sized for the SF7/125 kHz defaults: a 64-byte payload flies in 118 ms,
-    /// so a 160 ms slot leaves a 15 ms guard on each side with margin. 100
-    /// slots make a 16-second frame (whole seconds, anchoring at
-    /// `utc % 16 == 0`) at a ~0.7% duty cycle per slot held.
+    /// The fleet profile every node must share (a mismatched frame layout
+    /// cannot sync). Sized for a small mesh on the SF7/125 kHz defaults:
+    /// 200 ms slots fit a 99-byte payload (169 ms) inside 15 ms guards with
+    /// slack for late transmit starts, and 20 slots make a 4-second frame
+    /// (whole seconds, anchoring at `utc % 4 == 0`), so slot claims, root
+    /// election and text delivery all settle within seconds rather than
+    /// minutes. 3 beacon + 3 contention slots leave 14 data slots.
     fn default() -> Self {
         Self {
-            slot_us: 160_000,
-            slots_per_frame: 100,
+            slot_us: 200_000,
+            slots_per_frame: 20,
             guard_us: 15_000,
-            beacon_slots: 4,
-            contention_slots: 6,
+            beacon_slots: 3,
+            contention_slots: 3,
         }
+    }
+}
+
+/// A fixed 16-second, 100-slot layout for unit tests, so their arithmetic is
+/// independent of whatever the deployed profile in [`Config::default`]
+/// currently is.
+#[cfg(test)]
+pub(crate) fn test_config() -> Config {
+    match Config::new(160_000, 100, 15_000, 4, 6) {
+        Ok(config) => config,
+        Err(_) => unreachable!("test layout is valid"),
     }
 }
 
@@ -171,9 +185,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_valid_and_16s() {
-        let config = Config::new(160_000, 100, 15_000, 4, 6).unwrap();
-        assert_eq!(config, Config::default());
+    fn default_profile_is_4s_20_slots() {
+        let config = Config::default();
+        assert_eq!(config, Config::new(200_000, 20, 15_000, 3, 3).unwrap());
+        assert_eq!(config.frame_us(), 4_000_000);
+        assert_eq!(config.frame_seconds(), 4);
+        assert_eq!(config.first_data_slot(), 6);
+    }
+
+    #[test]
+    fn test_layout_is_16s_100_slots() {
+        let config = test_config();
         assert_eq!(config.frame_us(), 16_000_000);
         assert_eq!(config.frame_seconds(), 16);
         assert_eq!(config.first_data_slot(), 10);
@@ -183,11 +205,11 @@ mod tests {
     fn slot_kinds() {
         let config = Config::default();
         assert_eq!(config.slot_kind(0), SlotKind::Beacon);
-        assert_eq!(config.slot_kind(3), SlotKind::Beacon);
-        assert_eq!(config.slot_kind(4), SlotKind::Contention);
-        assert_eq!(config.slot_kind(9), SlotKind::Contention);
-        assert_eq!(config.slot_kind(10), SlotKind::Data);
-        assert_eq!(config.slot_kind(99), SlotKind::Data);
+        assert_eq!(config.slot_kind(2), SlotKind::Beacon);
+        assert_eq!(config.slot_kind(3), SlotKind::Contention);
+        assert_eq!(config.slot_kind(5), SlotKind::Contention);
+        assert_eq!(config.slot_kind(6), SlotKind::Data);
+        assert_eq!(config.slot_kind(19), SlotKind::Data);
     }
 
     #[test]

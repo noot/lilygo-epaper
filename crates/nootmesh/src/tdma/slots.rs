@@ -198,7 +198,7 @@ fn fnv1a(value: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tdma::SlotKind;
+    use crate::tdma::{SlotKind, test_config};
 
     fn hello(sender: u32, slot: Option<u16>, neighbors: &[(u32, u16)]) -> Hello {
         let mut list = Vec::new();
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn fresh_node_picks_seeded_data_slot() {
-        let config = Config::default();
+        let config = test_config();
         let mut a = Coloring::new(config, NodeId(1));
         let mut b = Coloring::new(config, NodeId(2));
         let slot_a = a.pick_slot(0).unwrap();
@@ -227,13 +227,13 @@ mod tests {
 
     #[test]
     fn avoids_one_and_two_hop_claims() {
-        let mut coloring = Coloring::new(Config::default(), NodeId(9));
+        let mut coloring = Coloring::new(test_config(), NodeId(9));
         let mine = coloring.pick_slot(0).unwrap();
         coloring.on_hello(0, &hello(100, Some(mine), &[(101, mine + 1)]));
         // higher-id claims don't force a yield, but fresh picks avoid them
         assert_eq!(coloring.pick_slot(0), Some(mine));
 
-        let mut fresh = Coloring::new(Config::default(), NodeId(9));
+        let mut fresh = Coloring::new(test_config(), NodeId(9));
         fresh.on_hello(0, &hello(100, Some(mine), &[(101, mine + 1)]));
         let picked = fresh.pick_slot(0).unwrap();
         assert_ne!(picked, mine);
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn lower_id_wins_conflicts() {
-        let mut coloring = Coloring::new(Config::default(), NodeId(9));
+        let mut coloring = Coloring::new(test_config(), NodeId(9));
         let mine = coloring.pick_slot(0).unwrap();
         coloring.on_hello(0, &hello(3, Some(mine), &[]));
         let repicked = coloring.pick_slot(0).unwrap();
@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn stale_neighbors_are_forgotten() {
-        let config = Config::default();
+        let config = test_config();
         let mut coloring = Coloring::new(config, NodeId(9));
         let mine = coloring.pick_slot(0).unwrap();
         coloring.on_hello(0, &hello(3, Some(mine), &[]));
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn hello_reports_table_and_own_slot() {
-        let mut coloring = Coloring::new(Config::default(), NodeId(9));
+        let mut coloring = Coloring::new(test_config(), NodeId(9));
         let mine = coloring.pick_slot(0).unwrap();
         coloring.on_hello(0, &hello(3, Some(20), &[]));
         coloring.on_hello(0, &hello(4, None, &[]));

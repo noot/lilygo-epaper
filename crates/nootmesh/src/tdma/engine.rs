@@ -380,12 +380,12 @@ fn mix(seed: u64, frame_number: u64, salt: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tdma::SlotKind;
+    use crate::tdma::{SlotKind, test_config};
 
     const FRAME_US: u64 = 16_000_000;
 
     fn engine(id: u32, seed: u64) -> Engine {
-        Engine::new(Config::default(), Modulation::default(), NodeId(id), seed).unwrap()
+        Engine::new(test_config(), Modulation::default(), NodeId(id), seed).unwrap()
     }
 
     #[test]
@@ -419,7 +419,7 @@ mod tests {
             match e.next_action(now) {
                 Action::Transmit { at_us } if at_us < next_gps => {
                     let slot = e.position(at_us).unwrap().slot;
-                    if Config::default().slot_kind(slot) == SlotKind::Data {
+                    if test_config().slot_kind(slot) == SlotKind::Data {
                         assert!(matches!(
                             wire::decode(e.packet()),
                             Ok(wire::Message::Hello(h)) if h.slot == e.slot()
@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn root_beacons_then_claims_after_listen_window() {
         let mut e = engine(1, 7);
-        let config = Config::default();
+        let config = test_config();
         let sent = run_solo(&mut e, 20_000_000, 6);
 
         // synced mid-frame at the first gps second, so the first beacon lands
@@ -478,7 +478,7 @@ mod tests {
             match e.next_action(now) {
                 Action::Transmit { at_us } if at_us < next_gps => {
                     let slot = e.position(at_us).unwrap().slot;
-                    if Config::default().slot_kind(slot) == SlotKind::Data {
+                    if test_config().slot_kind(slot) == SlotKind::Data {
                         return at_us;
                     }
                     now = at_us + 50_000;

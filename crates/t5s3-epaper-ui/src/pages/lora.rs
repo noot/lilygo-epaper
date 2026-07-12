@@ -10,8 +10,9 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
+use nootmesh::airtime::Modulation;
 use t5s3_epaper_core::{
-    lora::{Config as LoraConfig, Lora},
+    lora::{Bandwidth, CodingRate, Config as LoraConfig, Lora, SpreadingFactor},
     spi::Bus,
     Display,
 };
@@ -172,11 +173,32 @@ pub(crate) fn make_radio<'a>(
         busy: unsafe { esp_hal::peripherals::GPIO47::steal() },
         dio1: unsafe { esp_hal::peripherals::GPIO10::steal() },
     };
-    // match the t3-s3 receiver, whose Config::default() uses SF7. every other
-    // parameter (915 MHz, BW125, CR4/5, preamble 8, private sync word) already
-    // agrees; only the spreading factor differed.
+    // derive the modulation from the nootmesh fleet profile, so the radio
+    // always matches what the mesh engine's airtime math (and every other
+    // node) assumes. this driver's own default is SF10, which the T3-S3
+    // nodes cannot demodulate.
+    let modulation = Modulation::default();
     let config = LoraConfig {
-        spreading_factor: t5s3_epaper_core::lora::SpreadingFactor::Sf7,
+        spreading_factor: match modulation.spreading_factor() {
+            8 => SpreadingFactor::Sf8,
+            9 => SpreadingFactor::Sf9,
+            10 => SpreadingFactor::Sf10,
+            11 => SpreadingFactor::Sf11,
+            12 => SpreadingFactor::Sf12,
+            _ => SpreadingFactor::Sf7,
+        },
+        bandwidth: match modulation.bandwidth_hz() {
+            250_000 => Bandwidth::Bw250,
+            500_000 => Bandwidth::Bw500,
+            _ => Bandwidth::Bw125,
+        },
+        coding_rate: match modulation.coding_rate_denominator() {
+            6 => CodingRate::Cr4_6,
+            7 => CodingRate::Cr4_7,
+            8 => CodingRate::Cr4_8,
+            _ => CodingRate::Cr4_5,
+        },
+        preamble_length: modulation.preamble_symbols(),
         ..LoraConfig::default()
     };
     Lora::new(bus, pins, &config)

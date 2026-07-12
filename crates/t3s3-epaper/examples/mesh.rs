@@ -49,7 +49,7 @@ use nootmesh::{
 };
 use t3s3_epaper::{
     ssd1680::{Display, Rotation},
-    sx1262::{Config, Sx1262},
+    sx1262::{Bandwidth, CodingRate, Config, SpreadingFactor, Sx1262},
 };
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -61,6 +61,34 @@ const FULL_REFRESH_EVERY: u32 = 10;
 /// microseconds since boot; the engine's monotonic clock.
 fn now_us() -> u64 {
     Instant::now().duration_since_epoch().as_micros()
+}
+
+/// derive the radio configuration from the fleet profile, so the modulation
+/// the airtime math assumes is the modulation the radio actually uses.
+fn radio_config(modulation: &Modulation) -> Config {
+    Config {
+        spreading_factor: match modulation.spreading_factor() {
+            8 => SpreadingFactor::Sf8,
+            9 => SpreadingFactor::Sf9,
+            10 => SpreadingFactor::Sf10,
+            11 => SpreadingFactor::Sf11,
+            12 => SpreadingFactor::Sf12,
+            _ => SpreadingFactor::Sf7,
+        },
+        bandwidth: match modulation.bandwidth_hz() {
+            250_000 => Bandwidth::Bw250kHz,
+            500_000 => Bandwidth::Bw500kHz,
+            _ => Bandwidth::Bw125kHz,
+        },
+        coding_rate: match modulation.coding_rate_denominator() {
+            6 => CodingRate::Cr4_6,
+            7 => CodingRate::Cr4_7,
+            8 => CodingRate::Cr4_8,
+            _ => CodingRate::Cr4_5,
+        },
+        preamble_len: modulation.preamble_symbols(),
+        ..Config::default()
+    }
 }
 
 #[main]
@@ -93,6 +121,7 @@ fn main() -> ! {
     // power the radio's oscillator rail (gpio35); see the rx example.
     let _radio_pow = Output::new(peripherals.GPIO35, Level::High, OutputConfig::default());
     Delay::new().delay_ms(10);
+    let modulation = Modulation::default();
     let mut radio = Sx1262::new(
         radio_spi,
         radio_cs,
@@ -100,7 +129,7 @@ fn main() -> ! {
         radio_busy,
         radio_dio1,
         Delay::new(),
-        Config::default(),
+        radio_config(&modulation),
     );
     radio.init().unwrap();
 
@@ -133,13 +162,8 @@ fn main() -> ! {
     let rng = Rng::new();
     let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
 
-    let mut engine = Engine::new(
-        nootmesh::tdma::Config::default(),
-        Modulation::default(),
-        node_id,
-        seed,
-    )
-    .unwrap();
+    let mut engine =
+        Engine::new(nootmesh::tdma::Config::default(), modulation, node_id, seed).unwrap();
 
     println!(
         "nootmesh node {:08x} up (mac {mac}, status {:#04x}, device_errors {:#06x})",
@@ -149,7 +173,7 @@ fn main() -> ! {
     );
 
     display.init().unwrap();
-    render_status(&mut display, node_id, &engine, now_us(), 0, 0);
+    render_status(&mut display, node_id, &engine, now_us(), 0, 0, "");
     display.refresh().unwrap();
 
     radio.start_receive().unwrap();
@@ -159,6 +183,7 @@ fn main() -> ! {
     let mut rx_count: u32 = 0;
     let mut tx_count: u32 = 0;
     let mut refreshes: u32 = 0;
+    let mut last_text = FmtBuf::new();
 
     loop {
         let action = engine.next_action(now_us());
@@ -195,6 +220,25 @@ fn main() -> ! {
             delay.delay_us(50);
         }
         if got_packet {
+            // show chat texts from the mesh (this node has no keyboard, so it
+            // only receives; the refresh briefly blocks the radio, which the
+            // protocol tolerates)
+            if let Some((from, body)) = engine.take_text() {
+                let text = core::str::from_utf8(&body).unwrap_or("<binary>");
+                println!("text from {:08x}: {text}", from.0);
+                last_text = FmtBuf::new();
+                let _ = write!(last_text, "{:08x}: {text}", from.0);
+                render_status(
+                    &mut display,
+                    node_id,
+                    &engine,
+                    now_us(),
+                    rx_count,
+                    tx_count,
+                    last_text.as_str(),
+                );
+                let _ = display.refresh_partial();
+            }
             continue;
         }
 
@@ -232,7 +276,15 @@ fn main() -> ! {
         // the panel blocks the loop for the refresh, so keep it away from
         // moments we expect to receive
         if is_hello {
-            render_status(&mut display, node_id, &engine, now_us(), rx_count, tx_count);
+            render_status(
+                &mut display,
+                node_id,
+                &engine,
+                now_us(),
+                rx_count,
+                tx_count,
+                last_text.as_str(),
+            );
             refreshes = refreshes.wrapping_add(1);
             if refreshes.is_multiple_of(FULL_REFRESH_EVERY) {
                 let _ = display.refresh();
@@ -251,6 +303,7 @@ fn render_status<D>(
     now_us: u64,
     rx_count: u32,
     tx_count: u32,
+    last_text: &str,
 ) where
     D: DrawTarget<Color = BinaryColor>,
 {
@@ -301,6 +354,7 @@ fn render_status<D>(
     let _ = Text::new(line1.as_str(), Point::new(8, 52), body).draw(display);
     let _ = Text::new(line2.as_str(), Point::new(8, 68), body).draw(display);
     let _ = Text::new(line3.as_str(), Point::new(8, 84), body).draw(display);
+    let _ = Text::new(last_text, Point::new(8, 100), body).draw(display);
 }
 
 /// a tiny fixed-capacity buffer that implements `core::fmt::Write` so `write!`

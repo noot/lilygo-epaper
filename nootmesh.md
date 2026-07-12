@@ -14,12 +14,18 @@ details:
 
 ## tdma (implemented in `crates/nootmesh/src/tdma`)
 
-Sized for the sx1262 defaults (915 MHz, SF7, 125 kHz, CR 4/5): a 64-byte
-payload flies in 118 ms, so slots are 160 ms with a 15 ms guard on each edge.
-100 slots per frame = 16 s frames, anchored at `utc % 16 == 0` (~0.7% duty
-cycle per slot held).
+The fleet profile is the single point of truth: `nootmesh::tdma::Config::default()`
++ `airtime::Modulation::default()` — every firmware target builds both its
+engine and its radio-driver config from them (mismatched nodes cannot sync,
+so nothing else may hardcode modulation or frame layout).
 
-Frame layout: `| 0..4 beacon | 4..10 contention (hellos) | 10..100 data |`
+Current profile (915 MHz, SF7, 125 kHz, CR 4/5): 200 ms slots fit a 99-byte
+payload (169 ms) inside 15 ms guards; 20 slots = 4 s frames anchored at
+`utc % 4 == 0`. Texts up to 91 bytes. Sized for a small (~6 node) mesh:
+sync, election and delivery settle in seconds. (An earlier 160 ms × 100 =
+16 s layout is kept as the unit tests' fixed arithmetic base.)
+
+Frame layout: `| 0..3 beacon | 3..6 contention (hellos) | 6..20 data |`
 
 Time sync: one elected root (GPS fix beats none, then lowest id) anchors the
 frame to UTC and floods it via beacons; stratum-k relays rebeacon in slot

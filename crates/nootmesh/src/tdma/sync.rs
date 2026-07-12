@@ -233,11 +233,12 @@ fn outranks(a_has_gps: bool, a: NodeId, b_has_gps: bool, b: NodeId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tdma::test_config;
 
     const FRAME_US: u64 = 16_000_000;
 
     fn synced_via_gps(node_id: u32, now_us: u64, utc_seconds: u64) -> Sync {
-        let mut sync = Sync::new(Config::default(), NodeId(node_id));
+        let mut sync = Sync::new(test_config(), NodeId(node_id));
         sync.on_gps_second(now_us, utc_seconds);
         sync
     }
@@ -263,7 +264,7 @@ mod tests {
 
     #[test]
     fn beacon_adoption_recovers_origin() {
-        let mut sync = Sync::new(Config::default(), NodeId(2));
+        let mut sync = Sync::new(test_config(), NodeId(2));
         let beacon = Beacon {
             root: NodeId(1),
             root_has_gps: true,
@@ -289,7 +290,7 @@ mod tests {
 
     #[test]
     fn root_ranking() {
-        let mut sync = Sync::new(Config::default(), NodeId(9));
+        let mut sync = Sync::new(test_config(), NodeId(9));
         let base = Beacon {
             root: NodeId(5),
             root_has_gps: true,
@@ -316,7 +317,7 @@ mod tests {
 
     #[test]
     fn same_root_requires_lower_stratum() {
-        let mut sync = Sync::new(Config::default(), NodeId(9));
+        let mut sync = Sync::new(test_config(), NodeId(9));
         let base = Beacon {
             root: NodeId(1),
             root_has_gps: true,
@@ -335,7 +336,7 @@ mod tests {
 
     #[test]
     fn deep_strata_not_adopted_or_relayed() {
-        let mut sync = Sync::new(Config::default(), NodeId(9));
+        let mut sync = Sync::new(test_config(), NodeId(9));
         let beacon = Beacon {
             root: NodeId(1),
             root_has_gps: true,
@@ -359,7 +360,7 @@ mod tests {
 
     #[test]
     fn beacon_sync_expires_without_refresh() {
-        let mut sync = Sync::new(Config::default(), NodeId(9));
+        let mut sync = Sync::new(test_config(), NodeId(9));
         let beacon = Beacon {
             root: NodeId(1),
             root_has_gps: true,
@@ -379,7 +380,7 @@ mod tests {
 
     #[test]
     fn free_running_root_fallback() {
-        let mut sync = Sync::new(Config::default(), NodeId(2));
+        let mut sync = Sync::new(test_config(), NodeId(2));
         sync.become_root(50_000_000);
         let position = sync.position(50_000_000 + FRAME_US + 200_000).unwrap();
         assert_eq!(position.frame_number, 1);
@@ -413,7 +414,7 @@ mod tests {
 
     #[test]
     fn free_running_root_upgrades_on_gps_fix() {
-        let mut sync = Sync::new(Config::default(), NodeId(2));
+        let mut sync = Sync::new(test_config(), NodeId(2));
         sync.become_root(50_000_000);
         sync.on_gps_second(60_000_000, 16_008);
         let (_, beacon) = sync.beacon(60_100_000).unwrap();
