@@ -8,11 +8,13 @@ details:
 - message storage and redelivery in case of non-receipt (have relays store x most recent messages and users pull on demand)
 
 todo:
-- store received messages on sd card for persistence — done on t5s3 (ui
-  appends the chat timeline to MESH/CHAT.LOG, reloads the tail at boot,
-  compacts past 128KB); t3s3 replay-ring persistence still open: its sd slot
-  is CS=GPIO13/MISO=GPIO2 sharing MOSI=11/SCLK=14 with the e-paper, so the
-  t3s3 crate needs a shared-spi-bus rework first
+- store received messages on sd card for persistence — done on both: the
+  t5s3 ui appends the chat timeline to MESH/CHAT.LOG (tail reload at boot,
+  compaction past 128KB); the t3s3 relay persists its replay store to
+  STORE.BIN via `Engine::store_snapshot`/`store_restore` (saved on every
+  store change, reloaded at boot with remaining-TTL rebasing — durations,
+  never absolute clocks, cross the reboot). the t3s3 sd (CS=13, MISO=2)
+  shares the e-paper SPI via RefCellDevice at 400 kHz
 - message "to:user" and "to:all" options (nodes simply don't display messages that aren't to them)
 - pubkey identities for remote peer verification
 - message encryption (optionally, can be required per-user) handshake to determine shared key (dh? noise protocol to prove remote actually has the key?)
@@ -153,9 +155,14 @@ frame, systematically shadowing the same slots each frame; it now refreshes
 every 4th frame). Store nodes ignore repeat requests while a replay session
 is already running, so retries never restart a session.
 
+The store survives reboots: `Engine::store_snapshot` serializes the ring
+(postcard) with retention as *remaining* lifetime — absolute expiry instants
+would be meaningless on the next boot's clock — and `store_restore` rebases
+them and re-marks the keys seen, so live duplicates of restored history stay
+deduplicated. The t3s3 relay saves to SD on every store change and reloads
+at boot, making the full 24 h mailbox window hold across power cycles.
+
 Known limits: recap is direct-range only (neither request nor replies flood);
-storage is RAM, so a rebooted relay starts empty and refills passively from
-live traffic and other relays' replays (SD persistence is in the todo);
 silence after a recap is ambiguous between "no store node in range" and
 "nothing missed".
 

@@ -20,8 +20,10 @@ embedded-hal-bus = "0.3"
 embedded-graphics = "0.8"
 
 # `mesh` example: TDMA mesh protocol logic (workspace-excluded crate, pure
-# no_std, host-tested via `just test-nootmesh`).
+# no_std, host-tested via `just test-nootmesh`), plus FAT access to the
+# on-board microSD (shares the e-paper SPI bus) for replay-store persistence.
 nootmesh = { path = "../nootmesh" }
+embedded-sdmmc = { workspace = true }
 
 # radio stack shared by the `ble` and `wifi_lora_bridge` examples. esp-radio is
 # the wifi/ble controller and esp-rtos the preemptive scheduler the radio

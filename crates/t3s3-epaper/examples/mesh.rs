@@ -12,7 +12,7 @@
 #![no_std]
 #![no_main]
 
-use core::fmt::Write as _;
+use core::{cell::RefCell, fmt::Write as _};
 
 use embedded_graphics::{
     draw_target::DrawTarget,
@@ -26,7 +26,8 @@ use embedded_graphics::{
     text::Text,
 };
 use embedded_hal::delay::DelayNs as _;
-use embedded_hal_bus::spi::ExclusiveDevice;
+use embedded_hal_bus::spi::RefCellDevice;
+use embedded_sdmmc::{Mode as SdMode, VolumeIdx};
 use esp_backtrace as _;
 use esp_hal::{
     delay::Delay,
@@ -57,6 +58,72 @@ esp_bootloader_esp_idf::esp_app_desc!();
 /// do a clean full refresh every this many partial refreshes to clear
 /// ghosting.
 const FULL_REFRESH_EVERY: u32 = 10;
+
+/// the replay store's snapshot file, in the SD card's FAT root.
+const STORE_FILE: &str = "STORE.BIN";
+
+/// sized for the engine's full store (32 entries of framed 127-byte bodies);
+/// static because it outsizes comfortable stack use.
+const SNAP_BUF_LEN: usize = 6144;
+static SNAP_BUF: static_cell::StaticCell<[u8; SNAP_BUF_LEN]> = static_cell::StaticCell::new();
+
+/// fixed timestamp for FAT metadata: the board has no wall clock, and file
+/// times play no protocol role.
+struct FixedTime;
+
+impl embedded_sdmmc::TimeSource for FixedTime {
+    fn get_timestamp(&self) -> embedded_sdmmc::Timestamp {
+        embedded_sdmmc::Timestamp {
+            year_since_1970: 56,
+            zero_indexed_month: 0,
+            zero_indexed_day: 0,
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+        }
+    }
+}
+
+/// read the persisted snapshot into `buf`, returning its length. None covers
+/// every degraded case alike: no card, no filesystem, no file yet.
+fn load_snapshot<D, T>(
+    volume_mgr: &mut embedded_sdmmc::VolumeManager<D, T>,
+    buf: &mut [u8],
+) -> Option<usize>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: embedded_sdmmc::TimeSource,
+{
+    let volume = volume_mgr.open_volume(VolumeIdx(0)).ok()?;
+    let root = volume.open_root_dir().ok()?;
+    let file = root.open_file_in_dir(STORE_FILE, SdMode::ReadOnly).ok()?;
+    let mut n = 0;
+    while !file.is_eof() && n < buf.len() {
+        let read = file.read(&mut buf[n..]).ok()?;
+        if read == 0 {
+            break;
+        }
+        n += read;
+    }
+    Some(n)
+}
+
+fn save_snapshot<D, T>(volume_mgr: &mut embedded_sdmmc::VolumeManager<D, T>, bytes: &[u8]) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: embedded_sdmmc::TimeSource,
+{
+    let Ok(volume) = volume_mgr.open_volume(VolumeIdx(0)) else {
+        return false;
+    };
+    let Ok(root) = volume.open_root_dir() else {
+        return false;
+    };
+    let Ok(file) = root.open_file_in_dir(STORE_FILE, SdMode::ReadWriteCreateOrTruncate) else {
+        return false;
+    };
+    file.write(bytes).is_ok()
+}
 
 /// microseconds since boot; the engine's monotonic clock.
 fn now_us() -> u64 {
@@ -137,14 +204,20 @@ fn main() -> ! {
     let disp_spi = Spi::new(
         peripherals.SPI3,
         SpiConfig::default()
-            .with_frequency(Rate::from_mhz(4))
+            // the microSD shares this bus (its cs is GPIO13, and it needs
+            // MISO=GPIO2 which the write-only panel doesn't); SD initialization
+            // caps the clock at 400 kHz, and the panel's multi-hundred-ms
+            // refresh dwarfs the slower transfers
+            .with_frequency(Rate::from_khz(400))
             .with_mode(Mode::_0),
     )
     .unwrap()
     .with_sck(peripherals.GPIO14)
-    .with_mosi(peripherals.GPIO11);
+    .with_mosi(peripherals.GPIO11)
+    .with_miso(peripherals.GPIO2);
+    let shared_spi = RefCell::new(disp_spi);
     let disp_cs = Output::new(peripherals.GPIO15, Level::High, OutputConfig::default());
-    let disp_dev = ExclusiveDevice::new(disp_spi, disp_cs, Delay::new()).unwrap();
+    let disp_dev = RefCellDevice::new(&shared_spi, disp_cs, Delay::new()).unwrap();
     let disp_dc = Output::new(peripherals.GPIO16, Level::Low, OutputConfig::default());
     let disp_rst = Output::new(peripherals.GPIO47, Level::High, OutputConfig::default());
     let disp_busy = Input::new(
@@ -153,6 +226,13 @@ fn main() -> ! {
     );
     let mut display = Display::new(disp_dev, disp_dc, disp_rst, disp_busy, Delay::new());
     display.set_rotation(Rotation::Rotate270); // landscape, 250 x 122
+
+    // microSD on the shared bus: persists the replay store across reboots.
+    // a missing/unreadable card degrades to the ram-only mailbox.
+    let sd_cs = Output::new(peripherals.GPIO13, Level::High, OutputConfig::default());
+    let sd_dev = RefCellDevice::new(&shared_spi, sd_cs, Delay::new()).unwrap();
+    let sdcard = embedded_sdmmc::SdCard::new(sd_dev, Delay::new());
+    let mut volume_mgr = embedded_sdmmc::VolumeManager::new(sdcard, FixedTime);
 
     // stable per-board identity from the efuse mac; trng entropy for the
     // engine's randomized skips and root-fallback jitter.
@@ -169,6 +249,18 @@ fn main() -> ! {
     // rebuilds our own history from other store nodes after a power cycle.
     engine.enable_store();
     engine.request_recap();
+
+    // reload the replay store persisted by the previous boot (remaining
+    // retention was saved as durations, rebased onto this boot's clock)
+    let snap_buf = SNAP_BUF.init([0; SNAP_BUF_LEN]);
+    match load_snapshot(&mut volume_mgr, snap_buf) {
+        Some(n) => {
+            engine.store_restore(now_us(), &snap_buf[..n]);
+            println!("sd: restored {} stored texts", engine.store_len());
+        }
+        None => println!("sd: no persisted store (missing card or first boot)"),
+    }
+    let mut saved_store_len = engine.store_len();
 
     println!(
         "nootmesh node {:08x} up (mac {mac}, status {:#04x}, device_errors {:#06x})",
@@ -191,6 +283,21 @@ fn main() -> ! {
     let mut last_text = FmtBuf::new();
 
     loop {
+        // persist the replay store whenever it changed (new text stored or an
+        // entry aged out); the sd write briefly blocks the radio, the same
+        // cost class as a display refresh
+        if engine.store_len() != saved_store_len {
+            saved_store_len = engine.store_len();
+            match engine.store_snapshot(now_us(), &mut snap_buf[..]) {
+                Some(bytes) => {
+                    if !save_snapshot(&mut volume_mgr, bytes) {
+                        println!("sd: store save failed");
+                    }
+                }
+                None => println!("sd: snapshot buffer too small"),
+            }
+        }
+
         let action = engine.next_action(now_us());
         let deadline = match action {
             Action::Transmit { at_us } => at_us,

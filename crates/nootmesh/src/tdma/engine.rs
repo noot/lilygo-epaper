@@ -188,9 +188,24 @@ struct Stored {
     msg_id: u16,
     timestamp: Option<u64>,
     body: heapless::Vec<u8, { wire::TEXT_CAP }>,
-    stored_at_us: u64,
+    /// local-clock instant this entry ages out (insertion + TTL, or a
+    /// restored snapshot's remaining lifetime rebased onto this boot).
+    expires_at_us: u64,
     /// awaiting replay in the current recap session.
     pending: bool,
+}
+
+/// One persisted replay-store entry. Retention travels as *remaining*
+/// lifetime: neither the local microsecond clock nor mesh frame numbers
+/// survive a reboot, so an absolute expiry would be meaningless on the next
+/// boot's clock.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistEntry {
+    origin: NodeId,
+    msg_id: u16,
+    timestamp: Option<u64>,
+    remaining_us: u64,
+    body: heapless::Vec<u8, { wire::TEXT_CAP }>,
 }
 
 /// What the packet in `tx_buf` commits to when its transmit is confirmed.
@@ -408,15 +423,16 @@ impl Engine {
             msg_id: key.1,
             timestamp,
             body: body.clone(),
-            stored_at_us: now_us,
+            expires_at_us: now_us + STORE_TTL_US,
             pending: false,
         });
     }
 
-    /// Entries are in arrival order, so aging out is a pop from the front.
+    /// Entries are in expiry order (insertion order, and restored snapshots
+    /// carry less lifetime than fresh entries), so aging out pops the front.
     fn prune_store(&mut self, now_us: u64) {
         while let Some(front) = self.store.front() {
-            if now_us.saturating_sub(front.stored_at_us) <= STORE_TTL_US {
+            if front.expires_at_us > now_us {
                 break;
             }
             self.store.pop_front();
@@ -483,6 +499,64 @@ impl Engine {
     /// Texts currently retained for replay, for status displays.
     pub fn store_len(&self) -> usize {
         self.store.len()
+    }
+
+    /// Serialize the replay store for persistence across reboots (postcard).
+    /// Save it whenever [`store_len`](Self::store_len) changes; size `buf`
+    /// for `STORE_CAP` entries of `TEXT_CAP` bodies plus framing (8 KiB is
+    /// comfortable). Returns `None` when the buffer is too small.
+    pub fn store_snapshot<'a>(&self, now_us: u64, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+        let mut entries: heapless::Vec<PersistEntry, STORE_CAP> = heapless::Vec::new();
+        for stored in &self.store {
+            let remaining_us = stored.expires_at_us.saturating_sub(now_us);
+            if remaining_us == 0 {
+                continue;
+            }
+            let _ = entries.push(PersistEntry {
+                origin: stored.origin,
+                msg_id: stored.msg_id,
+                timestamp: stored.timestamp,
+                remaining_us,
+                body: stored.body.clone(),
+            });
+        }
+        postcard::to_slice(&entries, buf).ok().map(|slice| &*slice)
+    }
+
+    /// Load a [`store_snapshot`](Self::store_snapshot) from a previous boot,
+    /// rebasing each entry's remaining lifetime onto this boot's clock.
+    /// Restored keys are marked seen, so live duplicates of restored history
+    /// stay deduplicated. Unparseable bytes are ignored.
+    pub fn store_restore(&mut self, now_us: u64, bytes: &[u8]) {
+        let Ok(entries) = postcard::from_bytes::<heapless::Vec<PersistEntry, STORE_CAP>>(bytes)
+        else {
+            return;
+        };
+        for entry in entries {
+            if entry.remaining_us == 0 {
+                continue;
+            }
+            let key = (entry.origin, entry.msg_id);
+            if self
+                .store
+                .iter()
+                .any(|stored| (stored.origin, stored.msg_id) == key)
+            {
+                continue;
+            }
+            self.mark_seen(key);
+            if self.store.is_full() {
+                self.store.pop_front();
+            }
+            let _ = self.store.push_back(Stored {
+                origin: entry.origin,
+                msg_id: entry.msg_id,
+                timestamp: entry.timestamp,
+                body: entry.body,
+                expires_at_us: now_us + entry.remaining_us.min(STORE_TTL_US),
+                pending: false,
+            });
+        }
     }
 
     /// Broadcast a history request from the next data slot: every store node
@@ -1215,6 +1289,88 @@ mod tests {
             now = at + 60_000;
         }
         panic!("replay stalled after the root change");
+    }
+
+    #[test]
+    fn store_snapshot_survives_a_reboot() {
+        let mut author = engine(1, 7);
+        let mut relay = engine(2, 8);
+        relay.enable_store();
+
+        author.queue_text(5_000_000, b"keep me").unwrap();
+        let _ = step_to_data_tx(&mut author, 20_000_000);
+        relay.on_packet(20_500_000, author.packet()).unwrap();
+        assert_eq!(relay.store_len(), 1);
+
+        let mut buf = [0u8; 8192];
+        let mut snap = [0u8; 8192];
+        let len = relay.store_snapshot(21_000_000, &mut buf).unwrap().len();
+        snap[..len].copy_from_slice(&buf[..len]);
+
+        // "reboot": a fresh engine with a young clock restores the snapshot
+        let mut reborn = engine(2, 8);
+        reborn.enable_store();
+        reborn.store_restore(1_000_000, &snap[..len]);
+        assert_eq!(reborn.store_len(), 1);
+
+        // restored keys stay deduplicated against live copies
+        assert!(matches!(
+            reborn.on_packet(1_200_000, author.packet()),
+            Ok(Received::DuplicateText { .. })
+        ));
+        assert_eq!(reborn.store_len(), 1);
+
+        // and the restored entry replays to a recap
+        let mut at_r = 30_000_000;
+        loop {
+            at_r = step_to_data_tx(&mut reborn, at_r);
+            let idle = matches!(wire::decode(reborn.packet()), Ok(wire::Message::Hello(_)));
+            reborn.on_transmitted();
+            at_r += 60_000;
+            if idle {
+                break;
+            }
+        }
+        let mut req = [0u8; 255];
+        let req_len = recap_packet(3, &mut req);
+        reborn.on_packet(at_r, &req[..req_len]).unwrap();
+        let mut now = at_r + 60_000;
+        for _ in 0..12 {
+            let at = step_to_data_tx(&mut reborn, now);
+            if let Ok(wire::Message::Text(t)) = wire::decode(reborn.packet()) {
+                assert_eq!(t.body.as_slice(), b"keep me");
+                return;
+            }
+            reborn.on_transmitted();
+            now = at + 60_000;
+        }
+        panic!("restored entry never replayed");
+    }
+
+    #[test]
+    fn restored_entries_keep_only_remaining_ttl() {
+        let mut author = engine(1, 7);
+        let mut relay = engine(2, 8);
+        relay.enable_store();
+
+        author.queue_text(5_000_000, b"old news").unwrap();
+        let _ = step_to_data_tx(&mut author, 20_000_000);
+        relay.on_packet(20_500_000, author.packet()).unwrap();
+
+        // snapshot taken with one second of lifetime left
+        let mut buf = [0u8; 8192];
+        let near_expiry = 20_500_000 + STORE_TTL_US - 1_000_000;
+        let len = relay.store_snapshot(near_expiry, &mut buf).unwrap().len();
+
+        let mut reborn = engine(2, 8);
+        reborn.enable_store();
+        reborn.store_restore(1_000_000, &buf[..len]);
+        assert_eq!(reborn.store_len(), 1);
+        // a second later it ages out on the new boot's clock, not 24h later
+        let mut req = [0u8; 255];
+        let req_len = recap_packet(3, &mut req);
+        reborn.on_packet(2_100_000, &req[..req_len]).unwrap();
+        assert_eq!(reborn.store_len(), 0);
     }
 
     #[test]
