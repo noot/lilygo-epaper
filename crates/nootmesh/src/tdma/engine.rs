@@ -1,6 +1,5 @@
+use super::{Coloring, Config, FramePosition, Hello, Sync};
 use crate::{NodeId, airtime::Modulation, wire};
-
-use super::{Coloring, Config, FramePosition, Sync};
 
 /// Frames to listen after first syncing before claiming a data slot, so the
 /// neighbor table informs the first pick.
@@ -14,6 +13,16 @@ const MAX_PACKET: usize = 255;
 const SALT_RELAY: u64 = 1;
 const SALT_CONTENTION_SEND: u64 = 2;
 const SALT_CONTENTION_SLOT: u64 = 3;
+const SALT_ROOT_FALLBACK: u64 = 4;
+
+/// Unsynced nodes listen 2..=5 frames (randomized per node, so simultaneous
+/// cold boots elect one winner) before self-appointing as a free-running
+/// root. Covers meshes with no GPS anywhere in reach. A sub-frame jitter is
+/// added on top: two roots whose origins were congruent mod the frame length
+/// would collide beacon-slot-on-beacon-slot every frame and never hear each
+/// other, so their slot grids must not align.
+const ROOT_FALLBACK_MIN_FRAMES: u64 = 2;
+const ROOT_FALLBACK_JITTER_FRAMES: u64 = 4;
 
 /// What the radio should do next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +43,14 @@ pub enum Error {
     SlotTooShort { budget_us: u64, airtime_us: u64 },
 }
 
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum QueueError {
+    #[error("text of {len} bytes exceeds the slot's {max}-byte budget")]
+    TooLong { len: usize, max: usize },
+    #[error("a message is already queued for the next slot")]
+    Busy,
+}
+
 /// Ties [`Sync`], [`Coloring`] and the wire format into one scheduling loop.
 ///
 /// The caller owns the radio and the clock, feeds events in (`on_packet`,
@@ -47,11 +64,18 @@ pub enum Error {
 pub struct Engine {
     config: Config,
     modulation: Modulation,
+    node_id: NodeId,
     seed: u64,
     sync: Sync,
     coloring: Coloring,
     synced_since: Option<u64>,
+    unsynced_since: Option<u64>,
+    root_fallback_us: u64,
     max_packet_len: u8,
+    max_text_len: usize,
+    outbox: Option<heapless::Vec<u8, { wire::TEXT_CAP }>>,
+    outbox_in_tx_buf: bool,
+    inbox: heapless::Deque<(NodeId, heapless::Vec<u8, { wire::TEXT_CAP }>), 4>,
     tx_buf: [u8; MAX_PACKET],
     tx_len: usize,
 }
@@ -81,14 +105,43 @@ impl Engine {
             .take_while(|len| modulation.packet_airtime_us(*len) <= budget_us)
             .last()
             .unwrap_or(MIN_PACKET_LEN);
+        let seed = seed ^ u64::from(node_id.0);
+        let fallback_frames = ROOT_FALLBACK_MIN_FRAMES
+            + mix(seed, 0, SALT_ROOT_FALLBACK) % ROOT_FALLBACK_JITTER_FRAMES;
+        let fallback_jitter_us = mix(seed, 1, SALT_ROOT_FALLBACK) % config.frame_us();
+        // probe how many packet bytes a text's framing costs (worst-case slot
+        // varint, neighbors trimmed away) to bound queueable body length
+        let probe = wire::Message::Text(wire::Text {
+            hello: Hello {
+                sender: node_id,
+                slot: Some(255),
+                neighbors: heapless::Vec::new(),
+            },
+            body: heapless::Vec::new(),
+        });
+        let mut probe_buf = [0u8; MAX_PACKET];
+        let overhead = match wire::encode(&probe, &mut probe_buf) {
+            Ok(packet) => packet.len(),
+            Err(_) => usize::from(max_packet_len),
+        };
+        let max_text_len = usize::from(max_packet_len)
+            .saturating_sub(overhead)
+            .min(wire::TEXT_CAP);
         Ok(Self {
             config,
             modulation,
-            seed: seed ^ u64::from(node_id.0),
+            node_id,
+            seed,
             sync: Sync::new(config, node_id),
             coloring: Coloring::new(config, node_id),
             synced_since: None,
+            unsynced_since: None,
+            root_fallback_us: fallback_frames * config.frame_us() + fallback_jitter_us,
             max_packet_len,
+            max_text_len,
+            outbox: None,
+            outbox_in_tx_buf: false,
+            inbox: heapless::Deque::new(),
             tx_buf: [0; MAX_PACKET],
             tx_len: 0,
         })
@@ -108,18 +161,87 @@ impl Engine {
                 self.sync.on_beacon(rx_end_us, airtime_us, &beacon);
             }
             wire::Message::Hello(hello) => self.coloring.on_hello(rx_end_us, &hello),
+            wire::Message::Text(text) => {
+                if text.hello.sender == self.node_id {
+                    return Ok(());
+                }
+                self.coloring.on_hello(rx_end_us, &text.hello);
+                if self.inbox.is_full() {
+                    self.inbox.pop_front();
+                }
+                let _ = self.inbox.push_back((text.hello.sender, text.body));
+            }
         }
         Ok(())
+    }
+
+    /// Largest text body that fits a data slot alongside the embedded hello.
+    pub fn max_text_len(&self) -> usize {
+        self.max_text_len
+    }
+
+    /// Queue a text to broadcast in this node's next data slot. One message
+    /// at a time: the slot frees when [`on_transmitted`](Self::on_transmitted)
+    /// confirms it went on the air.
+    pub fn queue_text(&mut self, body: &[u8]) -> Result<(), QueueError> {
+        if body.len() > self.max_text_len {
+            return Err(QueueError::TooLong {
+                len: body.len(),
+                max: self.max_text_len,
+            });
+        }
+        if self.outbox.is_some() {
+            return Err(QueueError::Busy);
+        }
+        let mut queued = heapless::Vec::new();
+        // bounded by max_text_len <= TEXT_CAP above, so this cannot overflow
+        let _ = queued.extend_from_slice(body);
+        self.outbox = Some(queued);
+        Ok(())
+    }
+
+    /// Confirm the packet from the most recent [`Action::Transmit`] went on
+    /// the air. Without this the queued text is rebuilt into the next data
+    /// slot rather than released.
+    pub fn on_transmitted(&mut self) {
+        if self.outbox_in_tx_buf {
+            self.outbox = None;
+            self.outbox_in_tx_buf = false;
+        }
+    }
+
+    /// Next received text, oldest first.
+    pub fn take_text(&mut self) -> Option<(NodeId, heapless::Vec<u8, { wire::TEXT_CAP }>)> {
+        self.inbox.pop_front()
     }
 
     /// Decide the next radio action. Deterministic for a given state and
     /// frame, so calling it repeatedly while waiting is safe.
     pub fn next_action(&mut self, now_us: u64) -> Action {
-        let Some(position) = self.sync.position(now_us) else {
-            self.synced_since = None;
-            return Action::Listen {
-                revisit_us: now_us + self.config.frame_us(),
-            };
+        let position = match self.sync.position(now_us) {
+            Some(position) => {
+                self.unsynced_since = None;
+                position
+            }
+            None => {
+                self.synced_since = None;
+                let since = *self.unsynced_since.get_or_insert(now_us);
+                let deadline = since + self.root_fallback_us;
+                if now_us < deadline {
+                    return Action::Listen {
+                        revisit_us: deadline.min(now_us + self.config.frame_us()),
+                    };
+                }
+                self.unsynced_since = None;
+                self.sync.become_root(now_us);
+                let Some(position) = self.sync.position(now_us) else {
+                    // become_root always syncs; defensive fallback
+                    return Action::Listen {
+                        revisit_us: now_us + self.config.frame_us(),
+                    };
+                };
+                position
+            }
         };
         let synced_since = *self.synced_since.get_or_insert(position.frame_number);
         let slot_us = self.config.slot_us();
@@ -182,6 +304,11 @@ impl Engine {
         self.coloring.slot()
     }
 
+    /// Current root and this node's stratum, for status displays.
+    pub fn root(&self, now_us: u64) -> Option<(NodeId, u8)> {
+        self.sync.root(now_us)
+    }
+
     fn hello_slot(&mut self, now_us: u64, frame_number: u64) -> Option<u16> {
         if let Some(slot) = self.coloring.pick_slot(now_us) {
             return Some(slot);
@@ -204,6 +331,7 @@ impl Engine {
         let Some((_, beacon)) = self.sync.beacon(at_us) else {
             return false;
         };
+        self.outbox_in_tx_buf = false;
         match wire::encode(&wire::Message::Beacon(beacon), &mut self.tx_buf) {
             Ok(packet) => {
                 self.tx_len = packet.len();
@@ -215,11 +343,20 @@ impl Engine {
 
     fn build_hello(&mut self) -> bool {
         let mut hello = self.coloring.hello();
+        let body = self.outbox.clone();
         loop {
-            if let Ok(packet) = wire::encode(&wire::Message::Hello(hello.clone()), &mut self.tx_buf)
+            let message = match &body {
+                Some(body) => wire::Message::Text(wire::Text {
+                    hello: hello.clone(),
+                    body: body.clone(),
+                }),
+                None => wire::Message::Hello(hello.clone()),
+            };
+            if let Ok(packet) = wire::encode(&message, &mut self.tx_buf)
                 && packet.len() <= usize::from(self.max_packet_len)
             {
                 self.tx_len = packet.len();
+                self.outbox_in_tx_buf = body.is_some();
                 return true;
             }
             if hello.neighbors.pop().is_none() {
@@ -331,6 +468,155 @@ mod tests {
         // listen window: no data-slot claim in the first two synced frames
         let first_synced_frame_start = beacons[0] - config.guard_us() - FRAME_US;
         assert!(hellos[0].0 >= first_synced_frame_start + LISTEN_FRAMES * FRAME_US);
+    }
+
+    /// step an engine to its next data-slot transmit, feeding gps seconds so
+    /// the root stays alive, and return the tx time.
+    fn step_to_data_tx(e: &mut Engine, mut now: u64) -> u64 {
+        loop {
+            let next_gps = (now / 1_000_000 + 1) * 1_000_000;
+            match e.next_action(now) {
+                Action::Transmit { at_us } if at_us < next_gps => {
+                    let slot = e.position(at_us).unwrap().slot;
+                    if Config::default().slot_kind(slot) == SlotKind::Data {
+                        return at_us;
+                    }
+                    now = at_us + 50_000;
+                }
+                _ => {
+                    e.on_gps_second(next_gps, next_gps / 1_000_000 + 15_980);
+                    now = next_gps;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn queued_text_rides_the_data_slot() {
+        let mut a = engine(1, 7);
+        let mut b = engine(2, 8);
+        assert_eq!(a.max_text_len(), 63);
+        assert_eq!(
+            a.queue_text(&[0u8; 64]),
+            Err(QueueError::TooLong { len: 64, max: 63 })
+        );
+        a.queue_text(b"hi from a").unwrap();
+        assert_eq!(a.queue_text(b"again"), Err(QueueError::Busy));
+
+        let at_us = step_to_data_tx(&mut a, 20_000_000);
+        let text = match wire::decode(a.packet()) {
+            Ok(wire::Message::Text(text)) => text,
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert_eq!(text.body.as_slice(), b"hi from a");
+        assert_eq!(text.hello.sender, NodeId(1));
+        assert_eq!(text.hello.slot, a.slot());
+
+        // a text still refreshes the slot claim and lands in the inbox
+        b.on_packet(at_us + 60_000, a.packet()).unwrap();
+        let (from, body) = b.take_text().unwrap();
+        assert_eq!(from, NodeId(1));
+        assert_eq!(body.as_slice(), b"hi from a");
+        assert_eq!(b.take_text(), None);
+
+        // unconfirmed: rebuilt next frame; confirmed: back to a bare hello
+        let at_us = step_to_data_tx(&mut a, at_us + 60_000);
+        assert!(matches!(
+            wire::decode(a.packet()),
+            Ok(wire::Message::Text(_))
+        ));
+        a.on_transmitted();
+        assert!(a.queue_text(b"next").is_ok());
+        a.on_transmitted(); // no tx since build: must NOT release the new text
+        let _ = step_to_data_tx(&mut a, at_us + 60_000);
+        assert!(matches!(
+            wire::decode(a.packet()),
+            Ok(wire::Message::Text(t)) if t.body.as_slice() == b"next"
+        ));
+    }
+
+    #[test]
+    fn gpsless_node_roots_after_fallback_listen() {
+        let mut e = engine(3, 42);
+        let start = 5_000_000u64;
+        let mut now = start;
+        let at_us = loop {
+            match e.next_action(now) {
+                Action::Listen { revisit_us } => {
+                    assert!(revisit_us > now);
+                    now = revisit_us;
+                }
+                Action::Transmit { at_us } => break at_us,
+            }
+        };
+        // listened between 2 and 6 frames (whole frames + sub-frame jitter),
+        // then rooted and beacons in slot 0
+        assert!(at_us >= start + 2 * FRAME_US);
+        assert!(at_us <= start + 7 * FRAME_US);
+        assert!(matches!(
+            wire::decode(e.packet()),
+            Ok(wire::Message::Beacon(b)) if b.root == NodeId(3) && !b.root_has_gps
+        ));
+    }
+
+    #[test]
+    fn two_gpsless_nodes_converge() {
+        let mut a = engine(1, 0x1111);
+        let mut b = engine(2, 0x2222);
+        let modulation = Modulation::default();
+        let start = 5_000_000u64;
+        let end = start + 25 * FRAME_US;
+        let mut now = start;
+        let mut heard = [0u32; 2];
+
+        while now < end {
+            let action_a = a.next_action(now);
+            let action_b = b.next_action(now);
+            let time = |action: Action| match action {
+                Action::Transmit { at_us } => at_us,
+                Action::Listen { revisit_us } => revisit_us,
+            };
+            let t = time(action_a).min(time(action_b));
+            now = t;
+            let a_tx = t == time(action_a) && matches!(action_a, Action::Transmit { .. });
+            let b_tx = t == time(action_b) && matches!(action_b, Action::Transmit { .. });
+            if !a_tx && !b_tx {
+                continue;
+            }
+            if a_tx && b_tx {
+                now += 1;
+                continue;
+            }
+            let (sender, receiver, idx) = if a_tx {
+                (&mut a, &mut b, 0)
+            } else {
+                (&mut b, &mut a, 1)
+            };
+            let mut copy = [0u8; 255];
+            let len = sender.packet().len();
+            copy[..len].copy_from_slice(sender.packet());
+            let airtime = modulation.packet_airtime_us(u8::try_from(len).unwrap());
+            receiver.on_packet(t + airtime, &copy[..len]).unwrap();
+            heard[idx] += 1;
+            now = t + airtime;
+        }
+
+        assert!(heard[0] > 0 && heard[1] > 0);
+        // one free-running root won the election; both share its timeline
+        let root_a = a.root(now).unwrap();
+        let root_b = b.root(now).unwrap();
+        assert_eq!(root_a.0, root_b.0);
+        assert_eq!(root_a.1.min(root_b.1), 0);
+        assert_eq!(
+            a.position(now).unwrap().frame_number,
+            b.position(now).unwrap().frame_number
+        );
+        assert_eq!(
+            a.position(now).unwrap().offset_us,
+            b.position(now).unwrap().offset_us
+        );
+        let (slot_a, slot_b) = (a.slot().unwrap(), b.slot().unwrap());
+        assert_ne!(slot_a, slot_b);
     }
 
     #[test]

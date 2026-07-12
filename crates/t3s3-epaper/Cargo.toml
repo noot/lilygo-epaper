@@ -19,6 +19,10 @@ esp-println = { version = "0.17", features = ["esp32s3", "log-04"] }
 embedded-hal-bus = "0.3"
 embedded-graphics = "0.8"
 
+# `mesh` example: TDMA mesh protocol logic (workspace-excluded crate, pure
+# no_std, host-tested via `just test-nootmesh`).
+nootmesh = { path = "../nootmesh" }
+
 # radio stack shared by the `ble` and `wifi_lora_bridge` examples. esp-radio is
 # the wifi/ble controller and esp-rtos the preemptive scheduler the radio
 # firmware requires; the feature sets are the union the two examples need (`ble`

@@ -15,6 +15,9 @@ path = "src/main.rs"
 [dependencies]
 t5s3-epaper-core = { workspace = true, features = ["wifi", "lora"] }
 epub-reader = { path = "../epub-reader" }
+# lora page: TDMA mesh protocol logic (workspace-excluded crate, pure no_std,
+# host-tested via `just test-nootmesh`).
+nootmesh = { path = "../nootmesh" }
 esp-hal = { workspace = true }
 esp-alloc = { workspace = true }
 esp-bootloader-esp-idf = { workspace = true }

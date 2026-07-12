@@ -16,6 +16,14 @@ ui:
 ble:
     ESP_RTOS_CONFIG_TICK_RATE_HZ=1000 cargo run -p t3s3-epaper --example ble
 
+# flash the nootmesh tdma node example (t3-s3); flash the same example on every board
+mesh:
+    cargo run -p t3s3-epaper --example mesh
+
+# flash the nootmesh tdma node example (t5-s3, with gps: becomes the mesh's utc root)
+mesh-t5:
+    cargo run -p t5s3-epaper-core --example mesh --features lora,gps
+
 # check that everything compiles
 check:
     cargo c -p t5s3-epaper-core --examples --all-features

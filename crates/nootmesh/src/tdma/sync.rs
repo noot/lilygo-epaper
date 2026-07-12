@@ -1,10 +1,10 @@
+use super::{Config, FramePosition};
 use crate::NodeId;
 
-use super::{Config, FramePosition};
-
-/// Frames of holdover before a node considers itself unsynced. At +/-20 ppm
-/// crystal drift, 8 default frames (128 s) accrue ~2.6 ms of error, well
-/// inside the guard.
+/// Frames of holdover before a beacon-synced node considers itself unsynced.
+/// At +/-20 ppm crystal drift, 8 default frames (128 s) accrue ~2.6 ms of
+/// error, well inside the guard. The root itself never expires: it is its own
+/// time source and cedes only to an outranking beacon.
 const EXPIRY_FRAMES: u64 = 8;
 
 /// Beacons at this stratum or above are not adopted (and not sent), bounding
@@ -65,7 +65,8 @@ impl Sync {
 
     fn effective(&self, now_us: u64) -> Option<&Synced> {
         self.state.as_ref().filter(|s| {
-            now_us.saturating_sub(s.synced_at_us) <= EXPIRY_FRAMES * self.config.frame_us()
+            s.root == self.node_id
+                || now_us.saturating_sub(s.synced_at_us) <= EXPIRY_FRAMES * self.config.frame_us()
         })
     }
 
@@ -94,6 +95,12 @@ impl Sync {
             .effective(now_us)
             .is_some_and(|s| s.root == self.node_id);
         if already_root {
+            // a free-running root that gains a fix upgrades to a gps-anchored
+            // timeline (stepping it once)
+            if self.state.as_ref().is_some_and(|s| !s.root_has_gps) {
+                self.anchor(now_us, utc_seconds);
+                return;
+            }
             if let Some(position) = self.position(now_us) {
                 let predicted_us = position.frame_number * self.config.frame_us()
                     + u64::from(position.slot) * self.config.slot_us()
@@ -132,6 +139,30 @@ impl Sync {
             frame_origin_us,
             synced_at_us: now_us,
         });
+    }
+
+    /// Self-appoint as a free-running (non-GPS) root, anchoring the frame
+    /// origin at `now_us`. No-op while synced: this is the fallback for a
+    /// mesh with no GPS anywhere in reach, invoked after listening long
+    /// enough to be confident no root exists. A GPS-anchored beacon heard
+    /// later outranks and displaces this timeline.
+    pub fn become_root(&mut self, now_us: u64) {
+        if self.effective(now_us).is_some() {
+            return;
+        }
+        self.state = Some(Synced {
+            root: self.node_id,
+            root_has_gps: false,
+            stratum: 0,
+            frame_number: 0,
+            frame_origin_us: now_us,
+            synced_at_us: now_us,
+        });
+    }
+
+    /// Current root and this node's stratum, for status displays.
+    pub fn root(&self, now_us: u64) -> Option<(NodeId, u8)> {
+        self.effective(now_us).map(|s| (s.root, s.stratum))
     }
 
     /// Feed a received beacon. `rx_end_us` is the local clock at RxDone and
@@ -327,10 +358,68 @@ mod tests {
     }
 
     #[test]
-    fn sync_expires_without_refresh() {
-        let sync = synced_via_gps(1, 20_000_000, 16_000);
+    fn beacon_sync_expires_without_refresh() {
+        let mut sync = Sync::new(Config::default(), NodeId(9));
+        let beacon = Beacon {
+            root: NodeId(1),
+            root_has_gps: true,
+            stratum: 0,
+            frame_number: 1,
+        };
+        sync.on_beacon(20_000_000, 41_216, &beacon);
         assert!(sync.position(20_000_000 + 8 * FRAME_US).is_some());
         assert_eq!(sync.position(20_000_000 + 8 * FRAME_US + 1), None);
+    }
+
+    #[test]
+    fn root_never_expires() {
+        let sync = synced_via_gps(1, 20_000_000, 16_000);
+        assert!(sync.position(20_000_000 + 100 * FRAME_US).is_some());
+    }
+
+    #[test]
+    fn free_running_root_fallback() {
+        let mut sync = Sync::new(Config::default(), NodeId(2));
+        sync.become_root(50_000_000);
+        let position = sync.position(50_000_000 + FRAME_US + 200_000).unwrap();
+        assert_eq!(position.frame_number, 1);
+        assert_eq!(position.slot, 1);
+        let (slot, beacon) = sync.beacon(51_000_000).unwrap();
+        assert_eq!(slot, 0);
+        assert!(!beacon.root_has_gps);
+        assert_eq!(beacon.root, NodeId(2));
+        // no expiry: it is its own time source
+        assert!(sync.position(50_000_000 + 100 * FRAME_US).is_some());
+
+        // a gps-anchored root outranks it
+        let better = Beacon {
+            root: NodeId(9),
+            root_has_gps: true,
+            stratum: 0,
+            frame_number: 500,
+        };
+        sync.on_beacon(60_000_000, 41_216, &better);
+        assert_eq!(sync.root(60_100_000), Some((NodeId(9), 1)));
+    }
+
+    #[test]
+    fn become_root_is_noop_while_synced() {
+        let mut sync = synced_via_gps(1, 20_000_000, 16_000);
+        sync.become_root(21_000_000);
+        let (_, beacon) = sync.beacon(21_100_000).unwrap();
+        assert!(beacon.root_has_gps);
+        assert_eq!(beacon.frame_number, 1_000);
+    }
+
+    #[test]
+    fn free_running_root_upgrades_on_gps_fix() {
+        let mut sync = Sync::new(Config::default(), NodeId(2));
+        sync.become_root(50_000_000);
+        sync.on_gps_second(60_000_000, 16_008);
+        let (_, beacon) = sync.beacon(60_100_000).unwrap();
+        assert!(beacon.root_has_gps);
+        assert_eq!(beacon.frame_number, 1_000);
+        assert_eq!(sync.position(60_100_000).unwrap().slot, 50);
     }
 
     #[test]

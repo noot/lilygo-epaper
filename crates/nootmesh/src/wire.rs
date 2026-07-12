@@ -16,12 +16,28 @@ use crate::tdma::{Beacon, Hello};
 
 pub const VERSION: u8 = 0;
 
+/// Wire capacity for a [`Text`] body. Runtime limits are tighter: the whole
+/// packet must fit the slot's airtime budget (see
+/// [`Engine::max_text_len`](crate::tdma::Engine::max_text_len)), and staying
+/// under 128 keeps postcard's length prefix to one byte.
+pub const TEXT_CAP: usize = 127;
+
 /// Every message type that can appear on the air. Append-only; see the module
 /// docs.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Message {
     Beacon(Beacon),
     Hello(Hello),
+    Text(Text),
+}
+
+/// Chat text broadcast in the sender's data slot. Embeds the sender's
+/// [`Hello`] so a frame that carries text still refreshes the sender's slot
+/// claim in every receiver's neighbor table.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Text {
+    pub hello: Hello,
+    pub body: heapless::Vec<u8, TEXT_CAP>,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -92,6 +108,24 @@ mod tests {
             neighbors,
         }));
         assert_eq!(len, 30);
+    }
+
+    #[test]
+    fn text_roundtrips() {
+        let mut body = heapless::Vec::new();
+        body.extend_from_slice(b"hello mesh").unwrap();
+        let mut neighbors = heapless::Vec::new();
+        neighbors.push((NodeId(3), 20u16)).unwrap();
+        let len = roundtrip(Message::Text(Text {
+            hello: Hello {
+                sender: NodeId(77),
+                slot: Some(42),
+                neighbors,
+            },
+            body,
+        }));
+        // ver 1 + disc 1 + sender 1 + slot 2 + neighbors 3 + body 1+10
+        assert_eq!(len, 19);
     }
 
     #[test]

@@ -75,7 +75,8 @@ impl Modulation {
 }
 
 impl Default for Modulation {
-    /// The t3s3 sx1262 driver defaults: SF7, 125 kHz, CR 4/5, 8-symbol preamble.
+    /// The t3s3 sx1262 driver defaults: SF7, 125 kHz, CR 4/5, 8-symbol
+    /// preamble.
     fn default() -> Self {
         Self {
             spreading_factor: 7,

@@ -33,6 +33,14 @@ Data slots: distributed 2-hop greedy coloring, first pick seeded by
 `fnv1a(node_id)` so simultaneous cold boots spread out, conflicts resolved
 lower-id-wins.
 
+No-GPS meshes (e.g. T3-S3-only): unsynced nodes listen 2-5 frames (plus a
+sub-frame jitter, so two simultaneous roots' slot grids can't align and
+collide beacon-on-beacon every frame) then self-appoint as a free-running
+root. GPS-anchored beacons outrank free-running ones, then lowest id; a root
+never expires (it is its own time source) and cedes only to an outranking
+beacon. Beacon-synced nodes expire after 8 quiet frames and re-enter the
+fallback, so the mesh survives a dead root.
+
 ## engine (implemented in `crates/nootmesh/src/tdma/engine.rs`)
 
 `Engine` ties sync + coloring + wire into the loop the firmware drives: feed
@@ -43,6 +51,17 @@ stable within a frame), nodes listen 2 frames before their first slot claim,
 slot holders hello every frame (TTL keepalive), saturated nodes fall back to
 random contention-slot hellos. Hellos are trimmed to the slot's airtime budget
 (71 bytes at SF7 defaults).
+
+## chat texts (wire `Text` + engine outbox/inbox)
+
+`Message::Text { hello, body }` — broadcast in the sender's data slot instead
+of the bare hello, embedding it so the slot claim stays fresh. One queued
+message at a time (`queue_text` → `on_transmitted` confirms + releases), body
+capped to the slot's airtime budget (63 bytes at SF7 with defaults; per-slot
+fragmentation is future work). Received texts land in a small inbox drained
+by the app. The t5s3-epaper-ui lora page is the first consumer (see
+`t5s3-epaper-ui/src/mesh.rs` for the servicing-slice pattern that gives the
+50 ms ui loop millisecond-precise mesh timing).
 
 ## wire format (implemented in `crates/nootmesh/src/wire.rs`)
 

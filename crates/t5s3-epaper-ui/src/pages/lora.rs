@@ -129,7 +129,7 @@ pub(crate) fn draw_lora_screen(
     let bold = MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK);
     draw_back_button(display);
     Text::with_alignment(
-        "LoRa  915 MHz",
+        "nootmesh  915 MHz",
         Point::new(SCREEN_W / 2, 120),
         bold,
         Alignment::Center,

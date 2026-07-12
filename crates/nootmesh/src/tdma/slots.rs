@@ -1,8 +1,7 @@
 use heapless::{FnvIndexMap, Vec};
 
-use crate::NodeId;
-
 use super::Config;
+use crate::NodeId;
 
 /// Maximum tracked 1-hop neighbors, and entries in a [`Hello`] neighbor list.
 pub const MAX_NEIGHBORS: usize = 16;
