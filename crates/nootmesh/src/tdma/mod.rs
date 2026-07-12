@@ -12,9 +12,11 @@
 //! transmissions start `guard_us` after the slot boundary so receivers with
 //! slightly offset clocks still capture the whole packet.
 
+pub mod engine;
 mod slots;
 mod sync;
 
+pub use engine::{Action, Engine};
 pub use slots::{Coloring, Hello, MAX_NEIGHBORS};
 pub use sync::{Beacon, Sync};
 

@@ -33,6 +33,17 @@ Data slots: distributed 2-hop greedy coloring, first pick seeded by
 `fnv1a(node_id)` so simultaneous cold boots spread out, conflicts resolved
 lower-id-wins.
 
+## engine (implemented in `crates/nootmesh/src/tdma/engine.rs`)
+
+`Engine` ties sync + coloring + wire into the loop the firmware drives: feed
+`on_packet`/`on_gps_second`, ask `next_action(now)` → `Listen { revisit_us }`
+or `Transmit { at_us }` (packet already encoded in `Engine::packet`). Policy:
+root beacons every frame, relays skip half their turns (seeded per-frame coin,
+stable within a frame), nodes listen 2 frames before their first slot claim,
+slot holders hello every frame (TTL keepalive), saturated nodes fall back to
+random contention-slot hellos. Hellos are trimmed to the slot's airtime budget
+(71 bytes at SF7 defaults).
+
 ## wire format (implemented in `crates/nootmesh/src/wire.rs`)
 
 `| version byte | postcard(Message) |` — postcard over protobuf because frames
