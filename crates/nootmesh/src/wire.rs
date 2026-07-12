@@ -17,7 +17,7 @@ use crate::{
     tdma::{Beacon, Hello},
 };
 
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 /// Wire capacity for a [`Text`] body. Runtime limits are tighter: the whole
 /// packet must fit the slot's airtime budget (see
@@ -32,6 +32,7 @@ pub enum Message {
     Beacon(Beacon),
     Hello(Hello),
     Text(Text),
+    Recap(Recap),
 }
 
 /// Chat text broadcast in a data slot and flooded across the mesh: every
@@ -43,14 +44,26 @@ pub enum Message {
 /// `hello.sender` is whoever transmitted *this* packet (author or relay);
 /// `origin` is the author. `(origin, msg_id)` identifies the message for
 /// deduplication, and `hops` counts relays so far (0 = straight from the
-/// author).
+/// author). `timestamp` is UTC seconds at origination when the author's
+/// timeline was GPS-anchored (`None` on free-running meshes); it rides
+/// unchanged through forwards and store-node replays.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Text {
     pub hello: Hello,
     pub origin: NodeId,
     pub msg_id: u16,
     pub hops: u8,
+    pub timestamp: Option<u64>,
     pub body: heapless::Vec<u8, TEXT_CAP>,
+}
+
+/// Anycast request for stored history: every store node in range replays its
+/// retained texts (as ordinary [`Text`]s pinned at the hop cap, so they are
+/// delivered but never re-flooded). Receiver-side dedup reconciles overlap
+/// between responders and with messages the requester already has.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Recap {
+    pub hello: Hello,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -138,10 +151,12 @@ mod tests {
             origin: NodeId(5),
             msg_id: 300,
             hops: 1,
+            timestamp: Some(1_752_300_000),
             body,
         }));
-        // ver 1 + disc 1 + hello 6 + origin 1 + msg_id 2 + hops 1 + body 1+10
-        assert_eq!(len, 23);
+        // ver 1 + disc 1 + hello 6 + origin 1 + msg_id 2 + hops 1
+        //   + timestamp 1+5 + body 1+10
+        assert_eq!(len, 29);
     }
 
     #[test]

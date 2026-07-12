@@ -212,6 +212,27 @@ fn lora_stamp(clock: &mut Clock, settings: &Settings) -> String {
     }
 }
 
+// a "[hh:mm:ss] " prefix for a mesh chat entry: the message's own origination
+// time when it carried one (relayed/recapped texts show when they were SENT,
+// not when they arrived here), else local arrival time.
+fn mesh_stamp(clock: &mut Clock, settings: &Settings, utc_seconds: Option<u64>) -> String {
+    let Some(utc) = utc_seconds else {
+        return lora_stamp(clock, settings);
+    };
+    let local = (utc as i64 + i64::from(settings.tz_offset_hours) * 3600).rem_euclid(86_400);
+    let (h, m, s) = (local / 3600, (local % 3600) / 60, local % 60);
+    if settings.time_24h {
+        format!("[{h:02}:{m:02}:{s:02}] ")
+    } else {
+        let suffix = if h < 12 { "am" } else { "pm" };
+        let h12 = match h % 12 {
+            0 => 12,
+            other => other,
+        };
+        format!("[{h12}:{m:02}:{s:02}{suffix}] ")
+    }
+}
+
 // after a timezone or time-format change, repaint the status-bar clock so the
 // shown time reflects the new setting immediately; returns the minute now shown
 // so the once-a-minute tick stays in sync.
@@ -2405,11 +2426,11 @@ async fn main(spawner: Spawner) -> ! {
         if let (Some(r), Some(m)) = (&mut radio, &mut lora_mesh) {
             m.service(r);
             let mut recv_dirty = false;
-            while let Some((from, text)) = m.take_text() {
+            while let Some((from, utc, text)) = m.take_text() {
                 esp_println::println!("mesh text from {from:08x}: {text}");
                 lora_recv.push(format!(
                     "{}{from:08x}: {text}",
-                    lora_stamp(&mut clock, &settings)
+                    mesh_stamp(&mut clock, &settings, utc)
                 ));
                 if lora_recv.len() > LIST_MAX {
                     lora_recv.remove(0);

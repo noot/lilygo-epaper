@@ -15,6 +15,22 @@ const SALT_CONTENTION_SEND: u64 = 2;
 const SALT_CONTENTION_SLOT: u64 = 3;
 const SALT_ROOT_FALLBACK: u64 = 4;
 const SALT_MSG_ID: u64 = 5;
+const SALT_REPLAY_STAGGER: u64 = 7;
+
+/// Texts a store node retains for recap replay.
+const STORE_CAP: usize = 32;
+
+/// How long a stored text stays replayable, by the store node's own
+/// monotonic clock (frame numbers unmoor across root changes, so they can't
+/// measure age). The effective window is this age or the ring capacity,
+/// whichever runs out first.
+const STORE_TTL_US: u64 = 24 * 60 * 60 * 1_000_000;
+
+/// A store node delays its recap replay start by 1..=6 frames (seeded per
+/// node), so overlapping responders desynchronize: the earliest starter's
+/// replays are heard by the others, which cross those messages off and only
+/// fill gaps the first responder didn't have.
+const REPLAY_STAGGER_FRAMES: u64 = 6;
 
 /// Texts stop being re-forwarded once they have been relayed this many times,
 /// bounding both flood traffic and the mesh diameter chat can cross.
@@ -87,6 +103,11 @@ pub enum Received {
         origin: NodeId,
         hops: u8,
     },
+    /// A history request; a store node answers by replaying its retained
+    /// texts from its data slot.
+    Recap {
+        from: NodeId,
+    },
 }
 
 impl core::fmt::Display for Received {
@@ -98,8 +119,20 @@ impl core::fmt::Display for Received {
             Self::DuplicateText { origin, hops } => {
                 write!(f, "duplicate text from {:08x} hops {hops}", origin.0)
             }
+            Self::Recap { from } => write!(f, "recap request from {:08x}", from.0),
         }
     }
+}
+
+/// A chat text delivered to this node, exactly once per message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Incoming {
+    /// The author (not the relay it may have arrived through).
+    pub from: NodeId,
+    /// UTC seconds at origination, when the author's mesh was GPS-anchored;
+    /// `None` means the receiver only knows its own arrival time.
+    pub utc_seconds: Option<u64>,
+    pub body: heapless::Vec<u8, { wire::TEXT_CAP }>,
 }
 
 /// Ties [`Sync`], [`Coloring`] and the wire format into one scheduling loop.
@@ -126,9 +159,13 @@ pub struct Engine {
     max_text_len: usize,
     next_msg_id: u16,
     outbox: heapless::Deque<Outgoing, OUTBOX_CAP>,
-    outbox_in_tx_buf: bool,
+    tx_carries: TxCarries,
     seen: heapless::Deque<(NodeId, u16), SEEN_CAP>,
-    inbox: heapless::Deque<(NodeId, heapless::Vec<u8, { wire::TEXT_CAP }>), 4>,
+    inbox: heapless::Deque<Incoming, 4>,
+    store_enabled: bool,
+    store: heapless::Deque<Stored, STORE_CAP>,
+    replay_start_frame: u64,
+    recap_requested: bool,
     tx_buf: [u8; MAX_PACKET],
     tx_len: usize,
 }
@@ -137,7 +174,27 @@ struct Outgoing {
     origin: NodeId,
     msg_id: u16,
     hops: u8,
+    timestamp: Option<u64>,
     body: heapless::Vec<u8, { wire::TEXT_CAP }>,
+}
+
+struct Stored {
+    origin: NodeId,
+    msg_id: u16,
+    timestamp: Option<u64>,
+    body: heapless::Vec<u8, { wire::TEXT_CAP }>,
+    stored_at_us: u64,
+    /// awaiting replay in the current recap session.
+    pending: bool,
+}
+
+/// What the packet in `tx_buf` commits to when its transmit is confirmed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TxCarries {
+    Nothing,
+    QueuedText,
+    Replay(NodeId, u16),
+    RecapRequest,
 }
 
 enum Payload {
@@ -172,7 +229,9 @@ impl Engine {
             + mix(seed, 0, SALT_ROOT_FALLBACK) % ROOT_FALLBACK_JITTER_FRAMES;
         let fallback_jitter_us = mix(seed, 1, SALT_ROOT_FALLBACK) % config.frame_us();
         // probe how many packet bytes a text's framing costs (worst-case
-        // varints, neighbors trimmed away) to bound queueable body length
+        // varints, neighbors trimmed away) to bound queueable body length.
+        // the timestamp probe is u32::MAX (utc seconds fit u32 until 2106;
+        // queue_text clamps to keep the encoding bounded)
         let probe = wire::Message::Text(wire::Text {
             hello: Hello {
                 sender: node_id,
@@ -182,6 +241,7 @@ impl Engine {
             origin: NodeId(u32::MAX),
             msg_id: u16::MAX,
             hops: u8::MAX,
+            timestamp: Some(u64::from(u32::MAX)),
             body: heapless::Vec::new(),
         });
         let mut probe_buf = [0u8; MAX_PACKET];
@@ -206,9 +266,13 @@ impl Engine {
             max_text_len,
             next_msg_id: mix(seed, 0, SALT_MSG_ID) as u16,
             outbox: heapless::Deque::new(),
-            outbox_in_tx_buf: false,
+            tx_carries: TxCarries::Nothing,
             seen: heapless::Deque::new(),
             inbox: heapless::Deque::new(),
+            store_enabled: false,
+            store: heapless::Deque::new(),
+            replay_start_frame: 0,
+            recap_requested: false,
             tx_buf: [0; MAX_PACKET],
             tx_len: 0,
         })
@@ -250,6 +314,10 @@ impl Engine {
                 // when the message itself is an already-seen duplicate
                 self.coloring.on_hello(rx_end_us, &text.hello);
                 let key = (text.origin, text.msg_id);
+                // any transmission of this message (fresh flood or another
+                // store node's replay) just reached everyone in range, so a
+                // pending replay of it is redundant
+                self.clear_pending(key);
                 if text.origin == self.node_id || self.seen.iter().any(|seen| *seen == key) {
                     return duplicate;
                 }
@@ -257,7 +325,12 @@ impl Engine {
                 if self.inbox.is_full() {
                     self.inbox.pop_front();
                 }
-                let _ = self.inbox.push_back((text.origin, text.body.clone()));
+                let _ = self.inbox.push_back(Incoming {
+                    from: text.origin,
+                    utc_seconds: text.timestamp,
+                    body: text.body.clone(),
+                });
+                self.store_text(rx_end_us, key, text.timestamp, &text.body);
                 // flood: re-broadcast once in our own data slot, up to the
                 // hop cap; a full outbox just drops the forward
                 if text.hops < MAX_TEXT_HOPS {
@@ -265,6 +338,7 @@ impl Engine {
                         origin: text.origin,
                         msg_id: text.msg_id,
                         hops: text.hops + 1,
+                        timestamp: text.timestamp,
                         body: text.body,
                     });
                 }
@@ -273,6 +347,69 @@ impl Engine {
                     hops: text.hops,
                 })
             }
+            wire::Message::Recap(recap) => {
+                let from = recap.hello.sender;
+                if from == self.node_id {
+                    return Ok(Received::Recap { from });
+                }
+                self.coloring.on_hello(rx_end_us, &recap.hello);
+                if self.store_enabled {
+                    self.prune_store(rx_end_us);
+                    if !self.store.is_empty()
+                        && let Some(position) = self.sync.position(rx_end_us)
+                    {
+                        let stagger = 1 + mix(u64::from(self.node_id.0), 0, SALT_REPLAY_STAGGER)
+                            % REPLAY_STAGGER_FRAMES;
+                        self.replay_start_frame = position.frame_number + stagger;
+                        for entry in self.store.iter_mut() {
+                            entry.pending = true;
+                        }
+                    }
+                }
+                Ok(Received::Recap { from })
+            }
+        }
+    }
+
+    fn clear_pending(&mut self, key: (NodeId, u16)) {
+        for entry in self.store.iter_mut() {
+            if (entry.origin, entry.msg_id) == key {
+                entry.pending = false;
+            }
+        }
+    }
+
+    fn store_text(
+        &mut self,
+        now_us: u64,
+        key: (NodeId, u16),
+        timestamp: Option<u64>,
+        body: &heapless::Vec<u8, { wire::TEXT_CAP }>,
+    ) {
+        if !self.store_enabled {
+            return;
+        }
+        self.prune_store(now_us);
+        if self.store.is_full() {
+            self.store.pop_front();
+        }
+        let _ = self.store.push_back(Stored {
+            origin: key.0,
+            msg_id: key.1,
+            timestamp,
+            body: body.clone(),
+            stored_at_us: now_us,
+            pending: false,
+        });
+    }
+
+    /// Entries are in arrival order, so aging out is a pop from the front.
+    fn prune_store(&mut self, now_us: u64) {
+        while let Some(front) = self.store.front() {
+            if now_us.saturating_sub(front.stored_at_us) <= STORE_TTL_US {
+                break;
+            }
+            self.store.pop_front();
         }
     }
 
@@ -289,9 +426,10 @@ impl Engine {
     }
 
     /// Queue a text authored by this node, flooded from its next data slot.
-    /// The queue is shared with forwards; entries free when
+    /// Stamped with UTC when the timeline is GPS-anchored. The queue is
+    /// shared with forwards; entries free when
     /// [`on_transmitted`](Self::on_transmitted) confirms they went on the air.
-    pub fn queue_text(&mut self, body: &[u8]) -> Result<(), QueueError> {
+    pub fn queue_text(&mut self, now_us: u64, body: &[u8]) -> Result<(), QueueError> {
         if body.len() > self.max_text_len {
             return Err(QueueError::TooLong {
                 len: body.len(),
@@ -308,29 +446,65 @@ impl Engine {
         self.next_msg_id = self.next_msg_id.wrapping_add(1);
         // so relayed echoes of our own message are ignored
         self.mark_seen((self.node_id, msg_id));
+        // clamped to the u32 range the framing probe assumed (fine to 2106)
+        let timestamp = self
+            .sync
+            .utc_seconds(now_us)
+            .map(|utc| utc.min(u64::from(u32::MAX)));
+        self.store_text(now_us, (self.node_id, msg_id), timestamp, &queued);
         let _ = self.outbox.push_back(Outgoing {
             origin: self.node_id,
             msg_id,
             hops: 0,
+            timestamp,
             body: queued,
         });
         Ok(())
+    }
+
+    /// A store node retains delivered (and own) texts and replays them to
+    /// [`wire::Recap`] requests. Enable on always-on nodes only; storage is
+    /// RAM, so a reboot starts empty (refilled passively from live traffic
+    /// and other store nodes' replays).
+    pub fn enable_store(&mut self) {
+        self.store_enabled = true;
+    }
+
+    /// Texts currently retained for replay, for status displays.
+    pub fn store_len(&self) -> usize {
+        self.store.len()
+    }
+
+    /// Broadcast a history request from the next data slot: every store node
+    /// in range replays what it has, and dedup discards what this node
+    /// already saw. Call on (re)joining the mesh.
+    pub fn request_recap(&mut self) {
+        self.recap_requested = true;
     }
 
     /// Confirm the packet from the most recent [`Action::Transmit`] went on
     /// the air. Without this a queued text is rebuilt into the next data
     /// slot rather than released.
     pub fn on_transmitted(&mut self) {
-        if self.outbox_in_tx_buf {
-            self.outbox.pop_front();
-            self.outbox_in_tx_buf = false;
+        match self.tx_carries {
+            TxCarries::Nothing => {}
+            TxCarries::QueuedText => {
+                // our own transmission of this message also covers any
+                // pending replay of it
+                if let Some(sent) = self.outbox.pop_front() {
+                    self.clear_pending((sent.origin, sent.msg_id));
+                }
+            }
+            TxCarries::Replay(origin, msg_id) => self.clear_pending((origin, msg_id)),
+            TxCarries::RecapRequest => self.recap_requested = false,
         }
+        self.tx_carries = TxCarries::Nothing;
     }
 
-    /// Next received text as `(author, body)`, oldest first. Flood
-    /// deduplication already happened: each message is delivered once no
-    /// matter how many relayed copies arrive.
-    pub fn take_text(&mut self) -> Option<(NodeId, heapless::Vec<u8, { wire::TEXT_CAP }>)> {
+    /// Next delivered text, oldest first. Flood deduplication already
+    /// happened: each message is delivered once no matter how many relayed
+    /// or replayed copies arrive.
+    pub fn take_text(&mut self) -> Option<Incoming> {
         self.inbox.pop_front()
     }
 
@@ -400,7 +574,7 @@ impl Engine {
             if let Some((at_us, payload)) = best {
                 let built = match payload {
                     Payload::Beacon => self.build_beacon(at_us),
-                    Payload::Hello => self.build_hello(),
+                    Payload::Hello => self.build_data(at_us),
                 };
                 if built {
                     return Action::Transmit { at_us };
@@ -453,7 +627,7 @@ impl Engine {
         let Some((_, beacon)) = self.sync.beacon(at_us) else {
             return false;
         };
-        self.outbox_in_tx_buf = false;
+        self.tx_carries = TxCarries::Nothing;
         match wire::encode(&wire::Message::Beacon(beacon), &mut self.tx_buf) {
             Ok(packet) => {
                 self.tx_len = packet.len();
@@ -463,28 +637,82 @@ impl Engine {
         }
     }
 
-    fn build_hello(&mut self) -> bool {
+    /// The next replayable store entry, once the staggered start frame has
+    /// been reached (oldest first, so a recap arrives in chronological order).
+    fn next_replay(
+        &mut self,
+        at_us: u64,
+    ) -> Option<(
+        NodeId,
+        u16,
+        Option<u64>,
+        heapless::Vec<u8, { wire::TEXT_CAP }>,
+    )> {
+        let position = self.sync.position(at_us)?;
+        if position.frame_number < self.replay_start_frame {
+            return None;
+        }
+        self.prune_store(at_us);
+        self.store.iter().find(|entry| entry.pending).map(|entry| {
+            (
+                entry.origin,
+                entry.msg_id,
+                entry.timestamp,
+                entry.body.clone(),
+            )
+        })
+    }
+
+    /// Build this node's data-slot packet, by priority: a pending recap
+    /// request, then queued/forwarded texts, then recap replays, then a bare
+    /// hello. Everything embeds the hello, so the slot claim stays fresh
+    /// regardless.
+    fn build_data(&mut self, at_us: u64) -> bool {
         let mut hello = self.coloring.hello();
-        let pending = self
-            .outbox
-            .front()
-            .map(|out| (out.origin, out.msg_id, out.hops, out.body.clone()));
+        let (message_body, carries) = if self.recap_requested {
+            (None, TxCarries::RecapRequest)
+        } else if let Some(out) = self.outbox.front() {
+            (
+                Some((
+                    out.origin,
+                    out.msg_id,
+                    out.hops,
+                    out.timestamp,
+                    out.body.clone(),
+                )),
+                TxCarries::QueuedText,
+            )
+        } else if let Some((origin, msg_id, timestamp, body)) = self.next_replay(at_us) {
+            // replays are pinned at the hop cap: delivered, never re-flooded
+            (
+                Some((origin, msg_id, MAX_TEXT_HOPS, timestamp, body)),
+                TxCarries::Replay(origin, msg_id),
+            )
+        } else {
+            (None, TxCarries::Nothing)
+        };
         loop {
-            let message = match &pending {
-                Some((origin, msg_id, hops, body)) => wire::Message::Text(wire::Text {
+            let message = match (&message_body, carries) {
+                (_, TxCarries::RecapRequest) => wire::Message::Recap(wire::Recap {
                     hello: hello.clone(),
-                    origin: *origin,
-                    msg_id: *msg_id,
-                    hops: *hops,
-                    body: body.clone(),
                 }),
-                None => wire::Message::Hello(hello.clone()),
+                (Some((origin, msg_id, hops, timestamp, body)), _) => {
+                    wire::Message::Text(wire::Text {
+                        hello: hello.clone(),
+                        origin: *origin,
+                        msg_id: *msg_id,
+                        hops: *hops,
+                        timestamp: *timestamp,
+                        body: body.clone(),
+                    })
+                }
+                (None, _) => wire::Message::Hello(hello.clone()),
             };
             if let Ok(packet) = wire::encode(&message, &mut self.tx_buf)
                 && packet.len() <= usize::from(self.max_packet_len)
             {
                 self.tx_len = packet.len();
-                self.outbox_in_tx_buf = pending.is_some();
+                self.tx_carries = carries;
                 return true;
             }
             if hello.neighbors.pop().is_none() {
@@ -616,16 +844,16 @@ mod tests {
     fn queued_text_rides_the_data_slot() {
         let mut a = engine(1, 7);
         let mut b = engine(2, 8);
-        assert_eq!(a.max_text_len(), 54);
+        assert_eq!(a.max_text_len(), 48);
         assert_eq!(
-            a.queue_text(&[0u8; 64]),
-            Err(QueueError::TooLong { len: 64, max: 54 })
+            a.queue_text(5_000_000, &[0u8; 64]),
+            Err(QueueError::TooLong { len: 64, max: 48 })
         );
-        a.queue_text(b"hi from a").unwrap();
-        a.queue_text(b"two").unwrap();
-        a.queue_text(b"three").unwrap();
-        a.queue_text(b"four").unwrap();
-        assert_eq!(a.queue_text(b"overflow"), Err(QueueError::Busy));
+        a.queue_text(5_000_000, b"hi from a").unwrap();
+        a.queue_text(5_000_000, b"two").unwrap();
+        a.queue_text(5_000_000, b"three").unwrap();
+        a.queue_text(5_000_000, b"four").unwrap();
+        assert_eq!(a.queue_text(5_000_000, b"overflow"), Err(QueueError::Busy));
 
         let at_us = step_to_data_tx(&mut a, 20_000_000);
         let text = match wire::decode(a.packet()) {
@@ -640,9 +868,10 @@ mod tests {
 
         // a text still refreshes the slot claim and lands in the inbox
         b.on_packet(at_us + 60_000, a.packet()).unwrap();
-        let (from, body) = b.take_text().unwrap();
-        assert_eq!(from, NodeId(1));
-        assert_eq!(body.as_slice(), b"hi from a");
+        let incoming = b.take_text().unwrap();
+        assert_eq!(incoming.from, NodeId(1));
+        assert_eq!(incoming.utc_seconds, None);
+        assert_eq!(incoming.body.as_slice(), b"hi from a");
         assert_eq!(b.take_text(), None);
 
         // unconfirmed: rebuilt next frame; confirmed: the queue advances
@@ -666,7 +895,7 @@ mod tests {
         let mut b = engine(2, 8);
         let mut c = engine(3, 9);
 
-        a.queue_text(b"flood me").unwrap();
+        a.queue_text(5_000_000, b"flood me").unwrap();
         let at_us = step_to_data_tx(&mut a, 20_000_000);
         let mut from_a = [0u8; 255];
         let len_a = a.packet().len();
@@ -713,7 +942,7 @@ mod tests {
 
         // c receives the forward attributed to the author, not the relay
         c.on_packet(21_500_000, &from_b[..len_b]).unwrap();
-        assert_eq!(c.take_text().map(|(from, _)| from), Some(NodeId(1)));
+        assert_eq!(c.take_text().map(|m| m.from), Some(NodeId(1)));
 
         // the author ignores echoes of its own message
         assert_eq!(
@@ -738,6 +967,7 @@ mod tests {
             origin: NodeId(9),
             msg_id: 7,
             hops: 3,
+            timestamp: None,
             body,
         });
         let mut buf = [0u8; 255];
@@ -749,6 +979,182 @@ mod tests {
             wire::decode(d.packet()),
             Ok(wire::Message::Hello(_))
         ));
+    }
+
+    #[test]
+    fn texts_carry_utc_when_gps_anchored() {
+        let mut a = engine(1, 7);
+        a.queue_text(5_000_000, b"early").unwrap();
+        a.on_gps_second(20_000_000, 16_000);
+        a.queue_text(21_500_000, b"later").unwrap();
+
+        let at_us = step_to_data_tx(&mut a, 21_600_000);
+        assert!(matches!(
+            wire::decode(a.packet()),
+            Ok(wire::Message::Text(t)) if t.body.as_slice() == b"early" && t.timestamp.is_none()
+        ));
+        a.on_transmitted();
+        let _ = step_to_data_tx(&mut a, at_us + 60_000);
+        assert!(matches!(
+            wire::decode(a.packet()),
+            Ok(wire::Message::Text(t))
+                if t.body.as_slice() == b"later" && t.timestamp == Some(16_001)
+        ));
+    }
+
+    /// craft a recap request from `sender` and encode it into `buf`.
+    fn recap_packet(sender: u32, buf: &mut [u8; 255]) -> usize {
+        let message = wire::Message::Recap(wire::Recap {
+            hello: Hello {
+                sender: NodeId(sender),
+                slot: Some(11),
+                neighbors: heapless::Vec::new(),
+            },
+        });
+        wire::encode(&message, buf).unwrap().len()
+    }
+
+    #[test]
+    fn store_and_recap_replay() {
+        let mut author = engine(1, 7);
+        let mut relay = engine(2, 8);
+        relay.enable_store();
+
+        // author floods two texts; the relay stores them on delivery
+        author.queue_text(5_000_000, b"m1").unwrap();
+        author.queue_text(5_000_000, b"m2").unwrap();
+        let at_a = step_to_data_tx(&mut author, 20_000_000);
+        let mut m1 = [0u8; 255];
+        let len1 = author.packet().len();
+        m1[..len1].copy_from_slice(author.packet());
+        author.on_transmitted();
+        let _ = step_to_data_tx(&mut author, at_a + 60_000);
+        let mut m2 = [0u8; 255];
+        let len2 = author.packet().len();
+        m2[..len2].copy_from_slice(author.packet());
+
+        relay.on_packet(20_500_000, &m1[..len1]).unwrap();
+        relay.on_packet(20_600_000, &m2[..len2]).unwrap();
+        assert_eq!(relay.store_len(), 2);
+        while relay.take_text().is_some() {}
+
+        // sync the relay and drain its own flood-forwards of m1/m2, so the
+        // session below observes replays rather than forwards
+        let mut at_r = 30_000_000;
+        loop {
+            at_r = step_to_data_tx(&mut relay, at_r);
+            let idle = matches!(wire::decode(relay.packet()), Ok(wire::Message::Hello(_)));
+            relay.on_transmitted();
+            at_r += 60_000;
+            if idle {
+                break;
+            }
+        }
+        let mut req = [0u8; 255];
+        let req_len = recap_packet(3, &mut req);
+        assert_eq!(
+            relay.on_packet(at_r + 60_000, &req[..req_len]),
+            Ok(Received::Recap { from: NodeId(3) })
+        );
+
+        // after the staggered start, replays come oldest-first, pinned at the
+        // hop cap so nobody re-floods yesterday's chat
+        let mut now = at_r + 100_000;
+        let mut replayed: heapless::Vec<heapless::Vec<u8, { wire::TEXT_CAP }>, 4> =
+            heapless::Vec::new();
+        for _ in 0..16 {
+            let at = step_to_data_tx(&mut relay, now);
+            if let Ok(wire::Message::Text(t)) = wire::decode(relay.packet()) {
+                assert_eq!(t.hops, MAX_TEXT_HOPS);
+                replayed.push(t.body.clone()).unwrap();
+            }
+            relay.on_transmitted();
+            now = at + 60_000;
+            if replayed.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[0].as_slice(), b"m1");
+        assert_eq!(replayed[1].as_slice(), b"m2");
+
+        // session drained: back to bare hellos
+        let _ = step_to_data_tx(&mut relay, now);
+        assert!(matches!(
+            wire::decode(relay.packet()),
+            Ok(wire::Message::Hello(_))
+        ));
+    }
+
+    #[test]
+    fn replay_suppressed_by_overheard_copy() {
+        let mut author = engine(1, 7);
+        let mut relay = engine(2, 8);
+        relay.enable_store();
+
+        author.queue_text(5_000_000, b"m1").unwrap();
+        author.queue_text(5_000_000, b"m2").unwrap();
+        let at_a = step_to_data_tx(&mut author, 20_000_000);
+        let mut m1 = [0u8; 255];
+        let len1 = author.packet().len();
+        m1[..len1].copy_from_slice(author.packet());
+        author.on_transmitted();
+        let _ = step_to_data_tx(&mut author, at_a + 60_000);
+        let mut m2 = [0u8; 255];
+        let len2 = author.packet().len();
+        m2[..len2].copy_from_slice(author.packet());
+
+        relay.on_packet(20_500_000, &m1[..len1]).unwrap();
+        relay.on_packet(20_600_000, &m2[..len2]).unwrap();
+
+        // drain the relay's own flood-forwards first
+        let mut at_r = 30_000_000;
+        loop {
+            at_r = step_to_data_tx(&mut relay, at_r);
+            let idle = matches!(wire::decode(relay.packet()), Ok(wire::Message::Hello(_)));
+            relay.on_transmitted();
+            at_r += 60_000;
+            if idle {
+                break;
+            }
+        }
+        let mut req = [0u8; 255];
+        let req_len = recap_packet(3, &mut req);
+        relay.on_packet(at_r + 60_000, &req[..req_len]).unwrap();
+
+        // another responder replays m1 first; the relay hears the duplicate
+        // and crosses it off, so its own session only sends m2
+        relay.on_packet(at_r + 120_000, &m1[..len1]).unwrap();
+        let mut now = at_r + 150_000;
+        for _ in 0..16 {
+            let at = step_to_data_tx(&mut relay, now);
+            if let Ok(wire::Message::Text(t)) = wire::decode(relay.packet()) {
+                assert_eq!(t.body.as_slice(), b"m2");
+                return;
+            }
+            relay.on_transmitted();
+            now = at + 60_000;
+        }
+        panic!("replay of m2 never went out");
+    }
+
+    #[test]
+    fn store_ages_out_by_ttl() {
+        let mut relay = engine(2, 8);
+        relay.enable_store();
+        let mut author = engine(1, 7);
+        author.queue_text(5_000_000, b"old news").unwrap();
+        let _ = step_to_data_tx(&mut author, 20_000_000);
+        relay.on_packet(20_500_000, author.packet()).unwrap();
+        assert_eq!(relay.store_len(), 1);
+
+        let at_r = step_to_data_tx(&mut relay, 30_000_000);
+        relay.on_transmitted();
+        let stale = at_r + STORE_TTL_US + 1_000_000;
+        let mut req = [0u8; 255];
+        let req_len = recap_packet(3, &mut req);
+        relay.on_packet(stale, &req[..req_len]).unwrap();
+        assert_eq!(relay.store_len(), 0);
     }
 
     #[test]

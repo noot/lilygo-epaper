@@ -187,6 +187,20 @@ impl Sync {
         self.effective(now_us).map(|s| (s.root, s.stratum))
     }
 
+    /// UTC in whole seconds at `now_us`, when the timeline is GPS-anchored
+    /// (only a GPS root's frame numbers are `utc / frame_seconds`; a
+    /// free-running timeline has no UTC meaning).
+    pub fn utc_seconds(&self, now_us: u64) -> Option<u64> {
+        let state = self.effective(now_us)?;
+        if !state.root_has_gps {
+            return None;
+        }
+        let elapsed = now_us.checked_sub(state.frame_origin_us)?;
+        let frame_us = self.config.frame_us();
+        let frame_number = state.frame_number + elapsed / frame_us;
+        Some(frame_number * self.config.frame_seconds() + (elapsed % frame_us) / 1_000_000)
+    }
+
     /// Feed a received beacon. `rx_end_us` is the local clock at RxDone and
     /// `airtime_us` the packet's computed time on air.
     pub fn on_beacon(&mut self, rx_end_us: u64, airtime_us: u64, beacon: &Beacon) {

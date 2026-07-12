@@ -155,6 +155,8 @@ fn main() -> ! {
 
     let mut engine = Engine::new(nootmesh::tdma::Config::default(), modulation, node_id, seed)
         .expect("slot budget fits the modulation");
+    // catch up on chat missed while powered off: store nodes replay history
+    engine.request_recap();
 
     println!("nootmesh node {:08x} up (gps root candidate)", node_id.0);
 
@@ -252,6 +254,10 @@ fn main() -> ! {
                     t.origin.0,
                     t.hops
                 );
+                true
+            }
+            Ok(wire::Message::Recap(_)) => {
+                println!("tx recap request");
                 true
             }
             Err(_) => false,

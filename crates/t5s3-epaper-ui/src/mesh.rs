@@ -55,12 +55,15 @@ impl Mesh {
         let node_id = NodeId(u32::from_be_bytes([m[2], m[3], m[4], m[5]]));
         let rng = esp_hal::rng::Rng::new();
         let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
-        let engine = Engine::new(
+        let mut engine = Engine::new(
             nootmesh::tdma::Config::default(),
             Modulation::default(),
             node_id,
             seed,
         )?;
+        // catch up on chat missed while off-mesh: store nodes in range replay
+        // their retained history, and dedup drops what we already saw
+        engine.request_recap();
         Ok(Self {
             engine,
             node_id: node_id.0,
@@ -88,17 +91,17 @@ impl Mesh {
     }
 
     pub(crate) fn queue_text(&mut self, body: &[u8]) -> Result<(), QueueError> {
-        self.engine.queue_text(body)
+        self.engine.queue_text(now_us(), body)
     }
 
-    /// Next received chat text as `(sender id, lossy utf-8 text)`.
-    pub(crate) fn take_text(&mut self) -> Option<(u32, String)> {
-        self.engine.take_text().map(|(from, body)| {
-            let text = match core::str::from_utf8(&body) {
+    /// Next received chat text as `(author id, origination utc, lossy utf-8)`.
+    pub(crate) fn take_text(&mut self) -> Option<(u32, Option<u64>, String)> {
+        self.engine.take_text().map(|incoming| {
+            let text = match core::str::from_utf8(&incoming.body) {
                 Ok(s) => String::from(s),
                 Err(_) => String::from("<binary>"),
             };
-            (from.0, text)
+            (incoming.from.0, incoming.utc_seconds, text)
         })
     }
 
@@ -170,6 +173,9 @@ impl Mesh {
                                 t.origin.0,
                                 t.hops
                             )
+                        }
+                        Ok(wire::Message::Recap(_)) => {
+                            esp_println::println!("mesh tx recap request")
                         }
                         Err(_) => {}
                     }

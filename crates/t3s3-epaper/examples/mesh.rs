@@ -164,6 +164,11 @@ fn main() -> ! {
 
     let mut engine =
         Engine::new(nootmesh::tdma::Config::default(), modulation, node_id, seed).unwrap();
+    // this board is always-on infrastructure: retain recent texts and answer
+    // recap requests from nodes that were offline. the boot-time recap
+    // rebuilds our own history from other store nodes after a power cycle.
+    engine.enable_store();
+    engine.request_recap();
 
     println!(
         "nootmesh node {:08x} up (mac {mac}, status {:#04x}, device_errors {:#06x})",
@@ -223,11 +228,11 @@ fn main() -> ! {
             // show chat texts from the mesh (this node has no keyboard, so it
             // only receives; the refresh briefly blocks the radio, which the
             // protocol tolerates)
-            if let Some((from, body)) = engine.take_text() {
-                let text = core::str::from_utf8(&body).unwrap_or("<binary>");
-                println!("text from {:08x}: {text}", from.0);
+            if let Some(incoming) = engine.take_text() {
+                let text = core::str::from_utf8(&incoming.body).unwrap_or("<binary>");
+                println!("text from {:08x}: {text}", incoming.from.0);
                 last_text = FmtBuf::new();
-                let _ = write!(last_text, "{:08x}: {text}", from.0);
+                let _ = write!(last_text, "{:08x}: {text}", incoming.from.0);
                 render_status(
                     &mut display,
                     node_id,
@@ -265,6 +270,10 @@ fn main() -> ! {
                     t.origin.0,
                     t.hops
                 );
+                true
+            }
+            Ok(wire::Message::Recap(_)) => {
+                println!("tx recap request");
                 true
             }
             Err(_) => false,
@@ -345,8 +354,9 @@ fn render_status<D>(
         Some(position) => {
             let _ = write!(
                 line3,
-                "frame {}  rx {rx_count} tx {tx_count}",
-                position.frame_number
+                "frame {}  rx {rx_count} tx {tx_count}  store {}",
+                position.frame_number,
+                engine.store_len()
             );
         }
         None => {
