@@ -17,6 +17,11 @@ const SALT_ROOT_FALLBACK: u64 = 4;
 const SALT_MSG_ID: u64 = 5;
 const SALT_REPLAY_STAGGER: u64 = 7;
 
+/// A recap request is retransmitted this many times (one data slot apart): a
+/// single shot can vanish into a receiver's display-refresh deafness window,
+/// and store nodes ignore repeats while a replay session is already running.
+const RECAP_SENDS: u8 = 3;
+
 /// Texts a store node retains for recap replay.
 const STORE_CAP: usize = 32;
 
@@ -165,7 +170,7 @@ pub struct Engine {
     store_enabled: bool,
     store: heapless::Deque<Stored, STORE_CAP>,
     replay_start_frame: u64,
-    recap_requested: bool,
+    recap_sends_left: u8,
     tx_buf: [u8; MAX_PACKET],
     tx_len: usize,
 }
@@ -272,7 +277,7 @@ impl Engine {
             store_enabled: false,
             store: heapless::Deque::new(),
             replay_start_frame: 0,
-            recap_requested: false,
+            recap_sends_left: 0,
             tx_buf: [0; MAX_PACKET],
             tx_len: 0,
         })
@@ -353,7 +358,9 @@ impl Engine {
                     return Ok(Received::Recap { from });
                 }
                 self.coloring.on_hello(rx_end_us, &recap.hello);
-                if self.store_enabled {
+                // a session already replaying serves this requester too (its
+                // retransmits would otherwise restart the session from the top)
+                if self.store_enabled && !self.store.iter().any(|entry| entry.pending) {
                     self.prune_store(rx_end_us);
                     if !self.store.is_empty()
                         && let Some(position) = self.sync.position(rx_end_us)
@@ -479,7 +486,7 @@ impl Engine {
     /// in range replays what it has, and dedup discards what this node
     /// already saw. Call on (re)joining the mesh.
     pub fn request_recap(&mut self) {
-        self.recap_requested = true;
+        self.recap_sends_left = RECAP_SENDS;
     }
 
     /// Confirm the packet from the most recent [`Action::Transmit`] went on
@@ -496,7 +503,9 @@ impl Engine {
                 }
             }
             TxCarries::Replay(origin, msg_id) => self.clear_pending((origin, msg_id)),
-            TxCarries::RecapRequest => self.recap_requested = false,
+            TxCarries::RecapRequest => {
+                self.recap_sends_left = self.recap_sends_left.saturating_sub(1)
+            }
         }
         self.tx_carries = TxCarries::Nothing;
     }
@@ -669,7 +678,7 @@ impl Engine {
     /// regardless.
     fn build_data(&mut self, at_us: u64) -> bool {
         let mut hello = self.coloring.hello();
-        let (message_body, carries) = if self.recap_requested {
+        let (message_body, carries) = if self.recap_sends_left > 0 {
             (None, TxCarries::RecapRequest)
         } else if let Some(out) = self.outbox.front() {
             (
@@ -1056,6 +1065,9 @@ mod tests {
             relay.on_packet(at_r + 60_000, &req[..req_len]),
             Ok(Received::Recap { from: NodeId(3) })
         );
+        // a retransmitted request must not restart the running session (the
+        // trailing back-to-hellos assert below would catch re-replays)
+        relay.on_packet(at_r + 70_000, &req[..req_len]).unwrap();
 
         // after the staggered start, replays come oldest-first, pinned at the
         // hop cap so nobody re-floods yesterday's chat

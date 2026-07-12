@@ -289,10 +289,15 @@ fn main() -> ! {
             println!("start_receive error: {e:?}");
         }
 
-        // refresh the display once per frame, right after our data-slot hello:
-        // the panel blocks the loop for the refresh, so keep it away from
-        // moments we expect to receive
-        if is_hello {
+        // refresh the display right after our data-slot hello, but only every
+        // 4th frame: the ~half-second refresh deafens the radio, and doing it
+        // every frame would shadow the same slots after ours every single
+        // frame — any neighbor whose slot fell there (or whose one-shot
+        // request did) would be systematically unheard
+        let refresh_frame = engine
+            .position(now_us())
+            .is_some_and(|p| p.frame_number.is_multiple_of(4));
+        if is_hello && refresh_frame {
             render_status(
                 &mut display,
                 node_id,

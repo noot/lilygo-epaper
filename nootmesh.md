@@ -143,6 +143,13 @@ message off its pending session — so the earliest responder does most of the
 talking and the others fill gaps. Suppression assumes shared audibility;
 hidden-terminal responders degrade to redundant-but-correct.
 
+The request is retransmitted 3 times, one data slot apart: a one-shot request
+can vanish into a receiver's display-refresh deafness window (observed on
+hardware — the T3-S3 refreshed its panel right after its own hello every
+frame, systematically shadowing the same slots each frame; it now refreshes
+every 4th frame). Store nodes ignore repeat requests while a replay session
+is already running, so retries never restart a session.
+
 Known limits: recap is direct-range only (neither request nor replies flood);
 storage is RAM, so a rebooted relay starts empty and refills passively from
 live traffic and other relays' replays (SD persistence is in the todo);
