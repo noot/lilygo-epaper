@@ -455,12 +455,13 @@ fn render_status<D>(
             let _ = write!(line2, "ROOT (free-running)");
         }
         Some((root, stratum)) => {
-            let _ = write!(line2, "root {:08x}  stratum {stratum}", root.0);
+            let _ = write!(line2, "root {:08x}  s{stratum}", root.0);
         }
         None => {
             let _ = write!(line2, "syncing...");
         }
     }
+    let _ = write!(line2, "  peers {}", engine.peer_count(now_us));
     let mut line3 = FmtBuf::new();
     match engine.position(now_us) {
         Some(position) => {

@@ -534,9 +534,9 @@ async fn main(spawner: Spawner) -> ! {
     let mut lora_mesh: Option<mesh::Mesh> = None;
     let mut radio_tried = false;
     // rate-limit mesh status flushes: the panel blocks the radio for hundreds
-    // of ms per refresh, so only the key parts of the status (role/slot)
-    // trigger one immediately; counters catch up on a slow cadence.
-    let mut lora_status_key: (Option<(u32, u8)>, Option<u16>) = (None, None);
+    // of ms per refresh, so only the key parts of the status (role/slot/peer
+    // count) trigger one immediately; counters catch up on a slow cadence.
+    let mut lora_status_key: (Option<(u32, u8)>, Option<u16>, usize) = (None, None, 0);
     let mut lora_status_at_secs: u64 = 0;
     // the mesh page's send/receive tab, the receive log's scroll position
     // (in wrapped lines), and the sd chat archive's load-once flag + size.

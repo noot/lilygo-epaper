@@ -158,19 +158,26 @@ pub(crate) fn draw_message(display: &mut Display, message: &str) {
     let x = MSG_X + 12;
     let mut y = MSG_Y + 28;
     if message.is_empty() {
-        Text::new("type a message...", Point::new(x, y), font)
-            .draw(display)
-            .ok();
-        return;
+        // hint sits after the cursor, in a lighter shade than typed text
+        Text::new(
+            " type a message...",
+            Point::new(x + 9, y),
+            MonoTextStyle::new(&FONT_9X15, Gray4::new(9)),
+        )
+        .draw(display)
+        .ok();
     }
 
-    // wrap on a character count; the font is fixed width and the text is ascii.
+    // trailing cursor makes the input position visible — a just-typed space
+    // is otherwise indistinguishable from nothing. wrap on a character count;
+    // the font is fixed width and the text is ascii.
+    let shown = format!("{message}_");
     let per_line = ((MSG_W as i32 - 24) / 9) as usize;
-    let bytes = message.len();
+    let bytes = shown.len();
     let mut start = 0;
     while start < bytes {
         let end = (start + per_line).min(bytes);
-        Text::new(&message[start..end], Point::new(x, y), font)
+        Text::new(&shown[start..end], Point::new(x, y), font)
             .draw(display)
             .ok();
         y += 20;

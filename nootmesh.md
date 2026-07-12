@@ -166,15 +166,145 @@ Known limits: recap is direct-range only (neither request nor replies flood);
 silence after a recap is ambiguous between "no store node in range" and
 "nothing missed".
 
-## wire format (implemented in `crates/nootmesh/src/wire.rs`)
+## wire reference (`crates/nootmesh/src/wire.rs`, VERSION 2)
 
-`| version byte | postcard(Message) |` — postcard over protobuf because frames
-are Rust-to-Rust (bridges translate for other consumers at the edge), it has a
-stable wire spec, and it costs zero field-tag bytes on air. Compatibility
-rules: bump the version byte on layout changes to existing variants; only
-append variants to the `Message` enum. A beacon is 13 bytes on air.
+Every packet is:
 
-## message types
+```
+| version (1 byte) | postcard(Message) |
+```
+
+postcard over protobuf because frames are Rust-to-Rust (bridges translate for
+other consumers at the edge), it has a stable wire spec, and it costs zero
+field-tag bytes on air. Compatibility rules: bump the version byte on layout
+changes to existing variants; only *append* variants to `Message` (the enum
+discriminant is a varint of the variant index, so old packets keep decoding
+and old firmware cleanly rejects unknown discriminants). Sizes below are
+postcard varints, so small values encode small.
+
+Version history: v0 = Beacon + Hello; v1 = + Text (flood fields); v2 = Text
+gained `timestamp` (layout change → bump; Recap was appended in the same
+release and alone would not have needed one).
+
+```rust
+enum Message {          // discriminant
+    Beacon(Beacon),     // 0
+    Hello(Hello),       // 1
+    Text(Text),         // 2
+    Recap(Recap),       // 3
+}
+```
+
+### Beacon — time sync (10–20 B on air)
+
+```rust
+Beacon {
+    root: NodeId,        // the elected root this timeline belongs to
+    root_has_gps: bool,  // rank: GPS-anchored beats free-running
+    stratum: u8,         // relay hops from the root (0 = the root itself)
+    frame_number: u64,   // the frame this beacon is transmitted in
+}
+```
+
+Sent every frame by the root in beacon slot 0; stratum-k nodes relay in slot
+`min(k, beacon_slots-1)` on a per-frame coin flip, never at stratum ≥ 7.
+Transmit time is `slot start + guard + jitter(root, frame_number)` — both
+jitter inputs are in the payload, so a receiver recovers the frame origin
+from its RxDone timestamp alone: `origin = rx_end − airtime − guard − jitter
+− slot·slot_len`. No timestamp field is needed on the wire.
+
+Receiver: adopt if it outranks the current root (GPS > free-running, then
+lowest id), or same root at lower stratum (refresh). A root ignores beacons
+it outranks — including echoes of its own timeline.
+
+### Hello — presence + slot claim (6 B + ~2–7 B per neighbor)
+
+```rust
+Hello {
+    sender: NodeId,
+    slot: Option<u16>,                        // sender's claimed data slot
+    neighbors: Vec<(NodeId, u16), 16>,        // sender's 1-hop table w/ slots
+}
+```
+
+The data-slot keepalive (sent every frame by slot holders; claims expire from
+neighbor tables after 4 quiet frames) and the bootstrap announcement
+(contention slots, when every data slot looks taken). The neighbor list gives
+receivers the 2-hop visibility the slot coloring needs; it is trimmed
+entry-by-entry to fit the slot's airtime budget. Every other data-slot
+message *embeds* a Hello for the same reason.
+
+Receiver: upsert the sender in the neighbor table; yield own slot claim if an
+outranking (lower-id) claimant appears at 1 or 2 hops.
+
+### Text — chat, flooded (≤ 99 B on air at the current profile)
+
+```rust
+Text {
+    hello: Hello,           // the *transmitter's* (author or relay)
+    origin: NodeId,         // the author, forever
+    msg_id: u16,            // author-stamped; (origin, msg_id) is the dedup key
+    hops: u8,               // relays so far; 0 = straight from the author
+    timestamp: Option<u64>, // UTC seconds at origination (None: not GPS-anchored)
+    body: Vec<u8, 127>,     // ≤ 76 B at the current profile (slot budget)
+}
+```
+
+Sent in the sender's data slot. Floods: each receiver re-broadcasts an unseen
+message once from its own data slot while `hops < 3`, giving ≤ 1 frame per
+hop. Store-node replays are ordinary Texts pinned at `hops = 3` (delivered,
+never re-forwarded) — replay-ness needs no marker. `timestamp` rides
+unchanged through forwards and replays.
+
+Receiver: process the embedded hello always; dedup on `(origin, msg_id)`
+against the seen-cache (duplicates also cross matching entries off any
+pending replay session); deliver exactly once to the inbox; queue a forward
+if under the hop cap; store nodes retain it for recap.
+
+### Recap — anycast history request (10–20 B on air)
+
+```rust
+Recap {
+    hello: Hello,   // the requester's; also refreshes its slot claim
+}
+```
+
+Broadcast from the requester's data slot on (re)joining the mesh,
+retransmitted 3 times one slot apart (a one-shot can vanish into a
+receiver's display-refresh deafness). Deliberately unaddressed: every store
+node in range answers, staggered 1–6 frames with hear-and-skip suppression
+between responders; receiver-side dedup reconciles all overlap.
+
+Receiver: process the hello; store nodes with retained texts (and no session
+already running) start a replay session, oldest first, one per data slot.
+
+### data-slot content priority
+
+A node's own data slot carries exactly one message per frame, chosen as:
+pending recap request > queued/forwarded text > recap replay > bare hello.
+Everything embeds the hello, so the slot claim never lapses.
+
+### protocol constants (engine defaults)
+
+| constant | value | meaning |
+|---|---|---|
+| guard | 15 ms | slot-edge margin; in-slot TX starts here |
+| beacon jitter range | (slot − 2·guard)/2 | per-frame root decorrelation |
+| LISTEN_FRAMES | 2 | sync → first slot claim |
+| EXPIRY_FRAMES | 8 | beacon silence → unsynced (roots never expire) |
+| root fallback | 2–5 frames + sub-frame jitter | listen before self-rooting |
+| MAX_STRATUM | 7 | beacons not adopted/relayed beyond |
+| NEIGHBOR_TTL | 4 frames | quiet neighbor's claim forgotten |
+| MAX_TEXT_HOPS | 3 | flood radius |
+| SEEN_CAP / OUTBOX_CAP | 32 / 4 | dedup window / pending texts |
+| STORE_CAP / STORE_TTL | 32 / 24 h | replay mailbox (local-clock TTL) |
+| RECAP_SENDS | 3 | request retransmits |
+| replay stagger | 1–6 frames (local-clock) | responder desync |
+
+All durations are the node's own monotonic clock — never frame numbers, which
+restart when a root changes.
+
+## planned message types (not yet on the wire)
 
 ```
 // can probably start w just dh and move to noise or something later
@@ -183,19 +313,15 @@ append variants to the `Message` enum. A beacon is 13 bytes on air.
 struct Handshake {
     public_key: PublicKey,
     alias: String,
-    encryption_mode: EncryptionMode
+    encryption_mode: EncryptionMode  // Always | Optional | Plaintext
 }
 
-enum EncryptionMode {
-    Always,
-    Optional,
-    Plaintext,
-}
-
+// directed messaging: like Text but to: Some(recipient), body encrypted
+// under the handshake-derived key; nodes still relay what they can't read
 struct UserMessage {
     to: Option<PublicKey>, // none for broadcast to all
     contents: Bytes,
 }
-
-
 ```
+
+Both are appends to `Message`, so they will not need a version bump.

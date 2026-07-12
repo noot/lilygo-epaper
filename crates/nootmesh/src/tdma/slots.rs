@@ -58,6 +58,17 @@ impl Coloring {
         self.my_slot
     }
 
+    /// Direct peers heard within the neighbor TTL — every slot holder
+    /// transmits at least once per frame, so this tracks radio-range
+    /// liveness closely.
+    pub fn neighbors_heard(&self, now_us: u64) -> usize {
+        let ttl = NEIGHBOR_TTL_FRAMES * self.config.frame_us();
+        self.neighbors
+            .values()
+            .filter(|neighbor| now_us.saturating_sub(neighbor.last_heard_us) <= ttl)
+            .count()
+    }
+
     /// Record a received [`Hello`] (or the equivalent header piggybacked on a
     /// data packet).
     pub fn on_hello(&mut self, now_us: u64, hello: &Hello) {

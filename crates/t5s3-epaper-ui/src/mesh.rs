@@ -117,12 +117,16 @@ impl Mesh {
     /// hundreds of milliseconds, so flushing on every received packet would
     /// deafen the node (enough to make two contending roots never hear each
     /// other's beacons).
-    pub(crate) fn status_key(&self) -> (Option<(u32, u8)>, Option<u16>) {
+    pub(crate) fn status_key(&self) -> (Option<(u32, u8)>, Option<u16>, usize) {
+        let now = now_us();
         (
             self.engine
-                .root(now_us())
+                .root(now)
                 .map(|(root, stratum)| (root.0, stratum)),
             self.engine.slot(),
+            // peers joining/leaving radio range warrant an immediate flush:
+            // it is the range-testing signal
+            self.engine.peer_count(now),
         )
     }
 
@@ -143,8 +147,10 @@ impl Mesh {
             None => String::new(),
         };
         format!(
-            "{role} | {slot} {frame} | rx {} tx {}",
-            self.rx_count, self.tx_count
+            "{role} | {slot} {frame} | peers {} | rx {} tx {}",
+            self.engine.peer_count(now),
+            self.rx_count,
+            self.tx_count
         )
     }
 

@@ -315,7 +315,7 @@ fn render_status<D>(
 
     let _ = FONT.render_aligned(
         format_args!(
-            "nootmesh {:08x}\n\ngps:  {} ({} sats)\nrole: {}\nslot: {}\nframe: {}\nrx {}  tx {}",
+            "nootmesh {:08x}\n\ngps:  {} ({} sats)\nrole: {}\nslot: {}\nframe: {}\npeers: {}\nrx {}  tx {}",
             node_id.0,
             fix,
             gps.satellites_in_view(),
@@ -326,6 +326,7 @@ fn render_status<D>(
             },
             engine.slot().map_or(-1, i32::from),
             engine.position(now_us).map_or(0, |p| p.frame_number),
+            engine.peer_count(now_us),
             rx_count,
             tx_count,
         ),

@@ -698,6 +698,13 @@ impl Engine {
         self.sync.root(now_us)
     }
 
+    /// Direct peers heard within the last 4 frames (any packet with an
+    /// embedded hello counts). Every slot holder transmits at least once per
+    /// frame, so this drops to 0 within ~16 s of walking out of range.
+    pub fn peer_count(&self, now_us: u64) -> usize {
+        self.coloring.neighbors_heard(now_us)
+    }
+
     fn hello_slot(&mut self, now_us: u64, frame_number: u64) -> Option<u16> {
         if let Some(slot) = self.coloring.pick_slot(now_us) {
             return Some(slot);
@@ -1371,6 +1378,24 @@ mod tests {
         let req_len = recap_packet(3, &mut req);
         reborn.on_packet(2_100_000, &req[..req_len]).unwrap();
         assert_eq!(reborn.store_len(), 0);
+    }
+
+    #[test]
+    fn peer_count_tracks_recently_heard_nodes() {
+        let mut e = engine(1, 7);
+        assert_eq!(e.peer_count(1_000_000), 0);
+        let hello = wire::Message::Hello(Hello {
+            sender: NodeId(9),
+            slot: Some(11),
+            neighbors: heapless::Vec::new(),
+        });
+        let mut buf = [0u8; 255];
+        let len = wire::encode(&hello, &mut buf).unwrap().len();
+        e.on_packet(1_000_000, &buf[..len]).unwrap();
+        assert_eq!(e.peer_count(1_100_000), 1);
+        // silent past the 4-frame neighbor TTL: out of range
+        assert_eq!(e.peer_count(1_000_000 + 4 * FRAME_US), 1);
+        assert_eq!(e.peer_count(1_000_000 + 4 * FRAME_US + 1), 0);
     }
 
     #[test]
