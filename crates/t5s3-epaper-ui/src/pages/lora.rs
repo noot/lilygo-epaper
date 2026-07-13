@@ -407,6 +407,10 @@ pub(crate) fn make_radio<'a>(
             _ => CodingRate::Cr4_5,
         },
         preamble_length: modulation.preamble_symbols(),
+        // match the t3-s3 relays' +22 dBm (this driver defaults to 17):
+        // asymmetric power made walker->home links die ~5 dB before
+        // home->walker, observed as "peers alive but my sends lost"
+        tx_power_dbm: 22,
         ..LoraConfig::default()
     };
     Lora::new(bus, pins, &config)

@@ -171,6 +171,13 @@ message off its pending session — so the earliest responder does most of the
 talking and the others fill gaps. Suppression assumes shared audibility;
 hidden-terminal responders degrade to redundant-but-correct.
 
+Recap triggers: mesh join, a *returning peer* (one pruned for silence, now
+heard again — either side may hold messages from the time apart, and both
+sides' triggers fire, so history flows both ways), and a 30-minute heartbeat
+(local clock) that heals gaps no event catches, e.g. a range-degraded link
+that never fully dropped. Redundant recaps are cheap: dedup discards
+already-held replays and suppression collapses redundant responders.
+
 The request is retransmitted 3 times, one data slot apart: a one-shot request
 can vanish into a receiver's display-refresh deafness window (observed on
 hardware — the T3-S3 refreshed its panel right after its own hello every

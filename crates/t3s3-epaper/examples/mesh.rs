@@ -84,8 +84,9 @@ impl embedded_sdmmc::TimeSource for FixedTime {
     }
 }
 
-/// read the persisted snapshot into `buf`, returning its length. None covers
-/// every degraded case alike: no card, no filesystem, no file yet.
+/// read the persisted snapshot into `buf`, returning its length. every
+/// failure stage logs its own error, so serial distinguishes a dead card
+/// from a healthy card that simply has no snapshot yet.
 fn load_snapshot<D, T>(
     volume_mgr: &mut embedded_sdmmc::VolumeManager<D, T>,
     buf: &mut [u8],
@@ -94,12 +95,40 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: embedded_sdmmc::TimeSource,
 {
-    let volume = volume_mgr.open_volume(VolumeIdx(0)).ok()?;
-    let root = volume.open_root_dir().ok()?;
-    let file = root.open_file_in_dir(STORE_FILE, SdMode::ReadOnly).ok()?;
+    let volume = match volume_mgr.open_volume(VolumeIdx(0)) {
+        Ok(volume) => volume,
+        Err(e) => {
+            println!("sd: open volume failed: {e:?}");
+            return None;
+        }
+    };
+    let root = match volume.open_root_dir() {
+        Ok(root) => root,
+        Err(e) => {
+            println!("sd: open root dir failed: {e:?}");
+            return None;
+        }
+    };
+    let file = match root.open_file_in_dir(STORE_FILE, SdMode::ReadOnly) {
+        Ok(file) => file,
+        Err(embedded_sdmmc::Error::NotFound) => {
+            println!("sd: card ok, no {STORE_FILE} yet (first boot)");
+            return None;
+        }
+        Err(e) => {
+            println!("sd: open {STORE_FILE} failed: {e:?}");
+            return None;
+        }
+    };
     let mut n = 0;
     while !file.is_eof() && n < buf.len() {
-        let read = file.read(&mut buf[n..]).ok()?;
+        let read = match file.read(&mut buf[n..]) {
+            Ok(read) => read,
+            Err(e) => {
+                println!("sd: read {STORE_FILE} failed: {e:?}");
+                return None;
+            }
+        };
         if read == 0 {
             break;
         }
@@ -113,16 +142,28 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: embedded_sdmmc::TimeSource,
 {
-    let Ok(volume) = volume_mgr.open_volume(VolumeIdx(0)) else {
-        return false;
+    let volume = match volume_mgr.open_volume(VolumeIdx(0)) {
+        Ok(volume) => volume,
+        Err(e) => {
+            println!("sd: save: open volume failed: {e:?}");
+            return false;
+        }
     };
     let Ok(root) = volume.open_root_dir() else {
         return false;
     };
-    let Ok(file) = root.open_file_in_dir(STORE_FILE, SdMode::ReadWriteCreateOrTruncate) else {
-        return false;
+    let file = match root.open_file_in_dir(STORE_FILE, SdMode::ReadWriteCreateOrTruncate) {
+        Ok(file) => file,
+        Err(e) => {
+            println!("sd: save: open {STORE_FILE} failed: {e:?}");
+            return false;
+        }
     };
-    file.write(bytes).is_ok()
+    if let Err(e) = file.write(bytes) {
+        println!("sd: save: write failed: {e:?}");
+        return false;
+    }
+    true
 }
 
 /// microseconds since boot; the engine's monotonic clock.
@@ -216,6 +257,14 @@ fn main() -> ! {
     .with_mosi(peripherals.GPIO11)
     .with_miso(peripherals.GPIO2);
     let shared_spi = RefCell::new(disp_spi);
+    // hold the MISO pad's internal pull-up: sd DAT0 must idle high, the slot
+    // may lack an external pull-up, and `with_miso` configures the pad
+    // floating. the held Input keeps the pad setting while the gpio matrix
+    // keeps routing it to the spi peripheral.
+    let _miso_pullup = Input::new(
+        unsafe { esp_hal::peripherals::GPIO2::steal() },
+        InputConfig::default().with_pull(Pull::Up),
+    );
     let disp_cs = Output::new(peripherals.GPIO15, Level::High, OutputConfig::default());
     let disp_dev = RefCellDevice::new(&shared_spi, disp_cs, Delay::new()).unwrap();
     let disp_dc = Output::new(peripherals.GPIO16, Level::Low, OutputConfig::default());
@@ -231,7 +280,23 @@ fn main() -> ! {
     // a missing/unreadable card degrades to the ram-only mailbox.
     let sd_cs = Output::new(peripherals.GPIO13, Level::High, OutputConfig::default());
     let sd_dev = RefCellDevice::new(&shared_spi, sd_cs, Delay::new()).unwrap();
+    // sd wake: >=74 clocks with chip-select de-asserted, which a device
+    // transaction cannot produce (it asserts cs) — write on the bus directly
+    // while both chip-selects are parked high. without this the card never
+    // enters spi mode and every command reports CardNotFound. (same pattern
+    // as the t5s3 core's sd driver; 20 bytes = 160 clocks and a settle delay
+    // give slow cards margin over the 74-clock minimum.)
+    Delay::new().delay_ms(10);
+    if let Err(e) = embedded_hal::spi::SpiBus::write(&mut *shared_spi.borrow_mut(), &[0xFF; 20]) {
+        println!("sd: wake clocks failed: {e:?}");
+    }
     let sdcard = embedded_sdmmc::SdCard::new(sd_dev, Delay::new());
+    // probe the card before any FAT logic: a size readout proves SPI comms
+    // and card acquisition, so later failures can only be filesystem-level
+    match sdcard.num_bytes() {
+        Ok(bytes) => println!("sd: card detected, {} MB", bytes / (1024 * 1024)),
+        Err(e) => println!("sd: no card detected: {e:?}"),
+    }
     let mut volume_mgr = embedded_sdmmc::VolumeManager::new(sdcard, FixedTime);
 
     // stable per-board identity from the efuse mac; trng entropy for the
@@ -468,6 +533,9 @@ fn render_status<D>(
             let _ = write!(line1, "id {:08x}  slot --", node_id.0);
         }
     }
+    if let Some(position) = engine.position(now_us) {
+        let _ = write!(line1, "  f {}", position.frame_number);
+    }
     let mut line2 = FmtBuf::new();
     match engine.root(now_us) {
         Some((root, 0)) if root == node_id => {
@@ -482,19 +550,11 @@ fn render_status<D>(
     }
     let _ = write!(line2, "  peers {}", engine.peer_count(now_us));
     let mut line3 = FmtBuf::new();
-    match engine.position(now_us) {
-        Some(position) => {
-            let _ = write!(
-                line3,
-                "frame {}  rx {rx_count} tx {tx_count}  store {}",
-                position.frame_number,
-                engine.store_len()
-            );
-        }
-        None => {
-            let _ = write!(line3, "rx {rx_count} tx {tx_count}");
-        }
-    }
+    let _ = write!(
+        line3,
+        "rx {rx_count}  tx {tx_count}  store {}",
+        engine.store_len()
+    );
 
     let _ = display.clear(BinaryColor::Off);
     let _ = Text::new("nootmesh", Point::new(8, 24), title_style).draw(display);

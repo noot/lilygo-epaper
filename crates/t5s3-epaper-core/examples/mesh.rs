@@ -81,6 +81,10 @@ fn radio_config(modulation: &Modulation) -> Config {
             _ => CodingRate::Cr4_5,
         },
         preamble_length: modulation.preamble_symbols(),
+        // match the t3-s3 relays' +22 dBm (this driver defaults to 17):
+        // asymmetric power made walker->home links die ~5 dB before
+        // home->walker, observed as "peers alive but my sends lost"
+        tx_power_dbm: 22,
         ..Config::default()
     }
 }

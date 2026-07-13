@@ -22,6 +22,12 @@ const SALT_REPLAY_STAGGER: u64 = 7;
 /// and store nodes ignore repeats while a replay session is already running.
 const RECAP_SENDS: u8 = 3;
 
+/// A standing recap heartbeat (local clock): gaps that no event catches — a
+/// range-degraded link that never fully dropped, packets lost to deafness —
+/// heal within this period, since dedup makes redundant replays cheap and
+/// suppression collapses redundant responders.
+const RECAP_PERIOD_US: u64 = 30 * 60 * 1_000_000;
+
 /// Texts a store node retains for recap replay.
 const STORE_CAP: usize = 32;
 
@@ -199,6 +205,7 @@ pub struct Engine {
     store: heapless::Deque<Stored, STORE_CAP>,
     replay_start_us: u64,
     recap_sends_left: u8,
+    recap_next_us: u64,
     tx_buf: [u8; MAX_PACKET],
     tx_len: usize,
 }
@@ -337,6 +344,7 @@ impl Engine {
             store: heapless::Deque::new(),
             replay_start_us: 0,
             recap_sends_left: 0,
+            recap_next_us: 0,
             tx_buf: [0; MAX_PACKET],
             tx_len: 0,
         })
@@ -361,7 +369,7 @@ impl Engine {
                 })
             }
             wire::Message::Hello(hello) => {
-                self.coloring.on_hello(rx_end_us, &hello);
+                self.hello_heard(rx_end_us, &hello);
                 Ok(Received::Hello {
                     sender: hello.sender,
                 })
@@ -376,7 +384,7 @@ impl Engine {
                 }
                 // the transmitter's embedded hello is fresh claim info even
                 // when the message itself is an already-seen duplicate
-                self.coloring.on_hello(rx_end_us, &text.hello);
+                self.hello_heard(rx_end_us, &text.hello);
                 let key = (text.origin, text.msg_id);
                 // any transmission of this message (fresh flood or another
                 // store node's replay) just reached everyone in range, so a
@@ -420,7 +428,7 @@ impl Engine {
                 if alias.hello.sender == self.node_id {
                     return duplicate;
                 }
-                self.coloring.on_hello(rx_end_us, &alias.hello);
+                self.hello_heard(rx_end_us, &alias.hello);
                 let key = (alias.origin, alias.msg_id);
                 if alias.origin == self.node_id || self.seen.iter().any(|seen| *seen == key) {
                     return duplicate;
@@ -446,7 +454,7 @@ impl Engine {
                 if from == self.node_id {
                     return Ok(Received::Recap { from });
                 }
-                self.coloring.on_hello(rx_end_us, &recap.hello);
+                self.hello_heard(rx_end_us, &recap.hello);
                 // a session already replaying serves this requester too (its
                 // retransmits would otherwise restart the session from the top)
                 if self.store_enabled && !self.store.iter().any(|entry| entry.pending) {
@@ -467,6 +475,16 @@ impl Engine {
                 }
                 Ok(Received::Recap { from })
             }
+        }
+    }
+
+    /// Record a heard hello; a *returning* peer (pruned for silence, now
+    /// back) triggers a recap, since either side may hold messages from the
+    /// time apart — the request makes them replay to us, and their own
+    /// trigger makes us replay to them.
+    fn hello_heard(&mut self, rx_end_us: u64, hello: &Hello) {
+        if self.coloring.on_hello(rx_end_us, hello) {
+            self.recap_sends_left = self.recap_sends_left.max(RECAP_SENDS);
         }
     }
 
@@ -869,6 +887,14 @@ impl Engine {
     /// recap replays, then a bare hello. Everything embeds the hello, so the
     /// slot claim stays fresh regardless.
     fn build_data(&mut self, at_us: u64) -> bool {
+        // standing recap heartbeat, armed on the first data slot so it never
+        // preempts the join-time request already in flight
+        if self.recap_next_us == 0 {
+            self.recap_next_us = at_us + RECAP_PERIOD_US;
+        } else if at_us >= self.recap_next_us {
+            self.recap_next_us = at_us + RECAP_PERIOD_US;
+            self.recap_sends_left = self.recap_sends_left.max(RECAP_SENDS);
+        }
         // due re-announce: queue our alias as a fresh flood so late joiners
         // learn it; rides the slot a bare hello would have taken
         if let Some(name) = &self.alias
@@ -1566,6 +1592,72 @@ mod tests {
         assert!(matches!(
             wire::decode(a.packet()),
             Ok(wire::Message::Hello(_))
+        ));
+    }
+
+    #[test]
+    fn returning_peer_triggers_recap() {
+        let mut e = engine(1, 7);
+        let hello = wire::Message::Hello(Hello {
+            sender: NodeId(9),
+            slot: Some(11),
+            neighbors: heapless::Vec::new(),
+        });
+        let mut buf = [0u8; 255];
+        let len = wire::encode(&hello, &mut buf).unwrap().len();
+
+        // first appearance: not a return, no recap beyond the join-time one
+        e.request_recap();
+        e.on_packet(1_000_000, &buf[..len]).unwrap();
+        // drain the join-time recap sends
+        let mut now = 20_000_000;
+        for _ in 0..RECAP_SENDS {
+            now = step_to_data_tx(&mut e, now);
+            assert!(matches!(
+                wire::decode(e.packet()),
+                Ok(wire::Message::Recap(_))
+            ));
+            e.on_transmitted();
+            now += 60_000;
+        }
+        now = step_to_data_tx(&mut e, now);
+        assert!(matches!(
+            wire::decode(e.packet()),
+            Ok(wire::Message::Hello(_))
+        ));
+
+        // silence past the neighbor TTL, then the peer reappears: recap
+        let gap = now + 5 * FRAME_US;
+        e.on_packet(gap, &buf[..len]).unwrap();
+        let _ = step_to_data_tx(&mut e, gap + 100_000);
+        assert!(matches!(
+            wire::decode(e.packet()),
+            Ok(wire::Message::Recap(_))
+        ));
+    }
+
+    #[test]
+    fn periodic_recap_rearms() {
+        let mut e = engine(1, 7);
+        // drain join-time recap sends
+        let mut now = 20_000_000;
+        for _ in 0..RECAP_SENDS {
+            now = step_to_data_tx(&mut e, now);
+            e.on_transmitted();
+            now += 60_000;
+        }
+        now = step_to_data_tx(&mut e, now);
+        assert!(matches!(
+            wire::decode(e.packet()),
+            Ok(wire::Message::Hello(_))
+        ));
+
+        // past the heartbeat period, the data slot carries a request again
+        let later = now + RECAP_PERIOD_US + FRAME_US;
+        let _ = step_to_data_tx(&mut e, later);
+        assert!(matches!(
+            wire::decode(e.packet()),
+            Ok(wire::Message::Recap(_))
         ));
     }
 

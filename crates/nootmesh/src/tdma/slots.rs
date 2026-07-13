@@ -42,6 +42,9 @@ pub struct Coloring {
     node_id: NodeId,
     my_slot: Option<u16>,
     neighbors: FnvIndexMap<NodeId, Neighbor, MAX_NEIGHBORS>,
+    /// peers pruned for silence, remembered so their return is detectable
+    /// (a returning peer may hold messages exchanged while apart).
+    lost: Vec<NodeId, MAX_NEIGHBORS>,
 }
 
 impl Coloring {
@@ -51,6 +54,7 @@ impl Coloring {
             node_id,
             my_slot: None,
             neighbors: FnvIndexMap::new(),
+            lost: Vec::new(),
         }
     }
 
@@ -70,12 +74,21 @@ impl Coloring {
     }
 
     /// Record a received [`Hello`] (or the equivalent header piggybacked on a
-    /// data packet).
-    pub fn on_hello(&mut self, now_us: u64, hello: &Hello) {
+    /// data packet). Returns true when the sender is *returning* — previously
+    /// tracked, pruned for silence, now heard again — which callers use to
+    /// trigger a recap (either side may hold messages from the time apart).
+    pub fn on_hello(&mut self, now_us: u64, hello: &Hello) -> bool {
         if hello.sender == self.node_id {
-            return;
+            return false;
         }
         self.prune(now_us);
+        let returning = match self.lost.iter().position(|id| *id == hello.sender) {
+            Some(i) => {
+                self.lost.swap_remove(i);
+                true
+            }
+            None => false,
+        };
         let entry = Neighbor {
             slot: hello.slot,
             last_heard_us: now_us,
@@ -83,6 +96,7 @@ impl Coloring {
         };
         // a full table drops the hello: the mesh is larger than we can track
         let _ = self.neighbors.insert(hello.sender, entry);
+        returning
     }
 
     /// The current slot claim, picking (or re-picking after a lost conflict) a
@@ -137,6 +151,12 @@ impl Coloring {
         }
         for id in stale {
             self.neighbors.remove(&id);
+            if !self.lost.contains(&id) {
+                if self.lost.is_full() {
+                    self.lost.remove(0);
+                }
+                let _ = self.lost.push(id);
+            }
         }
     }
 
