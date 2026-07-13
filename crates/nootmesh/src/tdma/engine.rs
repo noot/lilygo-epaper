@@ -355,9 +355,17 @@ impl Engine {
         self.sync.on_gps_second(now_us, utc_seconds);
     }
 
-    /// Feed a received packet. `rx_end_us` is the local clock at RxDone.
-    /// Returns what the packet contained, for logs and displays.
-    pub fn on_packet(&mut self, rx_end_us: u64, packet: &[u8]) -> Result<Received, wire::Error> {
+    /// Feed a received packet. `rx_end_us` is the local clock at RxDone and
+    /// `rssi_dbm` its received signal strength (attributed to the
+    /// *transmitter* — for a forwarded text that is the relay, whose link is
+    /// what the strength describes). Returns what the packet contained, for
+    /// logs and displays.
+    pub fn on_packet(
+        &mut self,
+        rx_end_us: u64,
+        packet: &[u8],
+        rssi_dbm: i16,
+    ) -> Result<Received, wire::Error> {
         match wire::decode(packet)? {
             wire::Message::Beacon(beacon) => {
                 let len = u8::try_from(packet.len()).unwrap_or(u8::MAX);
@@ -369,7 +377,7 @@ impl Engine {
                 })
             }
             wire::Message::Hello(hello) => {
-                self.hello_heard(rx_end_us, &hello);
+                self.hello_heard(rx_end_us, &hello, rssi_dbm);
                 Ok(Received::Hello {
                     sender: hello.sender,
                 })
@@ -384,7 +392,7 @@ impl Engine {
                 }
                 // the transmitter's embedded hello is fresh claim info even
                 // when the message itself is an already-seen duplicate
-                self.hello_heard(rx_end_us, &text.hello);
+                self.hello_heard(rx_end_us, &text.hello, rssi_dbm);
                 let key = (text.origin, text.msg_id);
                 // any transmission of this message (fresh flood or another
                 // store node's replay) just reached everyone in range, so a
@@ -428,7 +436,7 @@ impl Engine {
                 if alias.hello.sender == self.node_id {
                     return duplicate;
                 }
-                self.hello_heard(rx_end_us, &alias.hello);
+                self.hello_heard(rx_end_us, &alias.hello, rssi_dbm);
                 let key = (alias.origin, alias.msg_id);
                 if alias.origin == self.node_id || self.seen.iter().any(|seen| *seen == key) {
                     return duplicate;
@@ -454,7 +462,7 @@ impl Engine {
                 if from == self.node_id {
                     return Ok(Received::Recap { from });
                 }
-                self.hello_heard(rx_end_us, &recap.hello);
+                self.hello_heard(rx_end_us, &recap.hello, rssi_dbm);
                 // a session already replaying serves this requester too (its
                 // retransmits would otherwise restart the session from the top)
                 if self.store_enabled && !self.store.iter().any(|entry| entry.pending) {
@@ -482,8 +490,8 @@ impl Engine {
     /// back) triggers a recap, since either side may hold messages from the
     /// time apart — the request makes them replay to us, and their own
     /// trigger makes us replay to them.
-    fn hello_heard(&mut self, rx_end_us: u64, hello: &Hello) {
-        if self.coloring.on_hello(rx_end_us, hello) {
+    fn hello_heard(&mut self, rx_end_us: u64, hello: &Hello, rssi_dbm: i16) {
+        if self.coloring.on_hello(rx_end_us, hello, rssi_dbm) {
             self.recap_sends_left = self.recap_sends_left.max(RECAP_SENDS);
         }
     }
@@ -608,6 +616,11 @@ impl Engine {
     /// The display name `id` has claimed, if one has been heard.
     pub fn alias_of(&self, id: NodeId) -> Option<&[u8]> {
         self.aliases.get(&id).map(|name| name.as_slice())
+    }
+
+    /// This node's own display name, if set.
+    pub fn alias(&self) -> Option<&[u8]> {
+        self.alias.as_deref()
     }
 
     /// A store node retains delivered (and own) texts and replays them to
@@ -825,6 +838,13 @@ impl Engine {
     /// frame, so this drops to 0 within ~16 s of walking out of range.
     pub fn peer_count(&self, now_us: u64) -> usize {
         self.coloring.neighbors_heard(now_us)
+    }
+
+    /// Everything known about the neighborhood: direct peers with link
+    /// quality and last-heard age, then gossip-only peers attributed to the
+    /// neighbor that named them.
+    pub fn peers(&self, now_us: u64) -> heapless::Vec<super::PeerInfo, { super::PEER_ROWS }> {
+        self.coloring.peers(now_us)
     }
 
     fn hello_slot(&mut self, now_us: u64, frame_number: u64) -> Option<u16> {
@@ -1119,7 +1139,7 @@ mod tests {
         assert_eq!(text.hello.slot, a.slot());
 
         // a text still refreshes the slot claim and lands in the inbox
-        b.on_packet(at_us + 60_000, a.packet()).unwrap();
+        b.on_packet(at_us + 60_000, a.packet(), -60).unwrap();
         let incoming = b.take_text().unwrap();
         assert_eq!(incoming.from, NodeId(1));
         assert_eq!(incoming.utc_seconds, None);
@@ -1155,7 +1175,7 @@ mod tests {
 
         // b delivers it once and queues a forward with the hop count bumped
         assert_eq!(
-            b.on_packet(20_500_000, &from_a[..len_a]),
+            b.on_packet(20_500_000, &from_a[..len_a], -60),
             Ok(Received::Text {
                 origin: NodeId(1),
                 hops: 0,
@@ -1163,7 +1183,7 @@ mod tests {
         );
         assert!(b.take_text().is_some());
         assert_eq!(
-            b.on_packet(20_600_000, &from_a[..len_a]),
+            b.on_packet(20_600_000, &from_a[..len_a], -60),
             Ok(Received::DuplicateText {
                 origin: NodeId(1),
                 hops: 0,
@@ -1193,12 +1213,12 @@ mod tests {
         ));
 
         // c receives the forward attributed to the author, not the relay
-        c.on_packet(21_500_000, &from_b[..len_b]).unwrap();
+        c.on_packet(21_500_000, &from_b[..len_b], -60).unwrap();
         assert_eq!(c.take_text().map(|m| m.from), Some(NodeId(1)));
 
         // the author ignores echoes of its own message
         assert_eq!(
-            a.on_packet(at_us + 900_000, &from_b[..len_b]),
+            a.on_packet(at_us + 900_000, &from_b[..len_b], -60),
             Ok(Received::DuplicateText {
                 origin: NodeId(1),
                 hops: 1,
@@ -1224,7 +1244,7 @@ mod tests {
         });
         let mut buf = [0u8; 255];
         let packet = wire::encode(&capped, &mut buf).unwrap();
-        d.on_packet(20_500_000, packet).unwrap();
+        d.on_packet(20_500_000, packet, -60).unwrap();
         assert!(d.take_text().is_some());
         let _ = step_to_data_tx(&mut d, 21_000_000);
         assert!(matches!(
@@ -1285,8 +1305,8 @@ mod tests {
         let len2 = author.packet().len();
         m2[..len2].copy_from_slice(author.packet());
 
-        relay.on_packet(20_500_000, &m1[..len1]).unwrap();
-        relay.on_packet(20_600_000, &m2[..len2]).unwrap();
+        relay.on_packet(20_500_000, &m1[..len1], -60).unwrap();
+        relay.on_packet(20_600_000, &m2[..len2], -60).unwrap();
         assert_eq!(relay.store_len(), 2);
         while relay.take_text().is_some() {}
 
@@ -1305,12 +1325,14 @@ mod tests {
         let mut req = [0u8; 255];
         let req_len = recap_packet(3, &mut req);
         assert_eq!(
-            relay.on_packet(at_r + 60_000, &req[..req_len]),
+            relay.on_packet(at_r + 60_000, &req[..req_len], -60),
             Ok(Received::Recap { from: NodeId(3) })
         );
         // a retransmitted request must not restart the running session (the
         // trailing back-to-hellos assert below would catch re-replays)
-        relay.on_packet(at_r + 70_000, &req[..req_len]).unwrap();
+        relay
+            .on_packet(at_r + 70_000, &req[..req_len], -60)
+            .unwrap();
 
         // after the staggered start, replays come oldest-first, pinned at the
         // hop cap so nobody re-floods yesterday's chat
@@ -1359,8 +1381,8 @@ mod tests {
         let len2 = author.packet().len();
         m2[..len2].copy_from_slice(author.packet());
 
-        relay.on_packet(20_500_000, &m1[..len1]).unwrap();
-        relay.on_packet(20_600_000, &m2[..len2]).unwrap();
+        relay.on_packet(20_500_000, &m1[..len1], -60).unwrap();
+        relay.on_packet(20_600_000, &m2[..len2], -60).unwrap();
 
         // drain the relay's own flood-forwards first
         let mut at_r = 30_000_000;
@@ -1375,11 +1397,13 @@ mod tests {
         }
         let mut req = [0u8; 255];
         let req_len = recap_packet(3, &mut req);
-        relay.on_packet(at_r + 60_000, &req[..req_len]).unwrap();
+        relay
+            .on_packet(at_r + 60_000, &req[..req_len], -60)
+            .unwrap();
 
         // another responder replays m1 first; the relay hears the duplicate
         // and crosses it off, so its own session only sends m2
-        relay.on_packet(at_r + 120_000, &m1[..len1]).unwrap();
+        relay.on_packet(at_r + 120_000, &m1[..len1], -60).unwrap();
         let mut now = at_r + 150_000;
         for _ in 0..16 {
             let at = step_to_data_tx(&mut relay, now);
@@ -1405,7 +1429,7 @@ mod tests {
 
         author.queue_text(5_000_000, b"m1").unwrap();
         let _ = step_to_data_tx(&mut author, 20_000_000);
-        relay.on_packet(20_500_000, author.packet()).unwrap();
+        relay.on_packet(20_500_000, author.packet(), -60).unwrap();
 
         // relay roots itself via gps (frame numbers ~1900), drains its forward
         let mut at_r = 30_000_000;
@@ -1421,7 +1445,7 @@ mod tests {
 
         let mut req = [0u8; 255];
         let req_len = recap_packet(3, &mut req);
-        relay.on_packet(at_r, &req[..req_len]).unwrap();
+        relay.on_packet(at_r, &req[..req_len], -60).unwrap();
 
         // an outranking root whose timeline restarted near zero takes over
         // between the recap and the replay
@@ -1433,7 +1457,9 @@ mod tests {
         });
         let mut buf = [0u8; 255];
         let coup_len = wire::encode(&coup, &mut buf).unwrap().len();
-        relay.on_packet(at_r + 100_000, &buf[..coup_len]).unwrap();
+        relay
+            .on_packet(at_r + 100_000, &buf[..coup_len], -60)
+            .unwrap();
 
         // the replay still arrives within the stagger window on the new
         // timeline rather than stalling behind the old frame numbers
@@ -1459,7 +1485,7 @@ mod tests {
 
         author.queue_text(5_000_000, b"keep me").unwrap();
         let _ = step_to_data_tx(&mut author, 20_000_000);
-        relay.on_packet(20_500_000, author.packet()).unwrap();
+        relay.on_packet(20_500_000, author.packet(), -60).unwrap();
         assert_eq!(relay.store_len(), 1);
 
         let mut buf = [0u8; 8192];
@@ -1475,7 +1501,7 @@ mod tests {
 
         // restored keys stay deduplicated against live copies
         assert!(matches!(
-            reborn.on_packet(1_200_000, author.packet()),
+            reborn.on_packet(1_200_000, author.packet(), -60),
             Ok(Received::DuplicateText { .. })
         ));
         assert_eq!(reborn.store_len(), 1);
@@ -1493,7 +1519,7 @@ mod tests {
         }
         let mut req = [0u8; 255];
         let req_len = recap_packet(3, &mut req);
-        reborn.on_packet(at_r, &req[..req_len]).unwrap();
+        reborn.on_packet(at_r, &req[..req_len], -60).unwrap();
         let mut now = at_r + 60_000;
         for _ in 0..12 {
             let at = step_to_data_tx(&mut reborn, now);
@@ -1515,7 +1541,7 @@ mod tests {
 
         author.queue_text(5_000_000, b"old news").unwrap();
         let _ = step_to_data_tx(&mut author, 20_000_000);
-        relay.on_packet(20_500_000, author.packet()).unwrap();
+        relay.on_packet(20_500_000, author.packet(), -60).unwrap();
 
         // snapshot taken with one second of lifetime left
         let mut buf = [0u8; 8192];
@@ -1529,7 +1555,7 @@ mod tests {
         // a second later it ages out on the new boot's clock, not 24h later
         let mut req = [0u8; 255];
         let req_len = recap_packet(3, &mut req);
-        reborn.on_packet(2_100_000, &req[..req_len]).unwrap();
+        reborn.on_packet(2_100_000, &req[..req_len], -60).unwrap();
         assert_eq!(reborn.store_len(), 0);
     }
 
@@ -1555,13 +1581,13 @@ mod tests {
 
         // b learns the name, forwards the claim with the hop bumped
         assert_eq!(
-            b.on_packet(at_a + 500_000, a.packet()),
+            b.on_packet(at_a + 500_000, a.packet(), -60),
             Ok(Received::Alias { origin: NodeId(1) })
         );
         assert_eq!(b.alias_of(NodeId(1)), Some(b"noot".as_slice()));
         assert_eq!(b.alias_of(NodeId(9)), None);
         assert_eq!(
-            b.on_packet(at_a + 600_000, a.packet()),
+            b.on_packet(at_a + 600_000, a.packet(), -60),
             Ok(Received::DuplicateAlias { origin: NodeId(1) })
         );
 
@@ -1582,7 +1608,7 @@ mod tests {
             copy[..p.len()].copy_from_slice(p);
             p.len()
         };
-        c.on_packet(at_b + 500_000, &copy[..len]).unwrap();
+        c.on_packet(at_b + 500_000, &copy[..len], -60).unwrap();
         assert_eq!(c.alias_of(NodeId(1)), Some(b"noot".as_slice()));
 
         // after the confirmed announce, a's slot goes back to hellos until
@@ -1593,6 +1619,36 @@ mod tests {
             wire::decode(a.packet()),
             Ok(wire::Message::Hello(_))
         ));
+    }
+
+    #[test]
+    fn peers_lists_direct_and_gossiped() {
+        let mut e = engine(1, 7);
+        let mut neighbors = heapless::Vec::new();
+        neighbors.push((NodeId(30), 12u16)).unwrap();
+        let hello = wire::Message::Hello(Hello {
+            sender: NodeId(9),
+            slot: Some(11),
+            neighbors,
+        });
+        let mut buf = [0u8; 255];
+        let len = wire::encode(&hello, &mut buf).unwrap().len();
+        e.on_packet(1_000_000, &buf[..len], -87).unwrap();
+
+        let peers = e.peers(1_500_000);
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].id, NodeId(9));
+        assert_eq!(peers[0].slot, Some(11));
+        assert_eq!(peers[0].rssi_dbm, Some(-87));
+        assert_eq!(peers[0].heard_age_us, Some(500_000));
+        assert_eq!(peers[0].via, None);
+        assert_eq!(peers[1].id, NodeId(30));
+        assert_eq!(peers[1].slot, Some(12));
+        assert_eq!(peers[1].rssi_dbm, None);
+        assert_eq!(peers[1].via, Some(NodeId(9)));
+
+        // past the TTL both disappear (the gossiper carried the 2-hop row)
+        assert!(e.peers(1_000_000 + 5 * FRAME_US).is_empty());
     }
 
     #[test]
@@ -1608,7 +1664,7 @@ mod tests {
 
         // first appearance: not a return, no recap beyond the join-time one
         e.request_recap();
-        e.on_packet(1_000_000, &buf[..len]).unwrap();
+        e.on_packet(1_000_000, &buf[..len], -60).unwrap();
         // drain the join-time recap sends
         let mut now = 20_000_000;
         for _ in 0..RECAP_SENDS {
@@ -1628,7 +1684,7 @@ mod tests {
 
         // silence past the neighbor TTL, then the peer reappears: recap
         let gap = now + 5 * FRAME_US;
-        e.on_packet(gap, &buf[..len]).unwrap();
+        e.on_packet(gap, &buf[..len], -60).unwrap();
         let _ = step_to_data_tx(&mut e, gap + 100_000);
         assert!(matches!(
             wire::decode(e.packet()),
@@ -1672,7 +1728,7 @@ mod tests {
         });
         let mut buf = [0u8; 255];
         let len = wire::encode(&hello, &mut buf).unwrap().len();
-        e.on_packet(1_000_000, &buf[..len]).unwrap();
+        e.on_packet(1_000_000, &buf[..len], -60).unwrap();
         assert_eq!(e.peer_count(1_100_000), 1);
         // silent past the 4-frame neighbor TTL: out of range
         assert_eq!(e.peer_count(1_000_000 + 4 * FRAME_US), 1);
@@ -1686,7 +1742,7 @@ mod tests {
         let mut author = engine(1, 7);
         author.queue_text(5_000_000, b"old news").unwrap();
         let _ = step_to_data_tx(&mut author, 20_000_000);
-        relay.on_packet(20_500_000, author.packet()).unwrap();
+        relay.on_packet(20_500_000, author.packet(), -60).unwrap();
         assert_eq!(relay.store_len(), 1);
 
         let at_r = step_to_data_tx(&mut relay, 30_000_000);
@@ -1694,7 +1750,7 @@ mod tests {
         let stale = at_r + STORE_TTL_US + 1_000_000;
         let mut req = [0u8; 255];
         let req_len = recap_packet(3, &mut req);
-        relay.on_packet(stale, &req[..req_len]).unwrap();
+        relay.on_packet(stale, &req[..req_len], -60).unwrap();
         assert_eq!(relay.store_len(), 0);
     }
 
@@ -1759,7 +1815,7 @@ mod tests {
             let len = sender.packet().len();
             copy[..len].copy_from_slice(sender.packet());
             let airtime = modulation.packet_airtime_us(u8::try_from(len).unwrap());
-            receiver.on_packet(t + airtime, &copy[..len]).unwrap();
+            receiver.on_packet(t + airtime, &copy[..len], -60).unwrap();
             heard[idx] += 1;
             now = t + airtime;
         }
@@ -1826,7 +1882,7 @@ mod tests {
             let len = sender.packet().len();
             copy[..len].copy_from_slice(sender.packet());
             let airtime = modulation.packet_airtime_us(u8::try_from(len).unwrap());
-            receiver.on_packet(t + airtime, &copy[..len]).unwrap();
+            receiver.on_packet(t + airtime, &copy[..len], -60).unwrap();
             sender.on_transmitted();
             now = t + airtime;
         }
@@ -1881,7 +1937,7 @@ mod tests {
             let len = sender.packet().len();
             copy[..len].copy_from_slice(sender.packet());
             let airtime = modulation.packet_airtime_us(u8::try_from(len).unwrap());
-            receiver.on_packet(t + airtime, &copy[..len]).unwrap();
+            receiver.on_packet(t + airtime, &copy[..len], -60).unwrap();
             if !a_tx {
                 b_heard += 1;
             }

@@ -6,7 +6,7 @@ use embedded_graphics::{
         MonoTextStyle,
     },
     prelude::*,
-    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
+    primitives::{Line, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
@@ -19,19 +19,21 @@ use t5s3_epaper_core::{
 
 use crate::{layout::screen_to_native_rect, widgets::draw_back_button};
 
-/// Which half of the mesh chat page is open: composing (keyboard) or the
-/// scrollable received-message log.
+/// Which view of the mesh page is open: node/peer info, composing
+/// (keyboard), or the scrollable received-message log.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tab {
+    Info,
     Send,
     Recv,
 }
 
 const TAB_Y: i32 = 64;
 const TAB_H: u32 = 48;
-const TAB_W: u32 = 180;
-const TAB_SEND_X: i32 = 120;
-const TAB_RECV_X: i32 = 310;
+const TAB_W: u32 = 150;
+const TAB_INFO_X: i32 = 30;
+const TAB_SEND_X: i32 = 195;
+const TAB_RECV_X: i32 = 360;
 
 const MSG_X: i32 = 30;
 const MSG_Y: i32 = 150;
@@ -41,7 +43,6 @@ const MSG_H: u32 = 170;
 // (ends at 320) and the sent list (368).
 const LORA_STATUS_Y: i32 = 322;
 const STATUS_H: u32 = 44;
-const STATUS_LINE_H: i32 = 20;
 pub(crate) const MSG_MAX: usize = 200;
 
 // the send tab's sent-message log, between the status line and the keyboard.
@@ -49,11 +50,10 @@ pub(crate) const SENT_Y: i32 = 368;
 const LIST_H: u32 = 102;
 pub(crate) const LIST_MAX: usize = 3;
 
-// the receive tab: a status line, then a tall scrollable log.
-const RECV_STATUS_Y: i32 = 130;
-const RECV_TOP: i32 = 180;
+// the receive tab: a tall scrollable log (mesh status lives on the info tab).
+const RECV_TOP: i32 = 140;
 const RECV_ROW_H: i32 = 20;
-const RECV_ROWS: i32 = 37;
+const RECV_ROWS: i32 = 40;
 const RECV_TEXT_X: i32 = 24;
 /// wrap width in characters (FONT_6X10 in the text column).
 const RECV_CHARS: usize = 70;
@@ -66,14 +66,20 @@ const SCROLL_DOWN_Y: i32 = RECV_TOP + (RECV_ROWS - 5) * RECV_ROW_H;
 /// received messages kept in ram (and as the sd log's retained tail).
 pub(crate) const RECV_MAX: usize = 120;
 
-pub(crate) fn tab_send_hit(sx: i32, sy: i32) -> bool {
-    (TAB_SEND_X..TAB_SEND_X + TAB_W as i32).contains(&sx)
-        && (TAB_Y..TAB_Y + TAB_H as i32).contains(&sy)
-}
-
-pub(crate) fn tab_recv_hit(sx: i32, sy: i32) -> bool {
-    (TAB_RECV_X..TAB_RECV_X + TAB_W as i32).contains(&sx)
-        && (TAB_Y..TAB_Y + TAB_H as i32).contains(&sy)
+pub(crate) fn tab_hit(sx: i32, sy: i32) -> Option<Tab> {
+    if !(TAB_Y..TAB_Y + TAB_H as i32).contains(&sy) {
+        return None;
+    }
+    for (x, tab) in [
+        (TAB_INFO_X, Tab::Info),
+        (TAB_SEND_X, Tab::Send),
+        (TAB_RECV_X, Tab::Recv),
+    ] {
+        if (x..x + TAB_W as i32).contains(&sx) {
+            return Some(tab);
+        }
+    }
+    None
 }
 
 pub(crate) fn recv_scroll_up_hit(sx: i32, sy: i32) -> bool {
@@ -119,6 +125,7 @@ fn draw_tabs(display: &mut Display, tab: Tab) {
     let bold = MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK);
     let bold_inv = MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::WHITE);
     for (label, x, active) in [
+        ("Info", TAB_INFO_X, tab == Tab::Info),
         ("Send", TAB_SEND_X, tab == Tab::Send),
         ("Receive", TAB_RECV_X, tab == Tab::Recv),
     ] {
@@ -189,34 +196,20 @@ pub(crate) fn draw_message(display: &mut Display, message: &str) {
     }
 }
 
-// up to two centered lines, split on '\n' (single-line statuses just leave
-// the second row blank).
-fn draw_status_at(display: &mut Display, status: &str, y: i32) {
-    Rectangle::new(Point::new(MSG_X, y), Size::new(MSG_W, STATUS_H))
+/// the send tab's action feedback line ("queued for our slot", errors).
+pub(crate) fn draw_lora_status(display: &mut Display, status: &str) {
+    Rectangle::new(Point::new(MSG_X, LORA_STATUS_Y), Size::new(MSG_W, STATUS_H))
         .into_styled(PrimitiveStyle::with_fill(Gray4::WHITE))
         .draw(display)
         .ok();
-    let font = MonoTextStyle::new(&FONT_9X15, Gray4::BLACK);
-    for (i, line) in status.split('\n').take(2).enumerate() {
-        Text::with_alignment(
-            line,
-            Point::new(
-                crate::layout::SCREEN_W / 2,
-                y + 18 + i as i32 * STATUS_LINE_H,
-            ),
-            font,
-            Alignment::Center,
-        )
-        .draw(display)
-        .ok();
-    }
-}
-
-pub(crate) fn draw_lora_status(display: &mut Display, status: &str, tab: Tab) {
-    match tab {
-        Tab::Send => draw_status_at(display, status, LORA_STATUS_Y),
-        Tab::Recv => draw_status_at(display, status, RECV_STATUS_Y),
-    }
+    Text::with_alignment(
+        status,
+        Point::new(crate::layout::SCREEN_W / 2, LORA_STATUS_Y + 18),
+        MonoTextStyle::new(&FONT_9X15, Gray4::BLACK),
+        Alignment::Center,
+    )
+    .draw(display)
+    .ok();
 }
 
 // the send tab's sent-message log (newest first), truncated to one line each.
@@ -320,6 +313,63 @@ pub(crate) fn draw_recv_list(display: &mut Display, entries: &[String], scroll: 
     .ok();
 }
 
+// the info tab: own node state, then a table of every known peer.
+const INFO_TOP: i32 = 140;
+const INFO_ROW_H: i32 = 20;
+const INFO_ROWS: usize = 22;
+const INFO_H: i32 = 110 + INFO_ROWS as i32 * INFO_ROW_H;
+
+pub(crate) fn draw_info_tab(display: &mut Display, mesh: Option<&crate::mesh::Mesh>) {
+    Rectangle::new(Point::new(0, INFO_TOP - 4), Size::new(540, INFO_H as u32))
+        .into_styled(PrimitiveStyle::with_fill(Gray4::WHITE))
+        .draw(display)
+        .ok();
+    let header = MonoTextStyle::new(&FONT_9X15, Gray4::BLACK);
+    let body = MonoTextStyle::new(&FONT_6X10, Gray4::BLACK);
+    let Some(mesh) = mesh else {
+        Text::new("mesh not running", Point::new(24, INFO_TOP + 18), header)
+            .draw(display)
+            .ok();
+        return;
+    };
+    let (line1, line2) = mesh.info_lines();
+    Text::new(&line1, Point::new(24, INFO_TOP + 18), header)
+        .draw(display)
+        .ok();
+    Text::new(&line2, Point::new(24, INFO_TOP + 42), header)
+        .draw(display)
+        .ok();
+    Line::new(
+        Point::new(20, INFO_TOP + 58),
+        Point::new(520, INFO_TOP + 58),
+    )
+    .into_styled(PrimitiveStyle::with_stroke(Gray4::BLACK, 1))
+    .draw(display)
+    .ok();
+    Text::new(
+        "peer                  slot   dBm   heard",
+        Point::new(24, INFO_TOP + 80),
+        body,
+    )
+    .draw(display)
+    .ok();
+    let rows = mesh.peer_rows();
+    if rows.is_empty() {
+        Text::new("no peers heard yet", Point::new(24, INFO_TOP + 104), body)
+            .draw(display)
+            .ok();
+    }
+    let mut y = INFO_TOP + 104;
+    for row in rows.iter().take(INFO_ROWS) {
+        Text::new(row, Point::new(24, y), body).draw(display).ok();
+        y += INFO_ROW_H;
+    }
+}
+
+pub(crate) fn info_native_rect() -> t5s3_epaper_core::display::Rectangle {
+    screen_to_native_rect(0, INFO_TOP - 4, 540, INFO_H)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_lora_screen(
     display: &mut Display,
@@ -331,18 +381,19 @@ pub(crate) fn draw_lora_screen(
     scroll: usize,
     symbols: bool,
     shift: bool,
+    mesh: Option<&crate::mesh::Mesh>,
 ) {
     draw_back_button(display);
     draw_tabs(display, tab);
     match tab {
+        Tab::Info => draw_info_tab(display, mesh),
         Tab::Send => {
             draw_message(display, message);
-            draw_lora_status(display, status, tab);
+            draw_lora_status(display, status);
             draw_list(display, SENT_Y, "sent", sent);
             crate::keyboard::draw(display, symbols, shift, "SEND");
         }
         Tab::Recv => {
-            draw_lora_status(display, status, tab);
             draw_recv_list(display, received, scroll);
         }
     }
@@ -352,12 +403,8 @@ pub(crate) fn message_box_native_rect() -> t5s3_epaper_core::display::Rectangle 
     screen_to_native_rect(MSG_X, MSG_Y, MSG_W as i32, MSG_H as i32)
 }
 
-pub(crate) fn lora_status_native_rect(tab: Tab) -> t5s3_epaper_core::display::Rectangle {
-    let y = match tab {
-        Tab::Send => LORA_STATUS_Y,
-        Tab::Recv => RECV_STATUS_Y,
-    };
-    screen_to_native_rect(MSG_X, y, MSG_W as i32, STATUS_H as i32)
+pub(crate) fn lora_status_native_rect() -> t5s3_epaper_core::display::Rectangle {
+    screen_to_native_rect(MSG_X, LORA_STATUS_Y, MSG_W as i32, STATUS_H as i32)
 }
 
 pub(crate) fn sent_native_rect() -> t5s3_epaper_core::display::Rectangle {

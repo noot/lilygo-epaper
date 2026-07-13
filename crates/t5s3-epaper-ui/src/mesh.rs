@@ -42,6 +42,7 @@ pub(crate) struct Mesh {
     node_id: u32,
     rx_count: u32,
     tx_count: u32,
+    last_rssi_dbm: Option<i16>,
     last_utc_fed: u64,
 }
 
@@ -75,6 +76,7 @@ impl Mesh {
             node_id: node_id.0,
             rx_count: 0,
             tx_count: 0,
+            last_rssi_dbm: None,
             last_utc_fed: 0,
         })
     }
@@ -107,11 +109,12 @@ impl Mesh {
     /// id. The id tail stays visible because names are unauthenticated
     /// claims.
     pub(crate) fn display_name(&self, id: u32) -> String {
-        match self
-            .engine
-            .alias_of(nootmesh::NodeId(id))
-            .and_then(|bytes| core::str::from_utf8(bytes).ok())
-        {
+        let claimed = if id == self.node_id {
+            self.engine.alias()
+        } else {
+            self.engine.alias_of(nootmesh::NodeId(id))
+        };
+        match claimed.and_then(|bytes| core::str::from_utf8(bytes).ok()) {
             Some(name) => format!("{name} ({:04x})", id & 0xffff),
             None => format!("{id:08x}"),
         }
@@ -155,8 +158,8 @@ impl Mesh {
         )
     }
 
-    /// One-line mesh status for the lora page.
-    pub(crate) fn status_line(&self) -> String {
+    /// The info tab's own-node header lines: mesh state, then counters.
+    pub(crate) fn info_lines(&self) -> (String, String) {
         let now = now_us();
         let role = match self.engine.root(now) {
             Some((root, _)) if root.0 == self.node_id => String::from("ROOT"),
@@ -171,13 +174,50 @@ impl Mesh {
             Some(p) => format!("f {}", p.frame_number),
             None => String::new(),
         };
-        // two lines (the page renders the '\n'): mesh state, then counters
-        format!(
-            "{role} | {slot} {frame}\npeers {} | rx {} tx {}",
-            self.engine.peer_count(now),
-            self.rx_count,
-            self.tx_count
+        let rssi = match self.last_rssi_dbm {
+            Some(dbm) => format!(" | last rx {dbm}dBm"),
+            None => String::new(),
+        };
+        (
+            format!(
+                "{} ({:04x}) | {role}",
+                self.display_name(self.node_id),
+                self.node_id & 0xffff
+            ),
+            format!(
+                "{slot} {frame} | peers {}{rssi} | rx {} tx {} | store {}",
+                self.engine.peer_count(now),
+                self.rx_count,
+                self.tx_count,
+                self.engine.store_len()
+            ),
         )
+    }
+
+    /// The info tab's peer table, one formatted row per known peer: direct
+    /// peers with link quality and age, gossip-only peers with their source.
+    pub(crate) fn peer_rows(&self) -> alloc::vec::Vec<String> {
+        let now = now_us();
+        let mut rows = alloc::vec::Vec::new();
+        for peer in self.engine.peers(now) {
+            let name = self.display_name(peer.id.0);
+            let slot = match peer.slot {
+                Some(slot) => format!("{slot}"),
+                None => String::from("--"),
+            };
+            let row = match (peer.rssi_dbm, peer.heard_age_us, peer.via) {
+                (Some(dbm), Some(age), _) => {
+                    let age_s = age / 1_000_000;
+                    format!("{name:<22}{slot:<7}{dbm:<6}{age_s}s ago")
+                }
+                (_, _, Some(via)) => {
+                    format!("{name:<22}{slot:<7}via {}", self.display_name(via.0))
+                }
+                _ => format!("{name:<22}{slot}"),
+            };
+            rows.push(row);
+        }
+        rows
     }
 
     /// Service the mesh for one ui pass: receive with precise timestamps for
@@ -271,13 +311,15 @@ impl Mesh {
             match radio.poll_receive(buf) {
                 Ok(Some(n)) => {
                     self.rx_count = self.rx_count.wrapping_add(1);
+                    self.last_rssi_dbm = Some(radio.rssi());
+                    let rssi = radio.rssi();
                     if was_stale {
                         if let Ok(wire::Message::Beacon(_)) = wire::decode(&buf[..n]) {
                             esp_println::println!("mesh: dropped stale-timestamped beacon");
                             continue;
                         }
                     }
-                    match self.engine.on_packet(t, &buf[..n]) {
+                    match self.engine.on_packet(t, &buf[..n], rssi) {
                         Ok(received) => esp_println::println!(
                             "mesh rx {n}B {received} rssi {} dBm snr {} dB",
                             radio.rssi(),

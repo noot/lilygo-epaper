@@ -25,8 +25,27 @@ pub struct Hello {
 struct Neighbor {
     slot: Option<u16>,
     last_heard_us: u64,
+    rssi_dbm: i16,
     neighbors: Vec<(NodeId, u16), MAX_NEIGHBORS>,
 }
+
+/// A status-display row: a peer this node knows about, directly (heard
+/// recently, with link quality) or only via a neighbor's gossip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerInfo {
+    pub id: NodeId,
+    pub slot: Option<u16>,
+    /// microseconds since last heard directly; None for gossip-only peers.
+    pub heard_age_us: Option<u64>,
+    /// signal strength of the last direct reception.
+    pub rssi_dbm: Option<i16>,
+    /// the direct neighbor whose hello named this peer (gossip-only peers).
+    pub via: Option<NodeId>,
+}
+
+/// Capacity of a peer listing: every direct neighbor plus as many
+/// gossip-only peers again.
+pub const PEER_ROWS: usize = 2 * MAX_NEIGHBORS;
 
 /// Distributed data-slot assignment: greedy graph coloring over the 2-hop
 /// neighborhood (2 hops because two transmitters that share no link can still
@@ -62,6 +81,46 @@ impl Coloring {
         self.my_slot
     }
 
+    /// Everything known about the neighborhood, for status displays: direct
+    /// peers (within the TTL, freshest first is NOT guaranteed — table
+    /// order), then peers known only from neighbors' hellos, attributed to
+    /// the gossiping neighbor.
+    pub fn peers(&self, now_us: u64) -> Vec<PeerInfo, PEER_ROWS> {
+        let ttl = NEIGHBOR_TTL_FRAMES * self.config.frame_us();
+        let mut rows: Vec<PeerInfo, PEER_ROWS> = Vec::new();
+        for (id, neighbor) in &self.neighbors {
+            let age = now_us.saturating_sub(neighbor.last_heard_us);
+            if age > ttl {
+                continue;
+            }
+            let _ = rows.push(PeerInfo {
+                id: *id,
+                slot: neighbor.slot,
+                heard_age_us: Some(age),
+                rssi_dbm: Some(neighbor.rssi_dbm),
+                via: None,
+            });
+        }
+        for (via, neighbor) in &self.neighbors {
+            if now_us.saturating_sub(neighbor.last_heard_us) > ttl {
+                continue;
+            }
+            for (id, slot) in &neighbor.neighbors {
+                if *id == self.node_id || rows.iter().any(|row| row.id == *id) {
+                    continue;
+                }
+                let _ = rows.push(PeerInfo {
+                    id: *id,
+                    slot: Some(*slot),
+                    heard_age_us: None,
+                    rssi_dbm: None,
+                    via: Some(*via),
+                });
+            }
+        }
+        rows
+    }
+
     /// Direct peers heard within the neighbor TTL — every slot holder
     /// transmits at least once per frame, so this tracks radio-range
     /// liveness closely.
@@ -77,7 +136,7 @@ impl Coloring {
     /// data packet). Returns true when the sender is *returning* — previously
     /// tracked, pruned for silence, now heard again — which callers use to
     /// trigger a recap (either side may hold messages from the time apart).
-    pub fn on_hello(&mut self, now_us: u64, hello: &Hello) -> bool {
+    pub fn on_hello(&mut self, now_us: u64, hello: &Hello, rssi_dbm: i16) -> bool {
         if hello.sender == self.node_id {
             return false;
         }
@@ -92,6 +151,7 @@ impl Coloring {
         let entry = Neighbor {
             slot: hello.slot,
             last_heard_us: now_us,
+            rssi_dbm,
             neighbors: hello.neighbors.clone(),
         };
         // a full table drops the hello: the mesh is larger than we can track
@@ -260,12 +320,12 @@ mod tests {
     fn avoids_one_and_two_hop_claims() {
         let mut coloring = Coloring::new(test_config(), NodeId(9));
         let mine = coloring.pick_slot(0).unwrap();
-        coloring.on_hello(0, &hello(100, Some(mine), &[(101, mine + 1)]));
+        coloring.on_hello(0, &hello(100, Some(mine), &[(101, mine + 1)]), -60);
         // higher-id claims don't force a yield, but fresh picks avoid them
         assert_eq!(coloring.pick_slot(0), Some(mine));
 
         let mut fresh = Coloring::new(test_config(), NodeId(9));
-        fresh.on_hello(0, &hello(100, Some(mine), &[(101, mine + 1)]));
+        fresh.on_hello(0, &hello(100, Some(mine), &[(101, mine + 1)]), -60);
         let picked = fresh.pick_slot(0).unwrap();
         assert_ne!(picked, mine);
         assert_ne!(picked, mine + 1);
@@ -275,12 +335,12 @@ mod tests {
     fn lower_id_wins_conflicts() {
         let mut coloring = Coloring::new(test_config(), NodeId(9));
         let mine = coloring.pick_slot(0).unwrap();
-        coloring.on_hello(0, &hello(3, Some(mine), &[]));
+        coloring.on_hello(0, &hello(3, Some(mine), &[]), -60);
         let repicked = coloring.pick_slot(0).unwrap();
         assert_ne!(repicked, mine);
 
         // and via a 2-hop report
-        coloring.on_hello(0, &hello(3, Some(mine), &[(4, repicked)]));
+        coloring.on_hello(0, &hello(3, Some(mine), &[(4, repicked)]), -60);
         let repicked_again = coloring.pick_slot(0).unwrap();
         assert_ne!(repicked_again, repicked);
     }
@@ -290,11 +350,11 @@ mod tests {
         let config = test_config();
         let mut coloring = Coloring::new(config, NodeId(9));
         let mine = coloring.pick_slot(0).unwrap();
-        coloring.on_hello(0, &hello(3, Some(mine), &[]));
+        coloring.on_hello(0, &hello(3, Some(mine), &[]), -60);
         assert_ne!(coloring.pick_slot(0), Some(mine));
 
         let after_ttl = 5 * config.frame_us();
-        coloring.on_hello(after_ttl, &hello(50, Some(0), &[]));
+        coloring.on_hello(after_ttl, &hello(50, Some(0), &[]), -60);
         assert!(!coloring.yields_conflict(mine));
     }
 
@@ -302,8 +362,8 @@ mod tests {
     fn hello_reports_table_and_own_slot() {
         let mut coloring = Coloring::new(test_config(), NodeId(9));
         let mine = coloring.pick_slot(0).unwrap();
-        coloring.on_hello(0, &hello(3, Some(20), &[]));
-        coloring.on_hello(0, &hello(4, None, &[]));
+        coloring.on_hello(0, &hello(3, Some(20), &[]), -60);
+        coloring.on_hello(0, &hello(4, None, &[]), -60);
 
         let announced = coloring.hello();
         assert_eq!(announced.sender, NodeId(9));
@@ -322,8 +382,8 @@ mod tests {
                 .push((u32::from(slot) + 100, slot))
                 .unwrap();
         }
-        coloring.on_hello(0, &hello(1, None, &claims[0]));
-        coloring.on_hello(0, &hello(2, None, &claims[1]));
+        coloring.on_hello(0, &hello(1, None, &claims[0]), -60);
+        coloring.on_hello(0, &hello(2, None, &claims[1]), -60);
         assert_eq!(coloring.pick_slot(0), None);
     }
 }

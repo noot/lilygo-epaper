@@ -127,11 +127,13 @@ use crate::{
         },
         library,
         lora::{
+            draw_info_tab,
             draw_list,
             draw_lora_screen,
             draw_lora_status,
             draw_message,
             draw_recv_list,
+            info_native_rect,
             lora_status_native_rect,
             make_radio,
             message_box_native_rect,
@@ -141,8 +143,7 @@ use crate::{
             recv_scroll_up_hit,
             recv_visible_rows,
             sent_native_rect,
-            tab_recv_hit,
-            tab_send_hit,
+            tab_hit,
             Tab as LoraTab,
             LIST_MAX,
             MSG_MAX,
@@ -543,7 +544,7 @@ async fn main(spawner: Spawner) -> ! {
     let mut mesh_name_draft = String::new();
     // the mesh page's send/receive tab, the receive log's scroll position
     // (in wrapped lines), and the sd chat archive's load-once flag + size.
-    let mut lora_tab = LoraTab::Send;
+    let mut lora_tab = LoraTab::Info;
     let mut lora_scroll: usize = 0;
     let mut chat_loaded = false;
     let mut chat_size: u64 = 0;
@@ -1001,6 +1002,7 @@ async fn main(spawner: Spawner) -> ! {
                     lora_scroll,
                     kb_symbols,
                     kb_shift,
+                    lora_mesh.as_ref(),
                 ),
                 Screen::Frontlight => draw_frontlight_screen(&mut display, brightness),
                 Screen::Sleep => draw_sleep_screen(&mut display),
@@ -1375,14 +1377,15 @@ async fn main(spawner: Spawner) -> ! {
                         if back_button_hit(sx, sy) {
                             current_screen = Screen::Home;
                             needs_redraw = true;
-                        } else if tab_send_hit(sx, sy) && lora_tab != LoraTab::Send {
-                            lora_tab = LoraTab::Send;
-                            needs_redraw = true;
-                        } else if tab_recv_hit(sx, sy) && lora_tab != LoraTab::Recv {
-                            lora_tab = LoraTab::Recv;
-                            // open pinned to the newest message
-                            lora_scroll = recv_scroll_end(&lora_recv);
-                            needs_redraw = true;
+                        } else if let Some(tab) = tab_hit(sx, sy) {
+                            if tab != lora_tab {
+                                lora_tab = tab;
+                                if tab == LoraTab::Recv {
+                                    // open pinned to the newest message
+                                    lora_scroll = recv_scroll_end(&lora_recv);
+                                }
+                                needs_redraw = true;
+                            }
                         } else if lora_tab == LoraTab::Recv {
                             // page up/down through the wrapped log, one row of
                             // overlap so context carries across pages
@@ -1399,7 +1402,9 @@ async fn main(spawner: Spawner) -> ! {
                                 draw_recv_list(&mut display, &lora_recv, lora_scroll);
                                 display.flush_partial_fast(recv_native_rect()).ok();
                             }
-                        } else if let Some(key) = keyboard::hit(sx, sy, kb_symbols, kb_shift) {
+                        } else if let (LoraTab::Send, Some(key)) =
+                            (lora_tab, keyboard::hit(sx, sy, kb_symbols, kb_shift))
+                        {
                             match key {
                                 Key::Shift => {
                                     kb_shift = !kb_shift;
@@ -1456,10 +1461,8 @@ async fn main(spawner: Spawner) -> ! {
                                     } else {
                                         lora_status = String::from("mesh not ready");
                                     }
-                                    draw_lora_status(&mut display, &lora_status, lora_tab);
-                                    display
-                                        .flush_partial_fast(lora_status_native_rect(lora_tab))
-                                        .ok();
+                                    draw_lora_status(&mut display, &lora_status);
+                                    display.flush_partial_fast(lora_status_native_rect()).ok();
                                 }
                                 other => {
                                     // cap typing at what one data slot can carry.
@@ -2599,14 +2602,13 @@ async fn main(spawner: Spawner) -> ! {
                 }
                 let key = m.status_key();
                 let now_secs = clock.now_us() / 1_000_000;
-                if key != lora_status_key || now_secs.saturating_sub(lora_status_at_secs) >= 8 {
+                if lora_tab == LoraTab::Info
+                    && (key != lora_status_key || now_secs.saturating_sub(lora_status_at_secs) >= 8)
+                {
                     lora_status_key = key;
                     lora_status_at_secs = now_secs;
-                    lora_status = m.status_line();
-                    draw_lora_status(&mut display, &lora_status, lora_tab);
-                    display
-                        .flush_partial_fast(lora_status_native_rect(lora_tab))
-                        .ok();
+                    draw_info_tab(&mut display, Some(m));
+                    display.flush_partial_fast(info_native_rect()).ok();
                 }
             }
         }

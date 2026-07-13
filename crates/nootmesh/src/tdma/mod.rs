@@ -17,7 +17,7 @@ mod slots;
 mod sync;
 
 pub use engine::{Action, Engine, Received};
-pub use slots::{Coloring, Hello, MAX_NEIGHBORS};
+pub use slots::{Coloring, Hello, MAX_NEIGHBORS, PEER_ROWS, PeerInfo};
 pub use sync::{Beacon, Sync};
 
 const MAX_SLOTS_PER_FRAME: u16 = 256;

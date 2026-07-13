@@ -335,7 +335,7 @@ fn main() -> ! {
     );
 
     display.init().unwrap();
-    render_status(&mut display, node_id, &engine, now_us(), 0, 0, "");
+    render_status(&mut display, node_id, &engine, now_us(), 0, 0, None, "");
     display.refresh().unwrap();
 
     radio.start_receive().unwrap();
@@ -345,6 +345,7 @@ fn main() -> ! {
     let mut rx_count: u32 = 0;
     let mut tx_count: u32 = 0;
     let mut refreshes: u32 = 0;
+    let mut last_rssi_dbm: Option<i16> = None;
     let mut last_text = FmtBuf::new();
 
     loop {
@@ -382,7 +383,8 @@ fn main() -> ! {
                 Ok(Some(info)) => {
                     got_packet = true;
                     rx_count = rx_count.wrapping_add(1);
-                    match engine.on_packet(t, &buf[..info.len]) {
+                    last_rssi_dbm = Some(info.rssi_dbm);
+                    match engine.on_packet(t, &buf[..info.len], info.rssi_dbm) {
                         Ok(received) => println!(
                             "rx {}B {received} rssi {} dBm snr {} dB",
                             info.len, info.rssi_dbm, info.snr_db
@@ -427,6 +429,7 @@ fn main() -> ! {
                     now_us(),
                     rx_count,
                     tx_count,
+                    last_rssi_dbm,
                     last_text.as_str(),
                 );
                 let _ = display.refresh_partial();
@@ -496,6 +499,7 @@ fn main() -> ! {
                 now_us(),
                 rx_count,
                 tx_count,
+                last_rssi_dbm,
                 last_text.as_str(),
             );
             refreshes = refreshes.wrapping_add(1);
@@ -509,6 +513,7 @@ fn main() -> ! {
 }
 
 /// draw the node's sync status into the framebuffer.
+#[allow(clippy::too_many_arguments)]
 fn render_status<D>(
     display: &mut D,
     node_id: NodeId,
@@ -516,6 +521,7 @@ fn render_status<D>(
     now_us: u64,
     rx_count: u32,
     tx_count: u32,
+    last_rssi_dbm: Option<i16>,
     last_text: &str,
 ) where
     D: DrawTarget<Color = BinaryColor>,
@@ -549,6 +555,9 @@ fn render_status<D>(
         }
     }
     let _ = write!(line2, "  peers {}", engine.peer_count(now_us));
+    if let Some(dbm) = last_rssi_dbm {
+        let _ = write!(line2, " {dbm}dBm");
+    }
     let mut line3 = FmtBuf::new();
     let _ = write!(
         line3,
