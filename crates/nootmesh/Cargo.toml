@@ -1,10 +1,9 @@
 [package]
 name = "nootmesh"
-description = "no_std mesh protocol over LoRa: TDMA sync, slot assignment, and (later) messaging"
+description = "no_std mesh protocol over LoRa with TDMA sync, messaging, aliases, and recaps"
 version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0"
-repository = "https://github.com/noot/t5s3-epaper"
+repository = "https://github.com/noot/lilygo-epaper"
 
 [dependencies]
 heapless = { version = "0.8", features = ["serde"] }

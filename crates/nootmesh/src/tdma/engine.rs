@@ -94,7 +94,11 @@ pub enum QueueError {
     Busy,
 }
 
-/// What a received packet contained, for callers' logs and displays.
+/// The processing *outcome* of a received packet, for callers' logs and
+/// displays — deliberately not a re-statement of [`wire::Message`]: the
+/// duplicate variants depend on engine state (the seen-cache), which is why
+/// no lossless conversion between the two can exist, and it carries no
+/// payload bodies so logging one is free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Received {
     Beacon {
@@ -199,6 +203,7 @@ pub struct Engine {
     tx_len: usize,
 }
 
+#[derive(Clone)]
 struct Outgoing {
     origin: NodeId,
     msg_id: u16,
@@ -208,6 +213,7 @@ struct Outgoing {
 
 /// What an outbox entry carries: chat, or an alias announcement (own or a
 /// flood-forward). Both ride the data slot and share the dedup machinery.
+#[derive(Clone)]
 enum OutKind {
     Text {
         timestamp: Option<u64>,
@@ -835,29 +841,27 @@ impl Engine {
         }
     }
 
-    /// The next replayable store entry, once the staggered start frame has
-    /// been reached (oldest first, so a recap arrives in chronological order).
-    fn next_replay(
-        &mut self,
-        at_us: u64,
-    ) -> Option<(
-        NodeId,
-        u16,
-        Option<u64>,
-        heapless::Vec<u8, { wire::TEXT_CAP }>,
-    )> {
+    /// The next replayable store entry, once the staggered start has been
+    /// reached (oldest first, so a recap arrives in chronological order),
+    /// shaped as the outgoing it would be — pinned at the hop cap: delivered,
+    /// never re-flooded.
+    fn next_replay(&mut self, at_us: u64) -> Option<Outgoing> {
         if at_us < self.replay_start_us {
             return None;
         }
         self.prune_store(at_us);
-        self.store.iter().find(|entry| entry.pending).map(|entry| {
-            (
-                entry.origin,
-                entry.msg_id,
-                entry.timestamp,
-                entry.body.clone(),
-            )
-        })
+        self.store
+            .iter()
+            .find(|entry| entry.pending)
+            .map(|entry| Outgoing {
+                origin: entry.origin,
+                msg_id: entry.msg_id,
+                hops: MAX_TEXT_HOPS,
+                kind: OutKind::Text {
+                    timestamp: entry.timestamp,
+                    body: entry.body.clone(),
+                },
+            })
     }
 
     /// Build this node's data-slot packet, by priority: a pending recap
@@ -876,57 +880,22 @@ impl Engine {
             self.queue_alias_announce(name);
         }
         let mut hello = self.coloring.hello();
-        let (content, carries) = if self.recap_sends_left > 0 {
+        let (outgoing, carries) = if self.recap_sends_left > 0 {
             (None, TxCarries::RecapRequest)
         } else if let Some(out) = self.outbox.front() {
-            let content = match &out.kind {
-                OutKind::Text { timestamp, body } => {
-                    Content::Text(out.origin, out.msg_id, out.hops, *timestamp, body.clone())
-                }
-                OutKind::Alias { name } => {
-                    Content::Alias(out.origin, out.msg_id, out.hops, name.clone())
-                }
-            };
-            (Some(content), TxCarries::QueuedText)
-        } else if let Some((origin, msg_id, timestamp, body)) = self.next_replay(at_us) {
-            // replays are pinned at the hop cap: delivered, never re-flooded
-            (
-                Some(Content::Text(
-                    origin,
-                    msg_id,
-                    MAX_TEXT_HOPS,
-                    timestamp,
-                    body,
-                )),
-                TxCarries::Replay(origin, msg_id),
-            )
+            (Some(out.clone()), TxCarries::QueuedText)
+        } else if let Some(replay) = self.next_replay(at_us) {
+            let carries = TxCarries::Replay(replay.origin, replay.msg_id);
+            (Some(replay), carries)
         } else {
             (None, TxCarries::Nothing)
         };
         loop {
-            let message = match (&content, carries) {
+            let message = match (&outgoing, carries) {
                 (_, TxCarries::RecapRequest) => wire::Message::Recap(wire::Recap {
                     hello: hello.clone(),
                 }),
-                (Some(Content::Text(origin, msg_id, hops, timestamp, body)), _) => {
-                    wire::Message::Text(wire::Text {
-                        hello: hello.clone(),
-                        origin: *origin,
-                        msg_id: *msg_id,
-                        hops: *hops,
-                        timestamp: *timestamp,
-                        body: body.clone(),
-                    })
-                }
-                (Some(Content::Alias(origin, msg_id, hops, name)), _) => {
-                    wire::Message::Alias(wire::Alias {
-                        hello: hello.clone(),
-                        origin: *origin,
-                        msg_id: *msg_id,
-                        hops: *hops,
-                        name: name.clone(),
-                    })
-                }
+                (Some(out), _) => out.to_message(hello.clone()),
                 (None, _) => wire::Message::Hello(hello.clone()),
             };
             if let Ok(packet) = wire::encode(&message, &mut self.tx_buf)
@@ -955,17 +924,28 @@ impl Engine {
     }
 }
 
-/// A data-slot payload candidate (hello excluded; it is retried with fewer
-/// neighbors until the packet fits).
-enum Content {
-    Text(
-        NodeId,
-        u16,
-        u8,
-        Option<u64>,
-        heapless::Vec<u8, { wire::TEXT_CAP }>,
-    ),
-    Alias(NodeId, u16, u8, heapless::Vec<u8, { wire::ALIAS_CAP }>),
+impl Outgoing {
+    /// The wire form of this outgoing, embedding `hello` (the caller retries
+    /// with a smaller hello until the packet fits the slot budget).
+    fn to_message(&self, hello: Hello) -> wire::Message {
+        match &self.kind {
+            OutKind::Text { timestamp, body } => wire::Message::Text(wire::Text {
+                hello,
+                origin: self.origin,
+                msg_id: self.msg_id,
+                hops: self.hops,
+                timestamp: *timestamp,
+                body: body.clone(),
+            }),
+            OutKind::Alias { name } => wire::Message::Alias(wire::Alias {
+                hello,
+                origin: self.origin,
+                msg_id: self.msg_id,
+                hops: self.hops,
+                name: name.clone(),
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
