@@ -92,6 +92,31 @@ impl Mesh {
         }
     }
 
+    /// Set (or change) the flooded display name; empty clears nothing on
+    /// peers but stops re-announcing.
+    pub(crate) fn set_alias(&mut self, name: &str) {
+        if name.is_empty() {
+            return;
+        }
+        if let Err(e) = self.engine.set_alias(now_us(), name.as_bytes()) {
+            esp_println::println!("mesh: set alias failed: {e}");
+        }
+    }
+
+    /// "name (137c)" when a name claim is known for `id`, else the bare hex
+    /// id. The id tail stays visible because names are unauthenticated
+    /// claims.
+    pub(crate) fn display_name(&self, id: u32) -> String {
+        match self
+            .engine
+            .alias_of(nootmesh::NodeId(id))
+            .and_then(|bytes| core::str::from_utf8(bytes).ok())
+        {
+            Some(name) => format!("{name} ({:04x})", id & 0xffff),
+            None => format!("{id:08x}"),
+        }
+    }
+
     pub(crate) fn max_text_len(&self) -> usize {
         self.engine.max_text_len()
     }
@@ -189,6 +214,13 @@ impl Mesh {
                         }
                         Ok(wire::Message::Recap(_)) => {
                             esp_println::println!("mesh tx recap request")
+                        }
+                        Ok(wire::Message::Alias(a)) => {
+                            esp_println::println!(
+                                "mesh tx alias from {:08x} hops {}",
+                                a.origin.0,
+                                a.hops
+                            )
                         }
                         Err(_) => {}
                     }

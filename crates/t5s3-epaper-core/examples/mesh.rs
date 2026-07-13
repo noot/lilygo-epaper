@@ -260,6 +260,10 @@ fn main() -> ! {
                 println!("tx recap request");
                 true
             }
+            Ok(wire::Message::Alias(a)) => {
+                println!("tx alias from {:08x} hops {}", a.origin.0, a.hops);
+                true
+            }
             Err(_) => false,
         };
         match radio.transmit(engine.packet()) {

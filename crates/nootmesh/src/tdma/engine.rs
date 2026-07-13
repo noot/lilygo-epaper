@@ -45,6 +45,14 @@ const MAX_TEXT_HOPS: u8 = 3;
 /// comfortably outlives its message's bounded flood lifetime.
 const SEEN_CAP: usize = 32;
 
+/// Peers whose display names are remembered.
+const ALIAS_TABLE_CAP: usize = 16;
+
+/// A set alias is re-flooded this often (local clock), so late joiners learn
+/// names without asking. It rides a data slot that would have carried a bare
+/// hello, so the steady-state cost is only the name bytes.
+const ALIAS_REANNOUNCE_US: u64 = 10 * 60 * 1_000_000;
+
 /// Pending outgoing texts: this node's own plus forwards awaiting its data
 /// slot. Forwards are dropped when full; own messages report
 /// [`QueueError::Busy`].
@@ -113,6 +121,15 @@ pub enum Received {
     Recap {
         from: NodeId,
     },
+    /// A new display-name claim, recorded in the alias table (and forwarded
+    /// when under the hop cap).
+    Alias {
+        origin: NodeId,
+    },
+    /// An already-seen alias flood copy; dropped after the hello refresh.
+    DuplicateAlias {
+        origin: NodeId,
+    },
 }
 
 impl core::fmt::Display for Received {
@@ -125,6 +142,10 @@ impl core::fmt::Display for Received {
                 write!(f, "duplicate text from {:08x} hops {hops}", origin.0)
             }
             Self::Recap { from } => write!(f, "recap request from {:08x}", from.0),
+            Self::Alias { origin } => write!(f, "alias from {:08x}", origin.0),
+            Self::DuplicateAlias { origin } => {
+                write!(f, "duplicate alias from {:08x}", origin.0)
+            }
         }
     }
 }
@@ -167,6 +188,9 @@ pub struct Engine {
     tx_carries: TxCarries,
     seen: heapless::Deque<(NodeId, u16), SEEN_CAP>,
     inbox: heapless::Deque<Incoming, 4>,
+    alias: Option<heapless::Vec<u8, { wire::ALIAS_CAP }>>,
+    aliases: heapless::FnvIndexMap<NodeId, heapless::Vec<u8, { wire::ALIAS_CAP }>, ALIAS_TABLE_CAP>,
+    alias_next_us: u64,
     store_enabled: bool,
     store: heapless::Deque<Stored, STORE_CAP>,
     replay_start_us: u64,
@@ -179,8 +203,19 @@ struct Outgoing {
     origin: NodeId,
     msg_id: u16,
     hops: u8,
-    timestamp: Option<u64>,
-    body: heapless::Vec<u8, { wire::TEXT_CAP }>,
+    kind: OutKind,
+}
+
+/// What an outbox entry carries: chat, or an alias announcement (own or a
+/// flood-forward). Both ride the data slot and share the dedup machinery.
+enum OutKind {
+    Text {
+        timestamp: Option<u64>,
+        body: heapless::Vec<u8, { wire::TEXT_CAP }>,
+    },
+    Alias {
+        name: heapless::Vec<u8, { wire::ALIAS_CAP }>,
+    },
 }
 
 struct Stored {
@@ -289,6 +324,9 @@ impl Engine {
             tx_carries: TxCarries::Nothing,
             seen: heapless::Deque::new(),
             inbox: heapless::Deque::new(),
+            alias: None,
+            aliases: heapless::FnvIndexMap::new(),
+            alias_next_us: 0,
             store_enabled: false,
             store: heapless::Deque::new(),
             replay_start_us: 0,
@@ -358,13 +396,43 @@ impl Engine {
                         origin: text.origin,
                         msg_id: text.msg_id,
                         hops: text.hops + 1,
-                        timestamp: text.timestamp,
-                        body: text.body,
+                        kind: OutKind::Text {
+                            timestamp: text.timestamp,
+                            body: text.body,
+                        },
                     });
                 }
                 Ok(Received::Text {
                     origin: text.origin,
                     hops: text.hops,
+                })
+            }
+            wire::Message::Alias(alias) => {
+                let duplicate = Ok(Received::DuplicateAlias {
+                    origin: alias.origin,
+                });
+                if alias.hello.sender == self.node_id {
+                    return duplicate;
+                }
+                self.coloring.on_hello(rx_end_us, &alias.hello);
+                let key = (alias.origin, alias.msg_id);
+                if alias.origin == self.node_id || self.seen.iter().any(|seen| *seen == key) {
+                    return duplicate;
+                }
+                self.mark_seen(key);
+                // remember the claim; a full table drops new names rather
+                // than evicting (bounded, cosmetic data)
+                let _ = self.aliases.insert(alias.origin, alias.name.clone());
+                if alias.hops < MAX_TEXT_HOPS {
+                    let _ = self.outbox.push_back(Outgoing {
+                        origin: alias.origin,
+                        msg_id: alias.msg_id,
+                        hops: alias.hops + 1,
+                        kind: OutKind::Alias { name: alias.name },
+                    });
+                }
+                Ok(Received::Alias {
+                    origin: alias.origin,
                 })
             }
             wire::Message::Recap(recap) => {
@@ -482,10 +550,40 @@ impl Engine {
             origin: self.node_id,
             msg_id,
             hops: 0,
-            timestamp,
-            body: queued,
+            kind: OutKind::Text {
+                timestamp,
+                body: queued,
+            },
         });
         Ok(())
+    }
+
+    /// Set this node's display name and flood the claim (repeated every 10
+    /// minutes for late joiners). Purely cosmetic: the node id remains the
+    /// protocol identity, and displays should keep showing (part of) the id
+    /// alongside the name, since claims are unauthenticated.
+    pub fn set_alias(&mut self, now_us: u64, name: &[u8]) -> Result<(), QueueError> {
+        if name.len() > wire::ALIAS_CAP {
+            return Err(QueueError::TooLong {
+                len: name.len(),
+                max: wire::ALIAS_CAP,
+            });
+        }
+        if self.outbox.is_full() {
+            return Err(QueueError::Busy);
+        }
+        let mut alias = heapless::Vec::new();
+        // bounded by ALIAS_CAP above, so this cannot overflow
+        let _ = alias.extend_from_slice(name);
+        self.alias = Some(alias.clone());
+        self.alias_next_us = now_us + ALIAS_REANNOUNCE_US;
+        self.queue_alias_announce(alias);
+        Ok(())
+    }
+
+    /// The display name `id` has claimed, if one has been heard.
+    pub fn alias_of(&self, id: NodeId) -> Option<&[u8]> {
+        self.aliases.get(&id).map(|name| name.as_slice())
     }
 
     /// A store node retains delivered (and own) texts and replays them to
@@ -763,39 +861,54 @@ impl Engine {
     }
 
     /// Build this node's data-slot packet, by priority: a pending recap
-    /// request, then queued/forwarded texts, then recap replays, then a bare
-    /// hello. Everything embeds the hello, so the slot claim stays fresh
-    /// regardless.
+    /// request, then queued/forwarded texts and alias announcements, then
+    /// recap replays, then a bare hello. Everything embeds the hello, so the
+    /// slot claim stays fresh regardless.
     fn build_data(&mut self, at_us: u64) -> bool {
+        // due re-announce: queue our alias as a fresh flood so late joiners
+        // learn it; rides the slot a bare hello would have taken
+        if let Some(name) = &self.alias
+            && at_us >= self.alias_next_us
+            && !self.outbox.is_full()
+        {
+            let name = name.clone();
+            self.alias_next_us = at_us + ALIAS_REANNOUNCE_US;
+            self.queue_alias_announce(name);
+        }
         let mut hello = self.coloring.hello();
-        let (message_body, carries) = if self.recap_sends_left > 0 {
+        let (content, carries) = if self.recap_sends_left > 0 {
             (None, TxCarries::RecapRequest)
         } else if let Some(out) = self.outbox.front() {
-            (
-                Some((
-                    out.origin,
-                    out.msg_id,
-                    out.hops,
-                    out.timestamp,
-                    out.body.clone(),
-                )),
-                TxCarries::QueuedText,
-            )
+            let content = match &out.kind {
+                OutKind::Text { timestamp, body } => {
+                    Content::Text(out.origin, out.msg_id, out.hops, *timestamp, body.clone())
+                }
+                OutKind::Alias { name } => {
+                    Content::Alias(out.origin, out.msg_id, out.hops, name.clone())
+                }
+            };
+            (Some(content), TxCarries::QueuedText)
         } else if let Some((origin, msg_id, timestamp, body)) = self.next_replay(at_us) {
             // replays are pinned at the hop cap: delivered, never re-flooded
             (
-                Some((origin, msg_id, MAX_TEXT_HOPS, timestamp, body)),
+                Some(Content::Text(
+                    origin,
+                    msg_id,
+                    MAX_TEXT_HOPS,
+                    timestamp,
+                    body,
+                )),
                 TxCarries::Replay(origin, msg_id),
             )
         } else {
             (None, TxCarries::Nothing)
         };
         loop {
-            let message = match (&message_body, carries) {
+            let message = match (&content, carries) {
                 (_, TxCarries::RecapRequest) => wire::Message::Recap(wire::Recap {
                     hello: hello.clone(),
                 }),
-                (Some((origin, msg_id, hops, timestamp, body)), _) => {
+                (Some(Content::Text(origin, msg_id, hops, timestamp, body)), _) => {
                     wire::Message::Text(wire::Text {
                         hello: hello.clone(),
                         origin: *origin,
@@ -803,6 +916,15 @@ impl Engine {
                         hops: *hops,
                         timestamp: *timestamp,
                         body: body.clone(),
+                    })
+                }
+                (Some(Content::Alias(origin, msg_id, hops, name)), _) => {
+                    wire::Message::Alias(wire::Alias {
+                        hello: hello.clone(),
+                        origin: *origin,
+                        msg_id: *msg_id,
+                        hops: *hops,
+                        name: name.clone(),
                     })
                 }
                 (None, _) => wire::Message::Hello(hello.clone()),
@@ -819,6 +941,31 @@ impl Engine {
             }
         }
     }
+
+    fn queue_alias_announce(&mut self, name: heapless::Vec<u8, { wire::ALIAS_CAP }>) {
+        let msg_id = self.next_msg_id;
+        self.next_msg_id = self.next_msg_id.wrapping_add(1);
+        self.mark_seen((self.node_id, msg_id));
+        let _ = self.outbox.push_back(Outgoing {
+            origin: self.node_id,
+            msg_id,
+            hops: 0,
+            kind: OutKind::Alias { name },
+        });
+    }
+}
+
+/// A data-slot payload candidate (hello excluded; it is retried with fewer
+/// neighbors until the packet fits).
+enum Content {
+    Text(
+        NodeId,
+        u16,
+        u8,
+        Option<u64>,
+        heapless::Vec<u8, { wire::TEXT_CAP }>,
+    ),
+    Alias(NodeId, u16, u8, heapless::Vec<u8, { wire::ALIAS_CAP }>),
 }
 
 #[cfg(test)]
@@ -1378,6 +1525,68 @@ mod tests {
         let req_len = recap_packet(3, &mut req);
         reborn.on_packet(2_100_000, &req[..req_len]).unwrap();
         assert_eq!(reborn.store_len(), 0);
+    }
+
+    #[test]
+    fn aliases_flood_and_are_remembered() {
+        let mut a = engine(1, 7);
+        let mut b = engine(2, 8);
+        let mut c = engine(3, 9);
+        assert_eq!(
+            a.set_alias(5_000_000, b"a name too long"),
+            Err(QueueError::TooLong { len: 15, max: 12 })
+        );
+        a.set_alias(5_000_000, b"noot").unwrap();
+
+        let at_a = step_to_data_tx(&mut a, 20_000_000);
+        let alias = match wire::decode(a.packet()) {
+            Ok(wire::Message::Alias(alias)) => alias,
+            other => panic!("expected alias, got {other:?}"),
+        };
+        assert_eq!(alias.origin, NodeId(1));
+        assert_eq!(alias.hops, 0);
+        assert_eq!(alias.name.as_slice(), b"noot");
+
+        // b learns the name, forwards the claim with the hop bumped
+        assert_eq!(
+            b.on_packet(at_a + 500_000, a.packet()),
+            Ok(Received::Alias { origin: NodeId(1) })
+        );
+        assert_eq!(b.alias_of(NodeId(1)), Some(b"noot".as_slice()));
+        assert_eq!(b.alias_of(NodeId(9)), None);
+        assert_eq!(
+            b.on_packet(at_a + 600_000, a.packet()),
+            Ok(Received::DuplicateAlias { origin: NodeId(1) })
+        );
+
+        let at_b = step_to_data_tx(&mut b, 21_000_000);
+        let fwd = match wire::decode(b.packet()) {
+            Ok(wire::Message::Alias(alias)) => alias,
+            other => panic!("expected alias forward, got {other:?}"),
+        };
+        assert_eq!(fwd.hops, 1);
+        assert_eq!(fwd.hello.sender, NodeId(2));
+        b.on_transmitted();
+
+        // c learns it from the forward, attributed to the author
+        let mut copy = [0u8; 255];
+        let len = {
+            let mut buf = [0u8; 255];
+            let p = wire::encode(&wire::Message::Alias(fwd), &mut buf).unwrap();
+            copy[..p.len()].copy_from_slice(p);
+            p.len()
+        };
+        c.on_packet(at_b + 500_000, &copy[..len]).unwrap();
+        assert_eq!(c.alias_of(NodeId(1)), Some(b"noot".as_slice()));
+
+        // after the confirmed announce, a's slot goes back to hellos until
+        // the 10-minute re-announce comes due
+        a.on_transmitted();
+        let _ = step_to_data_tx(&mut a, at_a + 500_000);
+        assert!(matches!(
+            wire::decode(a.packet()),
+            Ok(wire::Message::Hello(_))
+        ));
     }
 
     #[test]

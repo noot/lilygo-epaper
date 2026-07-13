@@ -538,6 +538,9 @@ async fn main(spawner: Spawner) -> ! {
     // count) trigger one immediately; counters catch up on a slow cadence.
     let mut lora_status_key: (Option<(u32, u8)>, Option<u16>, usize) = (None, None, 0);
     let mut lora_status_at_secs: u64 = 0;
+    // mesh-settings name editor: whether the keyboard is up, and the draft.
+    let mut mesh_name_editing = false;
+    let mut mesh_name_draft = String::new();
     // the mesh page's send/receive tab, the receive log's scroll position
     // (in wrapped lines), and the sd chat archive's load-once flag + size.
     let mut lora_tab = LoraTab::Send;
@@ -1051,6 +1054,12 @@ async fn main(spawner: Spawner) -> ! {
                 }
                 Screen::Settings => settings_page::draw_menu(&mut display),
                 Screen::SettingsSystem => settings_page::system::draw(&mut display, &settings),
+                Screen::SettingsMesh => settings_page::mesh::draw(
+                    &mut display,
+                    &settings,
+                    mesh_name_editing,
+                    &mesh_name_draft,
+                ),
                 Screen::SettingsReader => settings_page::reader::draw(&mut display, &settings),
                 Screen::SettingsWifi => {
                     if wifi_pw_mode {
@@ -1697,6 +1706,11 @@ async fn main(spawner: Spawner) -> ! {
                             current_screen = Screen::SettingsWifi;
                             needs_redraw = true;
                         }
+                        Some(MenuHit::Mesh) => {
+                            current_screen = Screen::SettingsMesh;
+                            mesh_name_editing = false;
+                            needs_redraw = true;
+                        }
                         None => {}
                     },
                     Screen::SettingsSystem => match settings_page::system::hit_test(sx, sy) {
@@ -1756,19 +1770,85 @@ async fn main(spawner: Spawner) -> ! {
                                 .flush_partial_fast(settings_page::system::icon_size_button_rect())
                                 .ok();
                         }
-                        Some(settings_page::system::Hit::ToggleMesh) => {
-                            settings.mesh_background = !settings.mesh_background;
-                            settings_dirty = true;
-                            settings_page::system::redraw_mesh(
-                                &mut display,
-                                settings.mesh_background,
-                            );
-                            display
-                                .flush_partial_fast(settings_page::system::mesh_button_rect())
-                                .ok();
-                        }
                         None => {}
                     },
+                    Screen::SettingsMesh => {
+                        if mesh_name_editing {
+                            // keyboard-driven name entry; SAVE commits to the
+                            // settings blob and the live mesh
+                            if let Some(key) = keyboard::hit(sx, sy, false, false) {
+                                match key {
+                                    Key::Enter => {
+                                        settings.set_mesh_alias(&mesh_name_draft);
+                                        settings_dirty = true;
+                                        if let Some(m) = &mut lora_mesh {
+                                            m.set_alias(settings.mesh_alias());
+                                        }
+                                        mesh_name_editing = false;
+                                        needs_redraw = true;
+                                    }
+                                    Key::Char(c) if mesh_name_draft.len() < settings::ALIAS_CAP => {
+                                        mesh_name_draft.push(c);
+                                        settings_page::mesh::draw_editor(
+                                            &mut display,
+                                            &mesh_name_draft,
+                                        );
+                                        display
+                                            .flush_partial_fast(settings_page::mesh::editor_rect())
+                                            .ok();
+                                    }
+                                    Key::Space if mesh_name_draft.len() < settings::ALIAS_CAP => {
+                                        mesh_name_draft.push(' ');
+                                        settings_page::mesh::draw_editor(
+                                            &mut display,
+                                            &mesh_name_draft,
+                                        );
+                                        display
+                                            .flush_partial_fast(settings_page::mesh::editor_rect())
+                                            .ok();
+                                    }
+                                    Key::Backspace => {
+                                        mesh_name_draft.pop();
+                                        settings_page::mesh::clear_editor(&mut display);
+                                        settings_page::mesh::draw_editor(
+                                            &mut display,
+                                            &mesh_name_draft,
+                                        );
+                                        display
+                                            .flush_partial_fast(settings_page::mesh::editor_rect())
+                                            .ok();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        } else {
+                            match settings_page::mesh::hit_test(sx, sy) {
+                                Some(settings_page::mesh::Hit::Back) => {
+                                    current_screen = Screen::Settings;
+                                    needs_redraw = true;
+                                }
+                                Some(settings_page::mesh::Hit::EditName) => {
+                                    mesh_name_draft = String::from(settings.mesh_alias());
+                                    mesh_name_editing = true;
+                                    needs_redraw = true;
+                                }
+                                Some(settings_page::mesh::Hit::ToggleRadio) => {
+                                    settings.mesh_background = !settings.mesh_background;
+                                    settings_dirty = true;
+                                    settings_page::mesh::redraw_radio(
+                                        &mut display,
+                                        settings.mesh_background,
+                                    );
+                                    display
+                                        .flush_partial_fast(
+                                            settings_page::mesh::radio_button_rect(),
+                                        )
+                                        .ok();
+                                }
+                                None => {}
+                            }
+                        }
+                    }
                     Screen::SettingsReader => match settings_page::reader::hit_test(sx, sy) {
                         Some(settings_page::reader::Hit::Back) => {
                             current_screen = Screen::Settings;
@@ -2461,8 +2541,9 @@ async fn main(spawner: Spawner) -> ! {
                         }
                         radio = Some(r);
                         match mesh::Mesh::new(settings.mesh_background) {
-                            Ok(m) => {
+                            Ok(mut m) => {
                                 esp_println::println!("mesh: joining as {:08x}", m.node_id());
+                                m.set_alias(settings.mesh_alias());
                                 lora_mesh = Some(m);
                             }
                             Err(e) => {
@@ -2495,9 +2576,11 @@ async fn main(spawner: Spawner) -> ! {
             let mut recv_dirty = false;
             while let Some((from, utc, text)) = m.take_text() {
                 esp_println::println!("mesh text from {from:08x}: {text}");
+                // claimed name plus id tail when known, bare id otherwise
                 let line = format!(
-                    "{}{from:08x}: {text}",
-                    mesh_stamp(&mut clock, &settings, utc)
+                    "{}{}: {text}",
+                    mesh_stamp(&mut clock, &settings, utc),
+                    m.display_name(from)
                 );
                 lora_recv.push(line.clone());
                 if lora_recv.len() > RECV_MAX {

@@ -339,7 +339,22 @@ fn main() -> ! {
                 let text = core::str::from_utf8(&incoming.body).unwrap_or("<binary>");
                 println!("text from {:08x}: {text}", incoming.from.0);
                 last_text = FmtBuf::new();
-                let _ = write!(last_text, "{:08x}: {text}", incoming.from.0);
+                // claimed name plus id tail when known, bare id otherwise
+                match engine
+                    .alias_of(incoming.from)
+                    .and_then(|bytes| core::str::from_utf8(bytes).ok())
+                {
+                    Some(name) => {
+                        let _ = write!(
+                            last_text,
+                            "{name} ({:04x}): {text}",
+                            incoming.from.0 & 0xffff
+                        );
+                    }
+                    None => {
+                        let _ = write!(last_text, "{:08x}: {text}", incoming.from.0);
+                    }
+                }
                 render_status(
                     &mut display,
                     node_id,
@@ -381,6 +396,10 @@ fn main() -> ! {
             }
             Ok(wire::Message::Recap(_)) => {
                 println!("tx recap request");
+                true
+            }
+            Ok(wire::Message::Alias(a)) => {
+                println!("tx alias from {:08x} hops {}", a.origin.0, a.hops);
                 true
             }
             Err(_) => false,

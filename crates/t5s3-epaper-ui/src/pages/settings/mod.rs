@@ -1,3 +1,4 @@
+pub(crate) mod mesh;
 pub(crate) mod reader;
 pub(crate) mod system;
 pub(crate) mod wifi;
@@ -87,9 +88,10 @@ pub(crate) enum MenuHit {
     System,
     Reader,
     Wifi,
+    Mesh,
 }
 
-const MENU_ENTRIES: [&str; 3] = ["System", "Reader", "Wi-Fi"];
+const MENU_ENTRIES: [&str; 4] = ["System", "Reader", "Wi-Fi", "Mesh"];
 
 fn menu_row_y(i: i32) -> i32 {
     MENU_TOP + i * (MENU_H as i32 + MENU_GAP)
@@ -104,7 +106,8 @@ pub(crate) fn menu_hit(sx: i32, sy: i32) -> Option<MenuHit> {
             return Some(match i {
                 0 => MenuHit::System,
                 1 => MenuHit::Reader,
-                _ => MenuHit::Wifi,
+                2 => MenuHit::Wifi,
+                _ => MenuHit::Mesh,
             });
         }
     }

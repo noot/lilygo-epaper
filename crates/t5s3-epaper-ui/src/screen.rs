@@ -20,6 +20,7 @@ pub(crate) enum Screen {
     MapFull,
     Notes,
     NoteEdit,
+    SettingsMesh,
 }
 
 impl Screen {
@@ -49,6 +50,7 @@ impl Screen {
             // the editor's buffer is RAM-only (it is saved to the card before
             // sleeping), so waking from it lands on the notes list instead.
             Screen::NoteEdit => 19,
+            Screen::SettingsMesh => 20,
         }
     }
 

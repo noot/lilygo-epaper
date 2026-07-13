@@ -221,6 +221,7 @@ enum Message {          // discriminant
     Hello(Hello),       // 1
     Text(Text),         // 2
     Recap(Recap),       // 3
+    Alias(Alias),       // 4
 }
 ```
 
@@ -290,6 +291,29 @@ against the seen-cache (duplicates also cross matching entries off any
 pending replay session); deliver exactly once to the inbox; queue a forward
 if under the hop cap; store nodes retain it for recap.
 
+### Alias — display-name claim (~12 B + name on air)
+
+```rust
+Alias {
+    hello: Hello,           // the transmitter's (author or relay)
+    origin: NodeId,         // whose name this is
+    msg_id: u16,            // (origin, msg_id) dedup, like Text
+    hops: u8,
+    name: Vec<u8, 12>,
+}
+```
+
+Flooded like a Text (same dedup, same hop cap) when a user sets their name,
+and re-flooded every 10 minutes (local clock) so late joiners learn it — the
+re-announce rides a data slot that would have carried a bare hello, so its
+steady cost is only the name bytes. Receivers keep a 16-entry id → name
+table. Purely cosmetic: node id remains the protocol identity, and displays
+show `name (137c)` — name plus id tail — because claims are unauthenticated
+until the pubkey layer. Nodes that never announce appear as bare ids.
+
+Receiver: process the hello; dedup; record the claim; forward under the hop
+cap.
+
 ### Recap — anycast history request (10–20 B on air)
 
 ```rust
@@ -310,8 +334,9 @@ already running) start a replay session, oldest first, one per data slot.
 ### data-slot content priority
 
 A node's own data slot carries exactly one message per frame, chosen as:
-pending recap request > queued/forwarded text > recap replay > bare hello.
-Everything embeds the hello, so the slot claim never lapses.
+pending recap request > queued/forwarded texts and alias announcements (one
+shared queue, FIFO) > recap replay > bare hello. Everything embeds the
+hello, so the slot claim never lapses.
 
 ### protocol constants (engine defaults)
 

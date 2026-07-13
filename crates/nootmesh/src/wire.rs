@@ -25,6 +25,10 @@ pub const VERSION: u8 = 2;
 /// under 128 keeps postcard's length prefix to one byte.
 pub const TEXT_CAP: usize = 127;
 
+/// Display-name length cap: enough to be personal, small enough that alias
+/// announcements stay near hello-sized.
+pub const ALIAS_CAP: usize = 12;
+
 /// Every message type that can appear on the air. Append-only; see the module
 /// docs.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -33,6 +37,7 @@ pub enum Message {
     Hello(Hello),
     Text(Text),
     Recap(Recap),
+    Alias(Alias),
 }
 
 /// Chat text broadcast in a data slot and flooded across the mesh: every
@@ -64,6 +69,20 @@ pub struct Text {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Recap {
     pub hello: Hello,
+}
+
+/// A user-chosen display name for `origin`, flooded like a text (same
+/// `(origin, msg_id)` dedup, same hop cap) on join/change and re-announced
+/// slowly for late joiners. Purely cosmetic: the node id stays the protocol
+/// identity, and displays should show both, since names are unauthenticated
+/// claims until the pubkey identity layer lands.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Alias {
+    pub hello: Hello,
+    pub origin: NodeId,
+    pub msg_id: u16,
+    pub hops: u8,
+    pub name: heapless::Vec<u8, ALIAS_CAP>,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
