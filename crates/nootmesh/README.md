@@ -5,16 +5,10 @@ A simple mesh protocol built on top of LoRa.
 details:
 - relay node support w max hops and msg dedup
 - supports synchronization (TDMA) to coordinate transmittions over the same channel
-- message storage and redelivery in case of non-receipt (have relays store x most recent messages and users pull on demand)
+- message storage and redelivery in case of non-receipt (relays store most recent messages and users pull on demand)
+- store received messages on sd card for persistence
 
 todo:
-- store received messages on sd card for persistence — done on both: the
-  t5s3 ui appends the chat timeline to MESH/CHAT.LOG (tail reload at boot,
-  compaction past 128KB); the t3s3 relay persists its replay store to
-  STORE.BIN via `Engine::store_snapshot`/`store_restore` (saved on every
-  store change, reloaded at boot with remaining-TTL rebasing — durations,
-  never absolute clocks, cross the reboot). the t3s3 sd (CS=13, MISO=2)
-  shares the e-paper SPI via RefCellDevice at 400 kHz
 - message "to:user" and "to:all" options (nodes simply don't display messages that aren't to them)
 - pubkey identities for remote peer verification
 - message encryption (optionally, can be required per-user) handshake to determine shared key (dh? noise protocol to prove remote actually has the key?)
