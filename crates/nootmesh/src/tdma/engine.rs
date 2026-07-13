@@ -824,12 +824,12 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tdma::{SlotKind, test_config};
+    use crate::tdma::{SlotKind, test_config, test_modulation};
 
     const FRAME_US: u64 = 16_000_000;
 
     fn engine(id: u32, seed: u64) -> Engine {
-        Engine::new(test_config(), Modulation::default(), NodeId(id), seed).unwrap()
+        Engine::new(test_config(), test_modulation(), NodeId(id), seed).unwrap()
     }
 
     #[test]
@@ -848,7 +848,7 @@ mod tests {
         // 150 slots of 40 ms = 6 s frame; 10 ms budget fits no packet
         let config = Config::new(40_000, 150, 15_000, 1, 1).unwrap();
         assert!(matches!(
-            Engine::new(config, Modulation::default(), NodeId(1), 7),
+            Engine::new(config, test_modulation(), NodeId(1), 7),
             Err(Error::SlotTooShort { .. })
         ));
     }
@@ -871,7 +871,7 @@ mod tests {
                     }
                     sent.push((at_us, slot)).unwrap();
                     now = at_us
-                        + Modulation::default()
+                        + test_modulation()
                             .packet_airtime_us(u8::try_from(e.packet().len()).unwrap());
                 }
                 _ => {
@@ -1445,7 +1445,7 @@ mod tests {
     fn two_gpsless_nodes_converge() {
         let mut a = engine(1, 0x1111);
         let mut b = engine(2, 0x2222);
-        let modulation = Modulation::default();
+        let modulation = test_modulation();
         let start = 5_000_000u64;
         let end = start + 25 * FRAME_US;
         let mut now = start;
@@ -1509,7 +1509,7 @@ mod tests {
     fn two_gps_roots_resolve_to_one() {
         let mut a = engine(1, 0x3333);
         let mut b = engine(2, 0x4444);
-        let modulation = Modulation::default();
+        let modulation = test_modulation();
         let start = 20_000_000u64;
         let end = start + 20 * FRAME_US;
         let mut now = start;
@@ -1563,7 +1563,7 @@ mod tests {
     fn two_nodes_converge_without_collisions() {
         let mut a = engine(1, 0xAAAA);
         let mut b = engine(2, 0xBBBB);
-        let modulation = Modulation::default();
+        let modulation = test_modulation();
         let start = 20_000_000u64;
         let end = start + 25 * FRAME_US;
         let mut now = start;

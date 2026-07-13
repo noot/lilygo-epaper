@@ -146,8 +146,9 @@ impl Mesh {
             Some(p) => format!("f {}", p.frame_number),
             None => String::new(),
         };
+        // two lines (the page renders the '\n'): mesh state, then counters
         format!(
-            "{role} | {slot} {frame} | peers {} | rx {} tx {}",
+            "{role} | {slot} {frame}\npeers {} | rx {} tx {}",
             self.engine.peer_count(now),
             self.rx_count,
             self.tx_count

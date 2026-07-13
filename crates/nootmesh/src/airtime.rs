@@ -93,13 +93,16 @@ impl Modulation {
 }
 
 impl Default for Modulation {
-    /// The fleet profile every node must share: SF7, 125 kHz, CR 4/5,
-    /// 8-symbol preamble. Radio drivers derive their configuration from these
-    /// accessors rather than hardcoding, so changing the profile here changes
-    /// every firmware target together.
+    /// The fleet profile every node must share: SF9, 125 kHz, CR 4/5,
+    /// 8-symbol preamble (~+6 dB link budget over SF7, roughly doubling
+    /// range, at 4x the airtime — see the modulation ladder in nootmesh.md).
+    /// Radio drivers derive their configuration from these accessors rather
+    /// than hardcoding, so changing the profile here changes every firmware
+    /// target together — with `tdma::Config::default()`, which must be
+    /// resized to match.
     fn default() -> Self {
         Self {
-            spreading_factor: 7,
+            spreading_factor: 9,
             bandwidth_hz: 125_000,
             coding_rate_denominator: 5,
             preamble_symbols: 8,
@@ -113,10 +116,17 @@ mod tests {
 
     #[test]
     fn sf7_reference_values() {
-        let m = Modulation::default();
+        let m = Modulation::new(7, 125_000, 5, 8).unwrap();
         assert_eq!(m.packet_airtime_us(12), 41_216);
         assert_eq!(m.packet_airtime_us(64), 118_016);
         assert_eq!(m.packet_airtime_us(255), 399_616);
+    }
+
+    #[test]
+    fn sf9_profile_reference_values() {
+        let m = Modulation::default();
+        assert_eq!(m.packet_airtime_us(16), 164_864);
+        assert_eq!(m.packet_airtime_us(71), 410_624);
     }
 
     #[test]

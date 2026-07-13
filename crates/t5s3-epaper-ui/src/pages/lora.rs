@@ -37,7 +37,11 @@ const MSG_X: i32 = 30;
 const MSG_Y: i32 = 150;
 const MSG_W: u32 = 480;
 const MSG_H: u32 = 170;
-const LORA_STATUS_Y: i32 = 338;
+// two-line status (see `Mesh::status_line`), wedged between the message box
+// (ends at 320) and the sent list (368).
+const LORA_STATUS_Y: i32 = 322;
+const STATUS_H: u32 = 44;
+const STATUS_LINE_H: i32 = 20;
 pub(crate) const MSG_MAX: usize = 200;
 
 // the send tab's sent-message log, between the status line and the keyboard.
@@ -185,19 +189,27 @@ pub(crate) fn draw_message(display: &mut Display, message: &str) {
     }
 }
 
+// up to two centered lines, split on '\n' (single-line statuses just leave
+// the second row blank).
 fn draw_status_at(display: &mut Display, status: &str, y: i32) {
-    Rectangle::new(Point::new(MSG_X, y), Size::new(MSG_W, 26))
+    Rectangle::new(Point::new(MSG_X, y), Size::new(MSG_W, STATUS_H))
         .into_styled(PrimitiveStyle::with_fill(Gray4::WHITE))
         .draw(display)
         .ok();
-    Text::with_alignment(
-        status,
-        Point::new(crate::layout::SCREEN_W / 2, y + 18),
-        MonoTextStyle::new(&FONT_9X15, Gray4::BLACK),
-        Alignment::Center,
-    )
-    .draw(display)
-    .ok();
+    let font = MonoTextStyle::new(&FONT_9X15, Gray4::BLACK);
+    for (i, line) in status.split('\n').take(2).enumerate() {
+        Text::with_alignment(
+            line,
+            Point::new(
+                crate::layout::SCREEN_W / 2,
+                y + 18 + i as i32 * STATUS_LINE_H,
+            ),
+            font,
+            Alignment::Center,
+        )
+        .draw(display)
+        .ok();
+    }
 }
 
 pub(crate) fn draw_lora_status(display: &mut Display, status: &str, tab: Tab) {
@@ -345,7 +357,7 @@ pub(crate) fn lora_status_native_rect(tab: Tab) -> t5s3_epaper_core::display::Re
         Tab::Send => LORA_STATUS_Y,
         Tab::Recv => RECV_STATUS_Y,
     };
-    screen_to_native_rect(MSG_X, y, MSG_W as i32, 26)
+    screen_to_native_rect(MSG_X, y, MSG_W as i32, STATUS_H as i32)
 }
 
 pub(crate) fn sent_native_rect() -> t5s3_epaper_core::display::Rectangle {

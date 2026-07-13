@@ -164,15 +164,17 @@ impl Config {
 
 impl Default for Config {
     /// The fleet profile every node must share (a mismatched frame layout
-    /// cannot sync). Sized for a small mesh on the SF7/125 kHz defaults:
-    /// 200 ms slots fit a 99-byte payload (169 ms) inside 15 ms guards with
-    /// slack for late transmit starts, and 20 slots make a 4-second frame
-    /// (whole seconds, anchoring at `utc % 4 == 0`), so slot claims, root
-    /// election and text delivery all settle within seconds rather than
-    /// minutes. 3 beacon + 3 contention slots leave 14 data slots.
+    /// cannot sync), sized to [`Modulation::default`]'s SF9/125 kHz: 450 ms
+    /// slots fit a 71-byte payload (411 ms) inside 15 ms guards, and 20
+    /// slots make a 9-second frame (whole seconds, anchoring at
+    /// `utc % 9 == 0`). 3 beacon + 3 contention slots leave 14 data slots.
+    /// See the modulation ladder in nootmesh.md for the slot/frame sizing at
+    /// other spreading factors.
+    ///
+    /// [`Modulation::default`]: crate::airtime::Modulation::default
     fn default() -> Self {
         Self {
-            slot_us: 200_000,
+            slot_us: 450_000,
             slots_per_frame: 20,
             guard_us: 15_000,
             beacon_slots: 3,
@@ -192,17 +194,36 @@ pub(crate) fn test_config() -> Config {
     }
 }
 
+/// The fixed SF7 modulation matching [`test_config`]'s airtime arithmetic,
+/// independent of the deployed [`Modulation`] profile.
+#[cfg(test)]
+pub(crate) fn test_modulation() -> crate::airtime::Modulation {
+    match crate::airtime::Modulation::new(7, 125_000, 5, 8) {
+        Ok(modulation) => modulation,
+        Err(_) => unreachable!("test modulation is valid"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn default_profile_is_4s_20_slots() {
+    fn default_profile_is_9s_20_slots() {
         let config = Config::default();
-        assert_eq!(config, Config::new(200_000, 20, 15_000, 3, 3).unwrap());
-        assert_eq!(config.frame_us(), 4_000_000);
-        assert_eq!(config.frame_seconds(), 4);
+        assert_eq!(config, Config::new(450_000, 20, 15_000, 3, 3).unwrap());
+        assert_eq!(config.frame_us(), 9_000_000);
+        assert_eq!(config.frame_seconds(), 9);
         assert_eq!(config.first_data_slot(), 6);
+        // the profile pair stays workable: the sf9 modulation's packets fit
+        // the slot budget with beacon jitter headroom
+        let engine = crate::tdma::Engine::new(
+            config,
+            crate::airtime::Modulation::default(),
+            crate::NodeId(1),
+            7,
+        );
+        assert!(engine.is_ok());
     }
 
     #[test]

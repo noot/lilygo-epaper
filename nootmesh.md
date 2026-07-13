@@ -27,13 +27,42 @@ The fleet profile is the single point of truth: `nootmesh::tdma::Config::default
 engine and its radio-driver config from them (mismatched nodes cannot sync,
 so nothing else may hardcode modulation or frame layout).
 
-Current profile (915 MHz, SF7, 125 kHz, CR 4/5): 200 ms slots fit a 99-byte
-payload (169 ms) inside 15 ms guards; 20 slots = 4 s frames anchored at
-`utc % 4 == 0`. Texts up to 91 bytes. Sized for a small (~6 node) mesh:
-sync, election and delivery settle in seconds. (An earlier 160 ms × 100 =
-16 s layout is kept as the unit tests' fixed arithmetic base.)
+Current profile (915 MHz, SF9, 125 kHz, CR 4/5): 450 ms slots fit a 71-byte
+payload (411 ms) inside 15 ms guards; 20 slots = 9 s frames anchored at
+`utc % 9 == 0`. Text bodies up to ~44 chars. Chosen for ~2x the range of SF7
+(~+6 dB) at still-tolerable latency; see the modulation ladder below. (An
+earlier SF7 / 160 ms x 100 = 16 s layout is kept as the unit tests' fixed
+arithmetic base.)
 
 Frame layout: `| 0..3 beacon | 3..6 contention (hellos) | 6..20 data |`
+
+### modulation ladder
+
+What each spreading factor would look like for nootmesh, all at BW 125 kHz /
+CR 4/5 with the 20-slot (3 beacon / 3 contention / 14 data) layout, 15 ms
+guards, and slots sized so the max packet plus beacon-jitter headroom fits
+(slot >= 2*(guard + 16-byte airtime); frames padded to whole seconds).
+Link budget and range multipliers are approximate (free-space math; clutter
+compresses it). Every step is a two-line profile change
+(`Modulation::default` + `Config::default`) and a full-fleet reflash —
+mixed spreading factors cannot hear each other at all.
+
+| SF | link vs SF7 | ~range | slot | frame | max packet | max text | per-hop latency |
+|---|---|---|---|---|---|---|---|
+| 7 | — | ~0.5–1 km | 200 ms | 4 s | 99 B | ~73 ch | ≤4 s |
+| 8 | +3 dB | ~1.4x | 300 ms | 6 s | 86 B | ~59 ch | ≤6 s |
+| **9 (current)** | **+6 dB** | **~2x** | **450 ms** | **9 s** | **71 B** | **~44 ch** | **≤9 s** |
+| 10 | +9 dB | ~2.8x | 900 ms | 18 s | 84 B | ~57 ch | ≤18 s |
+| 11 | +11.5 dB | ~3.8x | 1.8 s | 36 s | 76 B | ~49 ch | ≤36 s |
+| 12 | +14 dB | ~5x | 3 s | 60 s | 70 B | ~43 ch | ≤60 s |
+
+Everything scales with the frame: root election, recap replays (one message
+per frame), sync expiry, listen windows. SF11 at these settings is
+Meshtastic-LongFast-class range (their default is SF11/BW250 — same symbol
+rate as SF10/BW125 with ~2.5 dB less sensitivity; they tolerate the airtime
+because managed-flood CSMA has no slots to size). SF12 is telemetry
+territory, not chat. Max packet does not fall monotonically because frames
+are padded to whole seconds — some SFs land more slack than others.
 
 Time sync: one elected root (GPS fix beats none, then lowest id) anchors the
 frame to UTC and floods it via beacons; stratum-k relays rebeacon in slot
@@ -100,7 +129,7 @@ root beacons every frame, relays skip half their turns (seeded per-frame coin,
 stable within a frame), nodes listen 2 frames before their first slot claim,
 slot holders hello every frame (TTL keepalive), saturated nodes fall back to
 random contention-slot hellos. Hellos are trimmed to the slot's airtime budget
-(71 bytes at SF7 defaults).
+(the max-packet column above).
 
 ## chat texts + flooding (wire `Text` + engine outbox/inbox, wire v2)
 
@@ -117,7 +146,7 @@ is GPS-anchored (`None` on free-running meshes — frame numbers have no UTC
 meaning there); it rides unchanged through forwards and replays, so recapped
 messages display their send time, not their arrival time. Outgoing queue
 holds 4 (own + forwards; forwards drop silently when full). Body capped to
-the slot budget (76 bytes at the current profile). Per-slot fragmentation is
+the slot budget (~44 bytes at the current profile). Per-slot fragmentation is
 still future work. The t5s3-epaper-ui lora page is the first consumer (see
 `t5s3-epaper-ui/src/mesh.rs` for the servicing-slice pattern that gives the
 50 ms ui loop millisecond-precise mesh timing).
@@ -237,7 +266,7 @@ message *embeds* a Hello for the same reason.
 Receiver: upsert the sender in the neighbor table; yield own slot claim if an
 outranking (lower-id) claimant appears at 1 or 2 hops.
 
-### Text — chat, flooded (≤ 99 B on air at the current profile)
+### Text — chat, flooded (≤ 71 B on air at the current profile)
 
 ```rust
 Text {
@@ -246,7 +275,7 @@ Text {
     msg_id: u16,            // author-stamped; (origin, msg_id) is the dedup key
     hops: u8,               // relays so far; 0 = straight from the author
     timestamp: Option<u64>, // UTC seconds at origination (None: not GPS-anchored)
-    body: Vec<u8, 127>,     // ≤ 76 B at the current profile (slot budget)
+    body: Vec<u8, 127>,     // ~44 B at the current profile (slot budget)
 }
 ```
 
