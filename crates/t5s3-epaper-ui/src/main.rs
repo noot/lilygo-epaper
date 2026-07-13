@@ -138,8 +138,9 @@ use crate::{
             make_radio,
             message_box_native_rect,
             recv_native_rect,
+            recv_clear_hit,
             recv_scroll_down_hit,
-            recv_scroll_end,
+            recv_scroll_max,
             recv_scroll_up_hit,
             recv_visible_rows,
             sent_native_rect,
@@ -546,6 +547,7 @@ async fn main(spawner: Spawner) -> ! {
     // (in wrapped lines), and the sd chat archive's load-once flag + size.
     let mut lora_tab = LoraTab::Info;
     let mut lora_scroll: usize = 0;
+    let mut recv_clear_armed = false;
     let mut chat_loaded = false;
     let mut chat_size: u64 = 0;
     let mut kb_symbols = false;
@@ -1380,27 +1382,52 @@ async fn main(spawner: Spawner) -> ! {
                         } else if let Some(tab) = tab_hit(sx, sy) {
                             if tab != lora_tab {
                                 lora_tab = tab;
-                                if tab == LoraTab::Recv {
-                                    // open pinned to the newest message
-                                    lora_scroll = recv_scroll_end(&lora_recv);
-                                }
+                                // newest-first: open at the top
+                                lora_scroll = 0;
+                                recv_clear_armed = false;
                                 needs_redraw = true;
                             }
                         } else if lora_tab == LoraTab::Recv {
-                            // page up/down through the wrapped log, one row of
-                            // overlap so context carries across pages
-                            let page = recv_visible_rows() - 1;
-                            let target = if recv_scroll_up_hit(sx, sy) {
-                                Some(lora_scroll.saturating_sub(page))
-                            } else if recv_scroll_down_hit(sx, sy) {
-                                Some((lora_scroll + page).min(recv_scroll_end(&lora_recv)))
-                            } else {
-                                None
-                            };
-                            if let Some(target) = target {
-                                lora_scroll = target;
-                                draw_recv_list(&mut display, &lora_recv, lora_scroll);
+                            if recv_clear_hit(sx, sy) {
+                                if recv_clear_armed {
+                                    // confirmed: wipe the ram log and the sd
+                                    // archive (mesh stores elsewhere are
+                                    // untouched — history returns via recap
+                                    // only as far as relays still hold it)
+                                    lora_recv.clear();
+                                    chatlog::clear(&bus, &mut chat_size);
+                                    lora_scroll = 0;
+                                    recv_clear_armed = false;
+                                } else {
+                                    recv_clear_armed = true;
+                                }
+                                draw_recv_list(
+                                    &mut display,
+                                    &lora_recv,
+                                    lora_scroll,
+                                    recv_clear_armed,
+                                );
                                 display.flush_partial_fast(recv_native_rect()).ok();
+                            } else {
+                                // page up/down through the wrapped log, one
+                                // row of overlap so context carries across
+                                // pages; any tap disarms a pending clear
+                                let page = recv_visible_rows() - 1;
+                                let target = if recv_scroll_up_hit(sx, sy) {
+                                    Some(lora_scroll.saturating_sub(page))
+                                } else if recv_scroll_down_hit(sx, sy) {
+                                    Some((lora_scroll + page).min(recv_scroll_max(&lora_recv)))
+                                } else if recv_clear_armed {
+                                    Some(lora_scroll)
+                                } else {
+                                    None
+                                };
+                                if let Some(target) = target {
+                                    lora_scroll = target;
+                                    recv_clear_armed = false;
+                                    draw_recv_list(&mut display, &lora_recv, lora_scroll, false);
+                                    display.flush_partial_fast(recv_native_rect()).ok();
+                                }
                             }
                         } else if let (LoraTab::Send, Some(key)) =
                             (lora_tab, keyboard::hit(sx, sy, kb_symbols, kb_shift))
@@ -2535,7 +2562,7 @@ async fn main(spawner: Spawner) -> ! {
                         lines.drain(..lines.len() - RECV_MAX);
                     }
                     lora_recv = lines;
-                    lora_scroll = recv_scroll_end(&lora_recv);
+                    lora_scroll = 0;
                 }
                 match make_radio(&bus) {
                     Ok(mut r) => {
@@ -2594,10 +2621,10 @@ async fn main(spawner: Spawner) -> ! {
             }
             if current_screen == Screen::Lora && !needs_redraw {
                 if recv_dirty && lora_tab == LoraTab::Recv {
-                    // follow the conversation: new arrivals pin the view to
-                    // the newest line
-                    lora_scroll = recv_scroll_end(&lora_recv);
-                    draw_recv_list(&mut display, &lora_recv, lora_scroll);
+                    // newest-first: arrivals snap the view back to the top
+                    lora_scroll = 0;
+                    recv_clear_armed = false;
+                    draw_recv_list(&mut display, &lora_recv, lora_scroll, false);
                     display.flush_partial_fast(recv_native_rect()).ok();
                 }
                 let key = m.status_key();

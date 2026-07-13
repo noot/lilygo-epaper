@@ -62,6 +62,10 @@ const SCROLL_W: u32 = 60;
 const SCROLL_BTN_H: u32 = 100;
 const SCROLL_UP_Y: i32 = RECV_TOP;
 const SCROLL_DOWN_Y: i32 = RECV_TOP + (RECV_ROWS - 5) * RECV_ROW_H;
+// delete-history button, between the scroll buttons; first tap arms it
+// ("SURE?"), the second wipes, any other tap disarms.
+const CLEAR_Y: i32 = RECV_TOP + 21 * RECV_ROW_H;
+const CLEAR_H: u32 = 60;
 
 /// received messages kept in ram (and as the sd log's retained tail).
 pub(crate) const RECV_MAX: usize = 120;
@@ -92,11 +96,17 @@ pub(crate) fn recv_scroll_down_hit(sx: i32, sy: i32) -> bool {
         && (SCROLL_DOWN_Y..SCROLL_DOWN_Y + SCROLL_BTN_H as i32).contains(&sy)
 }
 
-/// lines the receive log scrolls over: each entry wrapped to at most two rows
-/// (a stamped max-length text fits in two), continuation rows indented.
+pub(crate) fn recv_clear_hit(sx: i32, sy: i32) -> bool {
+    (SCROLL_X..SCROLL_X + SCROLL_W as i32).contains(&sx)
+        && (CLEAR_Y..CLEAR_Y + CLEAR_H as i32).contains(&sy)
+}
+
+/// lines the receive log scrolls over, newest message first: each entry
+/// wrapped to at most two rows (a stamped max-length text fits in two),
+/// continuation rows indented.
 pub(crate) fn recv_lines(entries: &[String]) -> AVec<String> {
     let mut lines = AVec::new();
-    for entry in entries {
+    for entry in entries.iter().rev() {
         let chars: AVec<char> = entry.chars().collect();
         let first: String = chars.iter().take(RECV_CHARS).collect();
         lines.push(first);
@@ -116,8 +126,8 @@ pub(crate) fn recv_visible_rows() -> usize {
     RECV_ROWS as usize
 }
 
-/// the scroll offset that pins the newest line to the bottom of the view.
-pub(crate) fn recv_scroll_end(entries: &[String]) -> usize {
+/// the largest useful scroll offset (the view showing the oldest lines).
+pub(crate) fn recv_scroll_max(entries: &[String]) -> usize {
     recv_lines(entries).len().saturating_sub(RECV_ROWS as usize)
 }
 
@@ -245,7 +255,12 @@ pub(crate) fn draw_list(display: &mut Display, y: i32, header: &str, items: &[St
 
 /// the receive tab's scrollable log: `scroll` is the first visible wrapped
 /// line. draws the text column, the scroll buttons and a position hint.
-pub(crate) fn draw_recv_list(display: &mut Display, entries: &[String], scroll: usize) {
+pub(crate) fn draw_recv_list(
+    display: &mut Display,
+    entries: &[String],
+    scroll: usize,
+    clear_armed: bool,
+) {
     Rectangle::new(
         Point::new(0, RECV_TOP - 4),
         Size::new(540, (RECV_ROWS * RECV_ROW_H + 8) as u32),
@@ -274,26 +289,37 @@ pub(crate) fn draw_recv_list(display: &mut Display, entries: &[String], scroll: 
         y += RECV_ROW_H;
     }
 
-    // scroll controls, with a "shown/total" hint between them.
+    // scroll controls, a "shown/total" hint, and the armed-to-confirm
+    // history-delete button between them.
     let bold = MonoTextStyle::new(&FONT_9X18_BOLD, Gray4::BLACK);
-    for (label, by) in [("^", SCROLL_UP_Y), ("v", SCROLL_DOWN_Y)] {
-        Rectangle::new(Point::new(SCROLL_X, by), Size::new(SCROLL_W, SCROLL_BTN_H))
+    for (label, by, bh) in [
+        ("^", SCROLL_UP_Y, SCROLL_BTN_H),
+        ("v", SCROLL_DOWN_Y, SCROLL_BTN_H),
+        (if clear_armed { "SURE?" } else { "CLR" }, CLEAR_Y, CLEAR_H),
+    ] {
+        Rectangle::new(Point::new(SCROLL_X, by), Size::new(SCROLL_W, bh))
             .into_styled(
                 PrimitiveStyleBuilder::new()
                     .stroke_color(Gray4::BLACK)
                     .stroke_width(2)
-                    .fill_color(Gray4::WHITE)
+                    .fill_color(if clear_armed && by == CLEAR_Y {
+                        Gray4::new(11)
+                    } else {
+                        Gray4::WHITE
+                    })
                     .build(),
             )
             .draw(display)
             .ok();
+        let style = if by == CLEAR_Y {
+            MonoTextStyle::new(&FONT_6X10, Gray4::BLACK)
+        } else {
+            bold
+        };
         Text::with_alignment(
             label,
-            Point::new(
-                SCROLL_X + SCROLL_W as i32 / 2,
-                by + SCROLL_BTN_H as i32 / 2 + 6,
-            ),
-            bold,
+            Point::new(SCROLL_X + SCROLL_W as i32 / 2, by + bh as i32 / 2 + 4),
+            style,
             Alignment::Center,
         )
         .draw(display)
@@ -317,7 +343,7 @@ pub(crate) fn draw_recv_list(display: &mut Display, entries: &[String], scroll: 
 const INFO_TOP: i32 = 140;
 const INFO_ROW_H: i32 = 20;
 const INFO_ROWS: usize = 22;
-const INFO_H: i32 = 110 + INFO_ROWS as i32 * INFO_ROW_H;
+const INFO_H: i32 = 134 + INFO_ROWS as i32 * INFO_ROW_H;
 
 pub(crate) fn draw_info_tab(display: &mut Display, mesh: Option<&crate::mesh::Mesh>) {
     Rectangle::new(Point::new(0, INFO_TOP - 4), Size::new(540, INFO_H as u32))
@@ -332,34 +358,32 @@ pub(crate) fn draw_info_tab(display: &mut Display, mesh: Option<&crate::mesh::Me
             .ok();
         return;
     };
-    let (line1, line2) = mesh.info_lines();
-    Text::new(&line1, Point::new(24, INFO_TOP + 18), header)
-        .draw(display)
-        .ok();
-    Text::new(&line2, Point::new(24, INFO_TOP + 42), header)
-        .draw(display)
-        .ok();
+    for (i, line) in mesh.info_lines().iter().enumerate() {
+        Text::new(line, Point::new(24, INFO_TOP + 18 + i as i32 * 24), header)
+            .draw(display)
+            .ok();
+    }
     Line::new(
-        Point::new(20, INFO_TOP + 58),
-        Point::new(520, INFO_TOP + 58),
+        Point::new(20, INFO_TOP + 82),
+        Point::new(520, INFO_TOP + 82),
     )
     .into_styled(PrimitiveStyle::with_stroke(Gray4::BLACK, 1))
     .draw(display)
     .ok();
     Text::new(
         "peer                  slot   dBm   heard",
-        Point::new(24, INFO_TOP + 80),
+        Point::new(24, INFO_TOP + 104),
         body,
     )
     .draw(display)
     .ok();
     let rows = mesh.peer_rows();
     if rows.is_empty() {
-        Text::new("no peers heard yet", Point::new(24, INFO_TOP + 104), body)
+        Text::new("no peers heard yet", Point::new(24, INFO_TOP + 128), body)
             .draw(display)
             .ok();
     }
-    let mut y = INFO_TOP + 104;
+    let mut y = INFO_TOP + 128;
     for row in rows.iter().take(INFO_ROWS) {
         Text::new(row, Point::new(24, y), body).draw(display).ok();
         y += INFO_ROW_H;
@@ -394,7 +418,7 @@ pub(crate) fn draw_lora_screen(
             crate::keyboard::draw(display, symbols, shift, "SEND");
         }
         Tab::Recv => {
-            draw_recv_list(display, received, scroll);
+            draw_recv_list(display, received, scroll, false);
         }
     }
 }

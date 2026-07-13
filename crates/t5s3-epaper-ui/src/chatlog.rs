@@ -50,6 +50,25 @@ pub(crate) fn load(bus: &Bus<'static>) -> (Vec<String>, u64) {
     (lines, size)
 }
 
+/// Delete the persisted history (the ram log is the caller's to clear).
+pub(crate) fn clear(bus: &Bus<'static>, size: &mut u64) {
+    let card = match SdCard::new(bus) {
+        Ok(card) => card,
+        Err(e) => {
+            esp_println::println!("chatlog: mount failed: {e:?}");
+            return;
+        }
+    };
+    if !card.exists(PATH).unwrap_or(false) {
+        *size = 0;
+        return;
+    }
+    match card.write_file(PATH, b"") {
+        Ok(()) => *size = 0,
+        Err(e) => esp_println::println!("chatlog: clear failed: {e:?}"),
+    }
+}
+
 /// Append one message line, compacting the file back down to `entries` (the
 /// ram backlog) once it exceeds the growth bound. `size` tracks the file's
 /// length across appends so the bound costs no metadata reads.

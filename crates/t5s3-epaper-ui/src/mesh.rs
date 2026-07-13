@@ -158,8 +158,8 @@ impl Mesh {
         )
     }
 
-    /// The info tab's own-node header lines: mesh state, then counters.
-    pub(crate) fn info_lines(&self) -> (String, String) {
+    /// The info tab's own-node header: identity/role, timeline, counters.
+    pub(crate) fn info_lines(&self) -> [String; 3] {
         let now = now_us();
         let role = match self.engine.root(now) {
             Some((root, _)) if root.0 == self.node_id => String::from("ROOT"),
@@ -178,20 +178,16 @@ impl Mesh {
             Some(dbm) => format!(" | last rx {dbm}dBm"),
             None => String::new(),
         };
-        (
+        [
+            format!("{} | {role}", self.display_name(self.node_id)),
+            format!("{slot} {frame} | peers {}", self.engine.peer_count(now)),
             format!(
-                "{} ({:04x}) | {role}",
-                self.display_name(self.node_id),
-                self.node_id & 0xffff
-            ),
-            format!(
-                "{slot} {frame} | peers {}{rssi} | rx {} tx {} | store {}",
-                self.engine.peer_count(now),
+                "rx {} tx {} | store {}{rssi}",
                 self.rx_count,
                 self.tx_count,
                 self.engine.store_len()
             ),
-        )
+        ]
     }
 
     /// The info tab's peer table, one formatted row per known peer: direct
