@@ -1,0 +1,17 @@
+[package]
+name = "nootmesh"
+description = "no_std mesh protocol over LoRa with TDMA sync, messaging, aliases, and recaps"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/noot/lilygo-epaper"
+
+[dependencies]
+heapless = { version = "0.8", features = ["serde"] }
+postcard = { version = "1", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive"] }
+thiserror = { version = "2.0", default-features = false }
+
+# isolated from the embedded repo root (workspace-excluded) so its tests build
+# for the host with a stable toolchain rather than the esp32 target the root
+# .cargo/config forces on everything beneath it. consumed by the firmware as a
+# no_std path dependency.

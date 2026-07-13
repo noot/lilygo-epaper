@@ -1,0 +1,9 @@
+# build/test this crate for the host, overriding the esp32 target the repo root
+# .cargo/config.toml forces on everything beneath it.
+#
+# note: the root also sets build.rustflags = link-arg=-nostartfiles, and cargo
+# *joins* build.rustflags across config files, so it leaks in here and produces
+# a host test binary that segfaults at link time. it cannot be overridden from a
+# config file, so run tests with `RUSTFLAGS= cargo test` (see the justfile).
+[build]
+target = "x86_64-unknown-linux-gnu"

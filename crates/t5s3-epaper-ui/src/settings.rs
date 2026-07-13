@@ -343,6 +343,12 @@ pub(crate) struct Settings {
     pub(crate) reader_line_spacing: LineSpacing,
     pub(crate) icon_style: IconStyle,
     pub(crate) icon_size: IconSize,
+    /// keep the lora radio and mesh membership alive on every screen (at a
+    /// standing rx current cost), instead of only while the lora page is open.
+    pub(crate) mesh_background: bool,
+    /// mesh display name, flooded as an alias claim; empty = id only.
+    mesh_alias: [u8; ALIAS_CAP],
+    mesh_alias_len: u8,
     wifi_networks: [WifiNetwork; WIFI_NETWORK_CAP],
     wifi_network_count: u8,
 }
@@ -364,6 +370,9 @@ impl Default for Settings {
             reader_line_spacing: LineSpacing::Normal,
             icon_style: IconStyle::Lucide,
             icon_size: IconSize::Regular,
+            mesh_background: false,
+            mesh_alias: [0; ALIAS_CAP],
+            mesh_alias_len: 0,
             wifi_networks,
             wifi_network_count,
         }
@@ -375,14 +384,28 @@ impl Default for Settings {
 // flash, older/newer layout, corruption) falls back to defaults, except the
 // immediately previous version which is migrated (see `decode_v5`).
 const MAGIC: [u8; 2] = [0x54, 0x35];
-const VERSION: u8 = 6;
-// 11 scalar bytes, a saved-network count, then WIFI_NETWORK_CAP fixed-size
-// network entries (ssid len + 32, password len + 64), then a trailing xor
-// checksum.
-const NETWORKS_OFF: usize = 12;
+const VERSION: u8 = 8;
+/// mesh display-name capacity, matching nootmesh's wire cap.
+pub(crate) const ALIAS_CAP: usize = 12;
+// 12 scalar bytes, an alias (len + 12), a saved-network count, then
+// WIFI_NETWORK_CAP fixed-size network entries (ssid len + 32, password len +
+// 64), then a trailing xor checksum.
+const ALIAS_OFF: usize = 12;
+const NETWORKS_OFF: usize = ALIAS_OFF + 1 + ALIAS_CAP + 1;
 const NETWORK_SIZE: usize = 1 + SSID_CAP + 1 + PASSWORD_CAP;
 const CHECKSUM_OFF: usize = NETWORKS_OFF + WIFI_NETWORK_CAP * NETWORK_SIZE;
 const BLOB_LEN: usize = CHECKSUM_OFF + 1;
+
+// the version-7 layout: identical except it lacked the alias field, so the
+// network table sat 13 bytes earlier.
+const V7_VERSION: u8 = 7;
+const V7_NETWORKS_OFF: usize = 13;
+const V7_CHECKSUM_OFF: usize = V7_NETWORKS_OFF + WIFI_NETWORK_CAP * NETWORK_SIZE;
+
+// the version-6 layout: no mesh-background byte either.
+const V6_VERSION: u8 = 6;
+const V6_NETWORKS_OFF: usize = 12;
+const V6_CHECKSUM_OFF: usize = V6_NETWORKS_OFF + WIFI_NETWORK_CAP * NETWORK_SIZE;
 
 // the version-5 single-network layout, kept so an upgraded firmware migrates
 // the previously saved settings instead of dropping them.
@@ -413,7 +436,10 @@ impl Settings {
         buf[8] = self.reader_line_spacing.to_byte();
         buf[9] = self.icon_style.to_byte();
         buf[10] = self.icon_size.to_byte();
-        buf[11] = self.wifi_network_count.min(WIFI_NETWORK_CAP as u8);
+        buf[11] = u8::from(self.mesh_background);
+        buf[ALIAS_OFF] = self.mesh_alias_len.min(ALIAS_CAP as u8);
+        buf[ALIAS_OFF + 1..ALIAS_OFF + 1 + ALIAS_CAP].copy_from_slice(&self.mesh_alias);
+        buf[NETWORKS_OFF - 1] = self.wifi_network_count.min(WIFI_NETWORK_CAP as u8);
         for (i, net) in self.wifi_networks.iter().enumerate() {
             let off = NETWORKS_OFF + i * NETWORK_SIZE;
             buf[off] = net.ssid_len.min(SSID_CAP as u8);
@@ -431,6 +457,12 @@ impl Settings {
         }
         if buf[2] == V5_VERSION {
             return Self::decode_v5(buf);
+        }
+        if buf[2] == V7_VERSION {
+            return Self::decode_v7(buf);
+        }
+        if buf[2] == V6_VERSION {
+            return Self::decode_v6(buf);
         }
         if buf[2] != VERSION {
             return None;
@@ -457,6 +489,79 @@ impl Settings {
             reader_line_spacing: LineSpacing::from_byte(buf[8]),
             icon_style: IconStyle::from_byte(buf[9]),
             icon_size: IconSize::from_byte(buf[10]),
+            mesh_background: buf[11] != 0,
+            mesh_alias: {
+                let mut alias = [0; ALIAS_CAP];
+                alias.copy_from_slice(&buf[ALIAS_OFF + 1..ALIAS_OFF + 1 + ALIAS_CAP]);
+                alias
+            },
+            mesh_alias_len: buf[ALIAS_OFF].min(ALIAS_CAP as u8),
+            wifi_networks,
+            wifi_network_count: buf[NETWORKS_OFF - 1].min(WIFI_NETWORK_CAP as u8),
+        })
+    }
+
+    // migrate a version-7 blob: identical scalars, no alias (empty), network
+    // table 13 bytes earlier.
+    fn decode_v7(buf: &[u8; BLOB_LEN]) -> Option<Self> {
+        let checksum = buf[0..V7_CHECKSUM_OFF].iter().fold(0u8, |acc, &b| acc ^ b);
+        if checksum != buf[V7_CHECKSUM_OFF] {
+            return None;
+        }
+        let mut wifi_networks = [WifiNetwork::EMPTY; WIFI_NETWORK_CAP];
+        for (i, net) in wifi_networks.iter_mut().enumerate() {
+            let off = V7_NETWORKS_OFF + i * NETWORK_SIZE;
+            net.ssid_len = buf[off].min(SSID_CAP as u8);
+            net.ssid.copy_from_slice(&buf[off + 1..off + 1 + SSID_CAP]);
+            net.password_len = buf[off + 1 + SSID_CAP].min(PASSWORD_CAP as u8);
+            net.password
+                .copy_from_slice(&buf[off + 2 + SSID_CAP..off + NETWORK_SIZE]);
+        }
+        Some(Self {
+            tz_offset_hours: buf[3] as i8,
+            time_24h: buf[4] != 0,
+            brightness: buf[5].min(100),
+            reader_font_size: FontSize::from_byte(buf[6]),
+            reader_font_family: FontFamily::from_byte(buf[7]),
+            reader_line_spacing: LineSpacing::from_byte(buf[8]),
+            icon_style: IconStyle::from_byte(buf[9]),
+            icon_size: IconSize::from_byte(buf[10]),
+            mesh_background: buf[11] != 0,
+            mesh_alias: [0; ALIAS_CAP],
+            mesh_alias_len: 0,
+            wifi_networks,
+            wifi_network_count: buf[12].min(WIFI_NETWORK_CAP as u8),
+        })
+    }
+
+    // migrate a version-6 blob: identical scalars, network table one byte
+    // earlier, and no mesh-background flag (defaults off).
+    fn decode_v6(buf: &[u8; BLOB_LEN]) -> Option<Self> {
+        let checksum = buf[0..V6_CHECKSUM_OFF].iter().fold(0u8, |acc, &b| acc ^ b);
+        if checksum != buf[V6_CHECKSUM_OFF] {
+            return None;
+        }
+        let mut wifi_networks = [WifiNetwork::EMPTY; WIFI_NETWORK_CAP];
+        for (i, net) in wifi_networks.iter_mut().enumerate() {
+            let off = V6_NETWORKS_OFF + i * NETWORK_SIZE;
+            net.ssid_len = buf[off].min(SSID_CAP as u8);
+            net.ssid.copy_from_slice(&buf[off + 1..off + 1 + SSID_CAP]);
+            net.password_len = buf[off + 1 + SSID_CAP].min(PASSWORD_CAP as u8);
+            net.password
+                .copy_from_slice(&buf[off + 2 + SSID_CAP..off + NETWORK_SIZE]);
+        }
+        Some(Self {
+            tz_offset_hours: buf[3] as i8,
+            time_24h: buf[4] != 0,
+            brightness: buf[5].min(100),
+            reader_font_size: FontSize::from_byte(buf[6]),
+            reader_font_family: FontFamily::from_byte(buf[7]),
+            reader_line_spacing: LineSpacing::from_byte(buf[8]),
+            icon_style: IconStyle::from_byte(buf[9]),
+            icon_size: IconSize::from_byte(buf[10]),
+            mesh_background: false,
+            mesh_alias: [0; ALIAS_CAP],
+            mesh_alias_len: 0,
             wifi_networks,
             wifi_network_count: buf[11].min(WIFI_NETWORK_CAP as u8),
         })
@@ -488,9 +593,26 @@ impl Settings {
             reader_line_spacing: LineSpacing::from_byte(buf[8]),
             icon_style: IconStyle::from_byte(buf[9]),
             icon_size: IconSize::from_byte(buf[10]),
+            mesh_background: false,
+            mesh_alias: [0; ALIAS_CAP],
+            mesh_alias_len: 0,
             wifi_networks,
             wifi_network_count,
         })
+    }
+
+    // the mesh display name, or "" when unset (id-only display).
+    pub(crate) fn mesh_alias(&self) -> &str {
+        let len = (self.mesh_alias_len as usize).min(ALIAS_CAP);
+        core::str::from_utf8(&self.mesh_alias[..len]).unwrap_or("")
+    }
+
+    pub(crate) fn set_mesh_alias(&mut self, name: &str) {
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(ALIAS_CAP);
+        self.mesh_alias = [0; ALIAS_CAP];
+        self.mesh_alias[..len].copy_from_slice(&bytes[..len]);
+        self.mesh_alias_len = len as u8;
     }
 
     // the most recently used network's SSID, or "" if none is saved (or the

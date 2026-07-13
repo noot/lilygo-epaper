@@ -138,7 +138,8 @@ macro_rules! icon_set {
             | Screen::Reader
             | Screen::SettingsSystem
             | Screen::SettingsReader
-            | Screen::SettingsWifi => return None,
+            | Screen::SettingsWifi
+            | Screen::SettingsMesh => return None,
         }
     };
 }

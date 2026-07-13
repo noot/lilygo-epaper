@@ -212,6 +212,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cobs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "const-default"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1902,6 +1911,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nootmesh"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.8.0",
+ "postcard",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2097,6 +2116,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "postcard"
+version = "1.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6764c3b5dd454e283a30e6dfe78e9b31096d9e32036b5d1eaac7a6119ccb9a24"
+dependencies = [
+ "cobs",
+ "serde",
 ]
 
 [[package]]
@@ -2627,6 +2656,7 @@ dependencies = [
  "embedded-graphics-core",
  "embedded-hal 1.0.0",
  "embedded-hal-bus",
+ "embedded-sdmmc",
  "esp-alloc",
  "esp-backtrace",
  "esp-bootloader-esp-idf",
@@ -2635,6 +2665,7 @@ dependencies = [
  "esp-radio 0.18.0",
  "esp-rtos",
  "heapless 0.9.3",
+ "nootmesh",
  "smoltcp",
  "static_cell",
  "trouble-host",
@@ -2664,6 +2695,7 @@ dependencies = [
  "log",
  "nb 1.1.0",
  "nmea",
+ "nootmesh",
  "static_cell",
  "tinybmp",
  "u8g2-fonts",
@@ -2696,6 +2728,7 @@ dependencies = [
  "heapless 0.8.0",
  "libm",
  "nmea",
+ "nootmesh",
  "rand_core 0.6.4",
  "serde",
  "serde-json-core",

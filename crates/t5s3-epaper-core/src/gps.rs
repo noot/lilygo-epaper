@@ -230,6 +230,15 @@ impl<'a> Gps<'a> {
         self.parser.fix_type
     }
 
+    /// Returns UTC as whole seconds since the Unix epoch, once RMC sentences
+    /// have supplied both time and date. NMEA fractional seconds are
+    /// truncated.
+    pub fn utc_seconds(&self) -> Option<u64> {
+        let time = self.parser.fix_time?;
+        let date = self.parser.fix_date?;
+        u64::try_from(date.and_time(time).and_utc().timestamp()).ok()
+    }
+
     /// Returns the horizontal dilution of precision, if available.
     pub fn hdop(&self) -> Option<f32> {
         self.parser.hdop
