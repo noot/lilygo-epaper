@@ -120,6 +120,7 @@ pub(crate) enum Op {
     Music {
         command: Option<&'static str>,
     },
+    #[cfg(feature = "gps")]
     DownloadMaps {
         tiles: Vec<(u32, String)>,
         max_body: usize,
@@ -131,6 +132,7 @@ pub(crate) enum Host {
     // noot-server (music, environment json, and map tiles).
     Server,
     // an arbitrary public host over verified https (weather api).
+    #[cfg(feature = "gps")]
     External(&'static str),
 }
 
@@ -151,7 +153,9 @@ pub(crate) enum Event {
     MusicDone(Option<MusicSnapshot>),
     // one fetched tile of a bulk download, streamed as it arrives so only one
     // body is ever resident.
+    #[cfg(feature = "gps")]
     Tile { key: u32, body: Vec<u8> },
+    #[cfg(feature = "gps")]
     DownloadDone { fetched: usize },
 }
 
@@ -209,6 +213,7 @@ pub(crate) async fn run() {
             Op::Music { command } => {
                 Event::MusicDone(music_session(wifi, &req.ssid, &req.password, command).await)
             }
+            #[cfg(feature = "gps")]
             Op::DownloadMaps { tiles, max_body } => Event::DownloadDone {
                 fetched: download_maps(wifi, &req.ssid, &req.password, &tiles, max_body).await,
             },
@@ -428,6 +433,7 @@ async fn http_get(
         }
         match host {
             Host::Server => request(stack, "GET", path, max_body).await,
+            #[cfg(feature = "gps")]
             Host::External(h) => request_tls(stack, h, "GET", path, max_body, None).await,
         }
     })
@@ -442,6 +448,7 @@ async fn http_get(
 // consecutive failed tile fetches before a bulk download gives up (the network
 // has clearly gone away, so don't eat the socket timeout for every remaining
 // tile).
+#[cfg(feature = "gps")]
 const MAX_CONSECUTIVE_MISSES: usize = 5;
 
 // GET each map path from noot-server in one session, then power
@@ -451,6 +458,7 @@ const MAX_CONSECUTIVE_MISSES: usize = 5;
 // cache as it arrives, keeping only one tile body resident at a time. stops
 // early after a few consecutive misses or when cancelled. returns the number
 // of tiles fetched.
+#[cfg(feature = "gps")]
 async fn download_maps(
     wifi: esp_hal::peripherals::WIFI<'static>,
     ssid: &str,

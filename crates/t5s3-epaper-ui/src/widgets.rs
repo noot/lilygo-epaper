@@ -183,6 +183,7 @@ pub(crate) fn draw_image_fit(
 // `draw_image_fit` the destination is positioned and sized by the caller (not
 // centered), so tiles can be stitched into a larger view. dithering uses screen
 // coordinates so the pattern stays seamless across adjacent tiles.
+#[cfg(feature = "gps")]
 pub(crate) fn draw_image_scaled(
     display: &mut Display,
     image: &GrayImage,

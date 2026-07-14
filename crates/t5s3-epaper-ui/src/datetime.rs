@@ -63,6 +63,7 @@ pub(crate) fn status_date(clock: &mut Clock, offset_hours: i8) -> Option<(usize,
 
 // weekday index (0 = Sunday) for a gregorian date. used to label forecast days
 // parsed from ISO date strings, without depending on the RTC being synced.
+#[cfg(feature = "gps")]
 pub(crate) fn weekday(year: i64, month: u32, day: u32) -> usize {
     let days = days_from_civil(year, month, day);
     (((days + 4) % 7 + 7) % 7) as usize // 1970-01-01 was a Thursday; 0 = Sunday
@@ -71,6 +72,7 @@ pub(crate) fn weekday(year: i64, month: u32, day: u32) -> usize {
 // days since the unix epoch for a gregorian (year, month, day). inverse of
 // `civil_from_days`.
 // see http://howardhinnant.github.io/date_algorithms.html#days_from_civil
+#[cfg(feature = "gps")]
 fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = (if y >= 0 { y } else { y - 399 }) / 400;

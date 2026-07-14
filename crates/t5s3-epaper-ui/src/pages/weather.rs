@@ -1,47 +1,62 @@
+#[cfg(feature = "gps")]
 use alloc::boxed::Box;
+#[cfg(feature = "gps")]
 use core::fmt::Write as _;
 
+#[cfg(feature = "gps")]
 use embedded_graphics::{
     image::Image,
+    primitives::{PrimitiveStyle, Rectangle},
+};
+use embedded_graphics::{
     mono_font::{
         ascii::{FONT_9X15, FONT_9X18_BOLD},
         MonoTextStyle,
     },
     prelude::*,
-    primitives::{PrimitiveStyle, Rectangle},
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
+#[cfg(feature = "gps")]
 use heapless::{String as HString, Vec as HVec};
+#[cfg(feature = "gps")]
 use serde::Deserialize;
 use t5s3_epaper_core::Display;
+#[cfg(feature = "gps")]
 use tinybmp::Bmp;
+#[cfg(feature = "gps")]
 use u8g2_fonts::{
     fonts,
     types::{FontColor, HorizontalAlignment, VerticalPosition},
     FontRenderer,
 };
 
+#[cfg(feature = "gps")]
+use crate::datetime::{weekday, DAY_NAMES};
+#[cfg(feature = "gps")]
+use crate::fmt::FmtBuf;
 use crate::{
-    datetime::{weekday, DAY_NAMES},
-    fmt::FmtBuf,
     layout::SCREEN_W,
     widgets::{centered, draw_back_button},
 };
 
 // the public forecast api the page fetches from. keyless and reachable over
 // plain http (no TLS), which is all this device's http client speaks.
+#[cfg(feature = "gps")]
 pub(crate) const HOST: &str = "api.open-meteo.com";
 
 // number of forecast days requested and drawn.
+#[cfg(feature = "gps")]
 const FORECAST_DAYS: usize = 3;
 
 // large font for the current temperature. fub42's full latin-1 set includes the
 // degree sign, so the hero reading can show "18°C".
+#[cfg(feature = "gps")]
 static TEMP_FONT: FontRenderer = FontRenderer::new::<fonts::u8g2_font_fub42_tf>();
 
 // the `current` block of an open-meteo forecast response.
 #[derive(Deserialize)]
+#[cfg(feature = "gps")]
 pub(crate) struct Current {
     temperature_2m: f32,
     relative_humidity_2m: f32,
@@ -52,6 +67,7 @@ pub(crate) struct Current {
 
 // the `daily` block: parallel arrays, one entry per forecast day.
 #[derive(Deserialize)]
+#[cfg(feature = "gps")]
 pub(crate) struct Daily {
     time: HVec<HString<12>, FORECAST_DAYS>,
     weather_code: HVec<u16, FORECAST_DAYS>,
@@ -63,6 +79,7 @@ pub(crate) struct Daily {
 // longitude are echoed back (snapped to the model grid) and shown as the place
 // label, since the api returns no place name.
 #[derive(Deserialize)]
+#[cfg(feature = "gps")]
 pub(crate) struct Weather {
     latitude: f32,
     longitude: f32,
@@ -76,12 +93,15 @@ pub(crate) enum View {
     Loading,
     // no GPS position yet, so there are no coordinates to query for.
     NoFix,
+    #[cfg(feature = "gps")]
     Ready(Box<Weather>),
+    #[cfg(feature = "gps")]
     Error,
 }
 
 // the open-meteo request path for a position, asking for the current conditions
 // and a short daily forecast in the location's local timezone.
+#[cfg(feature = "gps")]
 pub(crate) fn path(lat: f64, lon: f64) -> FmtBuf<288> {
     let mut buf = FmtBuf::<288>::new();
     write!(
@@ -96,6 +116,7 @@ pub(crate) fn path(lat: f64, lon: f64) -> FmtBuf<288> {
 }
 
 // parse an open-meteo forecast response body into a view.
+#[cfg(feature = "gps")]
 pub(crate) fn parse(body: &[u8]) -> View {
     match serde_json_core::from_slice::<Weather>(body) {
         Ok((weather, _)) => View::Ready(Box::new(weather)),
@@ -105,6 +126,7 @@ pub(crate) fn parse(body: &[u8]) -> View {
 
 // a short description of a WMO weather interpretation code (as returned in
 // `weather_code`), matching open-meteo's documented code table.
+#[cfg(feature = "gps")]
 fn condition(code: u16) -> &'static str {
     match code {
         0 => "Clear",
@@ -128,6 +150,7 @@ fn condition(code: u16) -> &'static str {
 
 // the abbreviated weekday name for an ISO "YYYY-MM-DD" date, or "" if it does
 // not parse. used to label forecast columns.
+#[cfg(feature = "gps")]
 fn day_label(iso: &str) -> &'static str {
     let parsed = (|| {
         let year = iso.get(0..4)?.parse::<i64>().ok()?;
@@ -157,7 +180,9 @@ pub(crate) fn draw_screen(display: &mut Display, view: &View) {
     match view {
         View::Loading => centered(display, "loading...", 360, label),
         View::NoFix => centered(display, "waiting for GPS fix...", 360, label),
+        #[cfg(feature = "gps")]
         View::Error => centered(display, "could not reach weather service", 360, label),
+        #[cfg(feature = "gps")]
         View::Ready(w) => {
             // place label: the coordinates the forecast is for.
             let mut loc = FmtBuf::<32>::new();
@@ -182,6 +207,7 @@ pub(crate) fn draw_screen(display: &mut Display, view: &View) {
 
 // the current conditions: a large temperature, the condition text, then a row
 // of feels-like / humidity / wind.
+#[cfg(feature = "gps")]
 fn draw_current(display: &mut Display, w: &Weather) {
     draw_weather_icon(display, w.current.weather_code, SCREEN_W / 2, 232, false);
 
@@ -230,6 +256,7 @@ fn draw_current(display: &mut Display, w: &Weather) {
 }
 
 // a divider and the daily forecast, each column day / condition / hi / lo.
+#[cfg(feature = "gps")]
 fn draw_forecast(display: &mut Display, daily: &Daily) {
     Rectangle::new(Point::new(30, 560), Size::new((SCREEN_W - 60) as u32, 2))
         .into_styled(PrimitiveStyle::with_fill(Gray4::new(8)))
@@ -268,6 +295,7 @@ fn draw_forecast(display: &mut Display, daily: &Daily) {
 
 // the small set of lucide pictograms a WMO code maps to.
 #[derive(Clone, Copy)]
+#[cfg(feature = "gps")]
 enum Sky {
     Clear,
     PartlyCloudy,
@@ -278,6 +306,7 @@ enum Sky {
     Storm,
 }
 
+#[cfg(feature = "gps")]
 fn sky(code: u16) -> Sky {
     match code {
         0 | 1 => Sky::Clear,
@@ -293,6 +322,7 @@ fn sky(code: u16) -> Sky {
 
 // blit the lucide weather pictogram for `code` centered at (cx, cy). `small`
 // picks the forecast-column size over the current-conditions size.
+#[cfg(feature = "gps")]
 fn draw_weather_icon(display: &mut Display, code: u16, cx: i32, cy: i32, small: bool) {
     let Ok(bmp) = Bmp::<Gray4>::from_slice(icon_bytes(sky(code), small)) else {
         return;
@@ -302,6 +332,7 @@ fn draw_weather_icon(display: &mut Display, code: u16, cx: i32, cy: i32, small: 
     Image::new(&bmp, top_left).draw(display).ok();
 }
 
+#[cfg(feature = "gps")]
 fn icon_bytes(sky: Sky, small: bool) -> &'static [u8] {
     macro_rules! pick {
         ($cond:literal) => {{

@@ -43,6 +43,8 @@ pub(crate) struct Mesh {
     rx_count: u32,
     tx_count: u32,
     last_rssi_dbm: Option<i16>,
+    /// gps-fed nodes only: the last whole utc second forwarded to the engine.
+    #[cfg(feature = "gps")]
     last_utc_fed: u64,
 }
 
@@ -77,6 +79,7 @@ impl Mesh {
             rx_count: 0,
             tx_count: 0,
             last_rssi_dbm: None,
+            #[cfg(feature = "gps")]
             last_utc_fed: 0,
         })
     }
@@ -87,6 +90,7 @@ impl Mesh {
 
     /// Feed a UTC second freshly parsed from the gps (call only right after a
     /// sentence arrived: a stale value would step the mesh timeline).
+    #[cfg(feature = "gps")]
     pub(crate) fn on_gps_second(&mut self, utc_seconds: u64) {
         if utc_seconds != self.last_utc_fed {
             self.last_utc_fed = utc_seconds;

@@ -18,7 +18,9 @@ mod tls;
 mod widgets;
 mod wifi;
 
-use alloc::{collections::BTreeSet, format, string::String, vec::Vec};
+use alloc::{format, string::String, vec::Vec};
+#[cfg(feature = "gps")]
+use alloc::collections::BTreeSet;
 
 use embassy_executor::Spawner;
 use embassy_time::{with_timeout, Duration, Timer};
@@ -49,10 +51,9 @@ use t5s3_epaper_core::{
     Display,
     DrawMode,
     FrontLight,
-    SdCard,
 };
 #[cfg(feature = "gps")]
-use t5s3_epaper_core::{gps::Gps, gps_pin_config};
+use t5s3_epaper_core::{gps::Gps, gps_pin_config, SdCard};
 
 #[cfg(feature = "gps")]
 use crate::pages::gps::{
@@ -137,8 +138,8 @@ use crate::{
             lora_status_native_rect,
             make_radio,
             message_box_native_rect,
-            recv_native_rect,
             recv_clear_hit,
+            recv_native_rect,
             recv_scroll_down_hit,
             recv_scroll_max,
             recv_scroll_up_hit,
@@ -282,6 +283,7 @@ enum Pending {
         command: Option<music::Button>,
     },
     Environment,
+    #[cfg(feature = "gps")]
     Weather,
     #[cfg(feature = "gps")]
     MapTile {
@@ -834,6 +836,7 @@ async fn main(spawner: Spawner) -> ! {
                             needs_redraw = true;
                         }
                     }
+                    #[cfg(feature = "gps")]
                     Some(Pending::Weather) => {
                         weather.view = match body {
                             Some(body) => weather::parse(&body),
@@ -928,8 +931,6 @@ async fn main(spawner: Spawner) -> ! {
                         gps_map.invalidate();
                     }
                 }
-                #[cfg(not(feature = "gps"))]
-                WifiEvent::Tile { .. } | WifiEvent::DownloadDone { .. } => {}
             }
         }
 
@@ -2722,9 +2723,12 @@ async fn main(spawner: Spawner) -> ! {
     // the current tile); remaining events are drained and dropped.
     if wifi_pending.is_some() {
         wifi::cancel();
+        #[cfg(feature = "gps")]
         while let Ok(WifiEvent::Tile { .. }) =
             with_timeout(Duration::from_secs(30), wifi::next_event()).await
         {}
+        #[cfg(not(feature = "gps"))]
+        let _ = with_timeout(Duration::from_secs(30), wifi::next_event()).await;
     }
 
     // sleep was requested from the Sleep screen. turn the front light off,
