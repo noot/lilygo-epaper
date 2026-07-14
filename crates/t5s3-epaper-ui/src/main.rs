@@ -556,6 +556,11 @@ async fn main(spawner: Spawner) -> ! {
     let mut lora_scroll: usize = 0;
     let mut recv_clear_armed = false;
     let mut recv_fetch_sent = false;
+    // a send was queued and its "queued for our slot" status is showing;
+    // flips the label to "sent" once the engine's outbox drains (nothing
+    // else refreshes the send tab's action line since the info tab took
+    // over the periodic status).
+    let mut lora_send_pending = false;
     let mut chat_loaded = false;
     let mut chat_size: u64 = 0;
     let mut kb_symbols = false;
@@ -1494,6 +1499,7 @@ async fn main(spawner: Spawner) -> ! {
                                                     "mesh queued: {lora_message}"
                                                 );
                                                 lora_status = String::from("queued for our slot");
+                                                lora_send_pending = true;
                                                 let stamp = lora_stamp(&mut clock, &settings);
                                                 lora_sent.push(format!("{stamp}{lora_message}"));
                                                 if lora_sent.len() > LIST_MAX {
@@ -2680,6 +2686,15 @@ async fn main(spawner: Spawner) -> ! {
                 recv_dirty = true;
             }
             if current_screen == Screen::Lora && !needs_redraw {
+                // the queued message went out: let the sender know
+                if lora_send_pending && m.texts_pending() == 0 {
+                    lora_send_pending = false;
+                    lora_status = String::from("sent");
+                    if lora_tab == LoraTab::Send {
+                        draw_lora_status(&mut display, &lora_status);
+                        display.flush_partial_fast(lora_status_native_rect()).ok();
+                    }
+                }
                 if recv_dirty && lora_tab == LoraTab::Recv {
                     // newest-first: arrivals snap the view back to the top
                     lora_scroll = 0;

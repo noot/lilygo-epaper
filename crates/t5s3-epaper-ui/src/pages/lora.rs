@@ -357,7 +357,7 @@ pub(crate) fn draw_recv_list(
 const INFO_TOP: i32 = 140;
 const INFO_ROW_H: i32 = 20;
 const INFO_ROWS: usize = 22;
-const INFO_H: i32 = 154 + INFO_ROWS as i32 * INFO_ROW_H;
+const INFO_H: i32 = 134 + INFO_ROWS as i32 * INFO_ROW_H;
 
 pub(crate) fn draw_info_tab(display: &mut Display, mesh: Option<&crate::mesh::Mesh>) {
     Rectangle::new(Point::new(0, INFO_TOP - 4), Size::new(540, INFO_H as u32))
@@ -403,9 +403,11 @@ pub(crate) fn draw_info_tab(display: &mut Display, mesh: Option<&crate::mesh::Me
         y += INFO_ROW_H;
     }
 
-    // range-edge footnote, derived from the fleet profile so it tracks any
-    // spreading-factor change: heavy loss starts ~10 dB above the floors
-    // (fading swings that much while walking).
+    // range-edge footnote at the very bottom of the screen, derived from the
+    // fleet profile so it tracks any spreading-factor change: heavy loss
+    // starts ~10 dB above the floors (fading swings that much while
+    // walking). static text, so it lives outside the periodic-refresh rect
+    // and is painted by full redraws only.
     let m = Modulation::default();
     let rssi_floor = m.sensitivity_floor_dbm();
     let snr_floor = m.snr_floor_db();
@@ -419,7 +421,7 @@ pub(crate) fn draw_info_tab(display: &mut Display, mesh: Option<&crate::mesh::Me
     );
     Text::new(
         &note,
-        Point::new(24, INFO_TOP + 128 + INFO_ROWS as i32 * INFO_ROW_H + 14),
+        Point::new(24, 946),
         MonoTextStyle::new(&FONT_6X10, Gray4::new(6)),
     )
     .draw(display)

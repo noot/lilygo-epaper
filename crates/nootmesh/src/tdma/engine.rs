@@ -737,6 +737,16 @@ impl Engine {
         self.tx_carries = TxCarries::Nothing;
     }
 
+    /// Own chat texts still waiting for a data slot (excludes forwards and
+    /// alias announcements) — a ui's "sending..." indicator flips to "sent"
+    /// when this reaches zero.
+    pub fn texts_pending(&self) -> usize {
+        self.outbox
+            .iter()
+            .filter(|out| out.origin == self.node_id && matches!(out.kind, OutKind::Text { .. }))
+            .count()
+    }
+
     /// Forget which texts were already delivered, so the next recap replays
     /// them again. Supports an app-level "delete history, then re-fetch"
     /// flow — after the app wipes its log, replays of the deleted messages
@@ -1177,7 +1187,9 @@ mod tests {
             wire::decode(a.packet()),
             Ok(wire::Message::Text(t)) if t.body.as_slice() == b"hi from a"
         ));
+        assert_eq!(a.texts_pending(), 4);
         a.on_transmitted();
+        assert_eq!(a.texts_pending(), 3);
         a.on_transmitted(); // no tx since build: must NOT pop another entry
         let _ = step_to_data_tx(&mut a, at_us + 60_000);
         assert!(matches!(

@@ -147,6 +147,12 @@ impl Mesh {
         self.engine.queue_text(now_us(), body)
     }
 
+    /// Own texts still awaiting a data slot; zero means everything queued
+    /// from this device has gone on the air.
+    pub(crate) fn texts_pending(&self) -> usize {
+        self.engine.texts_pending()
+    }
+
     /// Next received chat text as `(dedup key, author id, origination utc,
     /// lossy utf-8)`. The key packs `(origin, msg_id)`; callers keeping logs
     /// that outlive this engine (reboots, page toggles) deduplicate recap
