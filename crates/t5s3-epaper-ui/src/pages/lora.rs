@@ -62,6 +62,11 @@ const SCROLL_W: u32 = 60;
 const SCROLL_BTN_H: u32 = 100;
 const SCROLL_UP_Y: i32 = RECV_TOP;
 const SCROLL_DOWN_Y: i32 = RECV_TOP + (RECV_ROWS - 5) * RECV_ROW_H;
+// fetch-missing button: an on-demand recap request (relays replay their
+// stored history; dedup keeps only what this node lacks). label flips to
+// SENT until the next redraw.
+const FETCH_Y: i32 = RECV_TOP + 8 * RECV_ROW_H;
+const FETCH_H: u32 = 60;
 // delete-history button, between the scroll buttons; first tap arms it
 // ("SURE?"), the second wipes, any other tap disarms.
 const CLEAR_Y: i32 = RECV_TOP + 21 * RECV_ROW_H;
@@ -99,6 +104,11 @@ pub(crate) fn recv_scroll_down_hit(sx: i32, sy: i32) -> bool {
 pub(crate) fn recv_clear_hit(sx: i32, sy: i32) -> bool {
     (SCROLL_X..SCROLL_X + SCROLL_W as i32).contains(&sx)
         && (CLEAR_Y..CLEAR_Y + CLEAR_H as i32).contains(&sy)
+}
+
+pub(crate) fn recv_fetch_hit(sx: i32, sy: i32) -> bool {
+    (SCROLL_X..SCROLL_X + SCROLL_W as i32).contains(&sx)
+        && (FETCH_Y..FETCH_Y + FETCH_H as i32).contains(&sy)
 }
 
 /// lines the receive log scrolls over, newest message first: each entry
@@ -260,6 +270,7 @@ pub(crate) fn draw_recv_list(
     entries: &[String],
     scroll: usize,
     clear_armed: bool,
+    fetch_sent: bool,
 ) {
     Rectangle::new(
         Point::new(0, RECV_TOP - 4),
@@ -295,6 +306,7 @@ pub(crate) fn draw_recv_list(
     for (label, by, bh) in [
         ("^", SCROLL_UP_Y, SCROLL_BTN_H),
         ("v", SCROLL_DOWN_Y, SCROLL_BTN_H),
+        (if fetch_sent { "SENT" } else { "FETCH" }, FETCH_Y, FETCH_H),
         (if clear_armed { "SURE?" } else { "CLR" }, CLEAR_Y, CLEAR_H),
     ] {
         Rectangle::new(Point::new(SCROLL_X, by), Size::new(SCROLL_W, bh))
@@ -302,16 +314,18 @@ pub(crate) fn draw_recv_list(
                 PrimitiveStyleBuilder::new()
                     .stroke_color(Gray4::BLACK)
                     .stroke_width(2)
-                    .fill_color(if clear_armed && by == CLEAR_Y {
-                        Gray4::new(11)
-                    } else {
-                        Gray4::WHITE
-                    })
+                    .fill_color(
+                        if (clear_armed && by == CLEAR_Y) || (fetch_sent && by == FETCH_Y) {
+                            Gray4::new(11)
+                        } else {
+                            Gray4::WHITE
+                        },
+                    )
                     .build(),
             )
             .draw(display)
             .ok();
-        let style = if by == CLEAR_Y {
+        let style = if by == CLEAR_Y || by == FETCH_Y {
             MonoTextStyle::new(&FONT_6X10, Gray4::BLACK)
         } else {
             bold
@@ -343,7 +357,7 @@ pub(crate) fn draw_recv_list(
 const INFO_TOP: i32 = 140;
 const INFO_ROW_H: i32 = 20;
 const INFO_ROWS: usize = 22;
-const INFO_H: i32 = 134 + INFO_ROWS as i32 * INFO_ROW_H;
+const INFO_H: i32 = 154 + INFO_ROWS as i32 * INFO_ROW_H;
 
 pub(crate) fn draw_info_tab(display: &mut Display, mesh: Option<&crate::mesh::Mesh>) {
     Rectangle::new(Point::new(0, INFO_TOP - 4), Size::new(540, INFO_H as u32))
@@ -371,7 +385,7 @@ pub(crate) fn draw_info_tab(display: &mut Display, mesh: Option<&crate::mesh::Me
     .draw(display)
     .ok();
     Text::new(
-        "peer                  slot   dBm   heard",
+        "peer                  slot   dBm   snr  heard",
         Point::new(24, INFO_TOP + 104),
         body,
     )
@@ -388,6 +402,28 @@ pub(crate) fn draw_info_tab(display: &mut Display, mesh: Option<&crate::mesh::Me
         Text::new(row, Point::new(24, y), body).draw(display).ok();
         y += INFO_ROW_H;
     }
+
+    // range-edge footnote, derived from the fleet profile so it tracks any
+    // spreading-factor change: heavy loss starts ~10 dB above the floors
+    // (fading swings that much while walking).
+    let m = Modulation::default();
+    let rssi_floor = m.sensitivity_floor_dbm();
+    let snr_floor = m.snr_floor_db();
+    let note = format!(
+        "link holds above ~{}dBm / {}dB snr; gone near {}dBm / {}dB (sf{})",
+        rssi_floor + 10,
+        snr_floor + 10,
+        rssi_floor,
+        snr_floor,
+        m.spreading_factor()
+    );
+    Text::new(
+        &note,
+        Point::new(24, INFO_TOP + 128 + INFO_ROWS as i32 * INFO_ROW_H + 14),
+        MonoTextStyle::new(&FONT_6X10, Gray4::new(6)),
+    )
+    .draw(display)
+    .ok();
 }
 
 pub(crate) fn info_native_rect() -> t5s3_epaper_core::display::Rectangle {
@@ -418,7 +454,7 @@ pub(crate) fn draw_lora_screen(
             crate::keyboard::draw(display, symbols, shift, "SEND");
         }
         Tab::Recv => {
-            draw_recv_list(display, received, scroll, false);
+            draw_recv_list(display, received, scroll, false, false);
         }
     }
 }

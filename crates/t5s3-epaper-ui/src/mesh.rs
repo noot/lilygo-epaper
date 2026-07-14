@@ -43,6 +43,7 @@ pub(crate) struct Mesh {
     rx_count: u32,
     tx_count: u32,
     last_rssi_dbm: Option<i16>,
+    last_snr_db: Option<i16>,
     /// gps-fed nodes only: the last whole utc second forwarded to the engine.
     #[cfg(feature = "gps")]
     last_utc_fed: u64,
@@ -79,6 +80,7 @@ impl Mesh {
             rx_count: 0,
             tx_count: 0,
             last_rssi_dbm: None,
+            last_snr_db: None,
             #[cfg(feature = "gps")]
             last_utc_fed: 0,
         })
@@ -124,6 +126,19 @@ impl Mesh {
         }
     }
 
+    /// On-demand history fetch: store nodes in range replay what they hold
+    /// and dedup keeps only what this node is missing.
+    pub(crate) fn request_recap(&mut self) {
+        self.engine.request_recap();
+    }
+
+    /// Forget delivered-message state, paired with the ui's history delete:
+    /// without it a subsequent fetch would be silently deduplicated against
+    /// messages the user just erased.
+    pub(crate) fn clear_seen(&mut self) {
+        self.engine.clear_seen();
+    }
+
     pub(crate) fn max_text_len(&self) -> usize {
         self.engine.max_text_len()
     }
@@ -132,14 +147,18 @@ impl Mesh {
         self.engine.queue_text(now_us(), body)
     }
 
-    /// Next received chat text as `(author id, origination utc, lossy utf-8)`.
-    pub(crate) fn take_text(&mut self) -> Option<(u32, Option<u64>, String)> {
+    /// Next received chat text as `(dedup key, author id, origination utc,
+    /// lossy utf-8)`. The key packs `(origin, msg_id)`; callers keeping logs
+    /// that outlive this engine (reboots, page toggles) deduplicate recap
+    /// replays with it.
+    pub(crate) fn take_text(&mut self) -> Option<(u64, u32, Option<u64>, String)> {
         self.engine.take_text().map(|incoming| {
             let text = match core::str::from_utf8(&incoming.body) {
                 Ok(s) => String::from(s),
                 Err(_) => String::from("<binary>"),
             };
-            (incoming.from.0, incoming.utc_seconds, text)
+            let key = (u64::from(incoming.from.0) << 16) | u64::from(incoming.msg_id);
+            (key, incoming.from.0, incoming.utc_seconds, text)
         })
     }
 
@@ -178,9 +197,9 @@ impl Mesh {
             Some(p) => format!("f {}", p.frame_number),
             None => String::new(),
         };
-        let rssi = match self.last_rssi_dbm {
-            Some(dbm) => format!(" | last rx {dbm}dBm"),
-            None => String::new(),
+        let rssi = match (self.last_rssi_dbm, self.last_snr_db) {
+            (Some(dbm), Some(snr)) => format!(" | last rx {dbm}dBm {snr}dB snr"),
+            _ => String::new(),
         };
         [
             format!("{} | {role}", self.display_name(self.node_id)),
@@ -205,15 +224,17 @@ impl Mesh {
                 Some(slot) => format!("{slot}"),
                 None => String::from("--"),
             };
-            let row = match (peer.rssi_dbm, peer.heard_age_us, peer.via) {
-                (Some(dbm), Some(age), _) => {
+            let row = match (peer.rssi_dbm, peer.snr_db, peer.heard_age_us) {
+                (Some(dbm), Some(snr), Some(age)) => {
                     let age_s = age / 1_000_000;
-                    format!("{name:<22}{slot:<7}{dbm:<6}{age_s}s ago")
+                    format!("{name:<22}{slot:<7}{dbm:<6}{snr:<5}{age_s}s ago")
                 }
-                (_, _, Some(via)) => {
-                    format!("{name:<22}{slot:<7}via {}", self.display_name(via.0))
-                }
-                _ => format!("{name:<22}{slot}"),
+                _ => match peer.via {
+                    Some(via) => {
+                        format!("{name:<22}{slot:<7}via {}", self.display_name(via.0))
+                    }
+                    None => format!("{name:<22}{slot}"),
+                },
             };
             rows.push(row);
         }
@@ -312,14 +333,16 @@ impl Mesh {
                 Ok(Some(n)) => {
                     self.rx_count = self.rx_count.wrapping_add(1);
                     self.last_rssi_dbm = Some(radio.rssi());
+                    self.last_snr_db = Some(radio.snr());
                     let rssi = radio.rssi();
+                    let snr = radio.snr();
                     if was_stale {
                         if let Ok(wire::Message::Beacon(_)) = wire::decode(&buf[..n]) {
                             esp_println::println!("mesh: dropped stale-timestamped beacon");
                             continue;
                         }
                     }
-                    match self.engine.on_packet(t, &buf[..n], rssi) {
+                    match self.engine.on_packet(t, &buf[..n], rssi, snr) {
                         Ok(received) => esp_println::println!(
                             "mesh rx {n}B {received} rssi {} dBm snr {} dB",
                             radio.rssi(),

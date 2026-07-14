@@ -18,9 +18,9 @@ mod tls;
 mod widgets;
 mod wifi;
 
-use alloc::{format, string::String, vec::Vec};
 #[cfg(feature = "gps")]
 use alloc::collections::BTreeSet;
+use alloc::{format, string::String, vec::Vec};
 
 use embassy_executor::Spawner;
 use embassy_time::{with_timeout, Duration, Timer};
@@ -139,6 +139,7 @@ use crate::{
             make_radio,
             message_box_native_rect,
             recv_clear_hit,
+            recv_fetch_hit,
             recv_native_rect,
             recv_scroll_down_hit,
             recv_scroll_max,
@@ -534,6 +535,10 @@ async fn main(spawner: Spawner) -> ! {
     let mut lora_status = String::from("type a message, then SEND");
     let mut lora_sent: Vec<String> = Vec::new();
     let mut lora_recv: Vec<String> = Vec::new();
+    // dedup keys parallel to lora_recv ((origin, msg_id) packed; 0 = keyless
+    // own lines): the engine forgets its seen-cache at reboot/page toggle, so
+    // recap replays of already-logged messages must be dropped here.
+    let mut lora_recv_keys: Vec<u64> = Vec::new();
     let mut radio: Option<Lora<'_, 'static>> = None;
     let mut lora_mesh: Option<mesh::Mesh> = None;
     let mut radio_tried = false;
@@ -550,6 +555,7 @@ async fn main(spawner: Spawner) -> ! {
     let mut lora_tab = LoraTab::Info;
     let mut lora_scroll: usize = 0;
     let mut recv_clear_armed = false;
+    let mut recv_fetch_sent = false;
     let mut chat_loaded = false;
     let mut chat_size: u64 = 0;
     let mut kb_symbols = false;
@@ -1386,27 +1392,51 @@ async fn main(spawner: Spawner) -> ! {
                                 // newest-first: open at the top
                                 lora_scroll = 0;
                                 recv_clear_armed = false;
+                                recv_fetch_sent = false;
                                 needs_redraw = true;
                             }
                         } else if lora_tab == LoraTab::Recv {
-                            if recv_clear_hit(sx, sy) {
+                            if recv_fetch_hit(sx, sy) {
+                                if let Some(m) = &mut lora_mesh {
+                                    m.request_recap();
+                                    esp_println::println!("mesh: manual recap requested");
+                                    recv_fetch_sent = true;
+                                }
+                                recv_clear_armed = false;
+                                draw_recv_list(
+                                    &mut display,
+                                    &lora_recv,
+                                    lora_scroll,
+                                    false,
+                                    recv_fetch_sent,
+                                );
+                                display.flush_partial_fast(recv_native_rect()).ok();
+                            } else if recv_clear_hit(sx, sy) {
                                 if recv_clear_armed {
                                     // confirmed: wipe the ram log and the sd
                                     // archive (mesh stores elsewhere are
                                     // untouched — history returns via recap
                                     // only as far as relays still hold it)
                                     lora_recv.clear();
+                                    lora_recv_keys.clear();
                                     chatlog::clear(&bus, &mut chat_size);
+                                    // deleting history also forgets delivery
+                                    // state, so a fetch can repopulate
+                                    if let Some(m) = &mut lora_mesh {
+                                        m.clear_seen();
+                                    }
                                     lora_scroll = 0;
                                     recv_clear_armed = false;
                                 } else {
                                     recv_clear_armed = true;
                                 }
+                                recv_fetch_sent = false;
                                 draw_recv_list(
                                     &mut display,
                                     &lora_recv,
                                     lora_scroll,
                                     recv_clear_armed,
+                                    false,
                                 );
                                 display.flush_partial_fast(recv_native_rect()).ok();
                             } else {
@@ -1426,7 +1456,14 @@ async fn main(spawner: Spawner) -> ! {
                                 if let Some(target) = target {
                                     lora_scroll = target;
                                     recv_clear_armed = false;
-                                    draw_recv_list(&mut display, &lora_recv, lora_scroll, false);
+                                    recv_fetch_sent = false;
+                                    draw_recv_list(
+                                        &mut display,
+                                        &lora_recv,
+                                        lora_scroll,
+                                        false,
+                                        false,
+                                    );
                                     display.flush_partial_fast(recv_native_rect()).ok();
                                 }
                             }
@@ -1465,13 +1502,17 @@ async fn main(spawner: Spawner) -> ! {
                                                 // own messages join the receive
                                                 // tab's timeline and the sd log
                                                 let line = format!("{stamp}me: {lora_message}");
+                                                lora_recv_keys.push(0);
                                                 lora_recv.push(line.clone());
                                                 if lora_recv.len() > RECV_MAX {
+                                                    lora_recv_keys.remove(0);
                                                     lora_recv.remove(0);
                                                 }
                                                 chatlog::append(
                                                     &bus,
+                                                    0,
                                                     &line,
+                                                    &lora_recv_keys,
                                                     &lora_recv,
                                                     &mut chat_size,
                                                 );
@@ -2556,12 +2597,15 @@ async fn main(spawner: Spawner) -> ! {
                 // before live traffic starts appending to it
                 if !chat_loaded {
                     chat_loaded = true;
-                    let (mut lines, size) = chatlog::load(&bus);
+                    let (mut keys, mut lines, size) = chatlog::load(&bus);
                     chat_size = size;
+                    keys.append(&mut lora_recv_keys);
                     lines.append(&mut lora_recv);
                     if lines.len() > RECV_MAX {
+                        keys.drain(..keys.len() - RECV_MAX);
                         lines.drain(..lines.len() - RECV_MAX);
                     }
+                    lora_recv_keys = keys;
                     lora_recv = lines;
                     lora_scroll = 0;
                 }
@@ -2605,7 +2649,13 @@ async fn main(spawner: Spawner) -> ! {
         if let (Some(r), Some(m)) = (&mut radio, &mut lora_mesh) {
             m.service(r);
             let mut recv_dirty = false;
-            while let Some((from, utc, text)) = m.take_text() {
+            while let Some((key, from, utc, text)) = m.take_text() {
+                // the log outlives the engine's seen-cache: drop recap
+                // replays of messages already restored from the sd archive
+                if lora_recv_keys.contains(&key) {
+                    esp_println::println!("mesh text from {from:08x} already logged");
+                    continue;
+                }
                 esp_println::println!("mesh text from {from:08x}: {text}");
                 // claimed name plus id tail when known, bare id otherwise
                 let line = format!(
@@ -2613,11 +2663,20 @@ async fn main(spawner: Spawner) -> ! {
                     mesh_stamp(&mut clock, &settings, utc),
                     m.display_name(from)
                 );
+                lora_recv_keys.push(key);
                 lora_recv.push(line.clone());
                 if lora_recv.len() > RECV_MAX {
+                    lora_recv_keys.remove(0);
                     lora_recv.remove(0);
                 }
-                chatlog::append(&bus, &line, &lora_recv, &mut chat_size);
+                chatlog::append(
+                    &bus,
+                    key,
+                    &line,
+                    &lora_recv_keys,
+                    &lora_recv,
+                    &mut chat_size,
+                );
                 recv_dirty = true;
             }
             if current_screen == Screen::Lora && !needs_redraw {
@@ -2625,7 +2684,8 @@ async fn main(spawner: Spawner) -> ! {
                     // newest-first: arrivals snap the view back to the top
                     lora_scroll = 0;
                     recv_clear_armed = false;
-                    draw_recv_list(&mut display, &lora_recv, lora_scroll, false);
+                    recv_fetch_sent = false;
+                    draw_recv_list(&mut display, &lora_recv, lora_scroll, false, false);
                     display.flush_partial_fast(recv_native_rect()).ok();
                 }
                 let key = m.status_key();

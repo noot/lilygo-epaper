@@ -30,6 +30,7 @@ use embedded_hal_bus::spi::RefCellDevice;
 use embedded_sdmmc::{Mode as SdMode, VolumeIdx};
 use esp_backtrace as _;
 use esp_hal::{
+    analog::adc::{Adc, AdcConfig, Attenuation},
     delay::Delay,
     efuse::{self, InterfaceMacAddress},
     gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
@@ -166,6 +167,37 @@ where
     true
 }
 
+/// battery voltage in millivolts: GPIO1 nominally reads the pack through a
+/// 2:1 divider (Meshtastic's multiplier for the base T3-S3 is 2.11), sampled
+/// at 11 dB attenuation (~3.1 V full scale, uncalibrated). None when the ADC
+/// never settles OR reads railed at full scale — observed on the e-paper
+/// PCB revision, where the pin sits at the 3.3 V rail instead of half the
+/// pack voltage (the divider ratio in vendor headers is marked "assumption"
+/// and appears not to hold here); a railed sample would display as a bogus
+/// ~6.5 V. the raw value is logged for pcb-revision forensics.
+fn battery_mv<'a, PIN, ADCI, CS>(
+    adc: &mut Adc<'a, ADCI, esp_hal::Blocking>,
+    pin: &mut esp_hal::analog::adc::AdcPin<PIN, ADCI, CS>,
+) -> Option<u32>
+where
+    PIN: esp_hal::analog::adc::AdcChannel,
+    ADCI: esp_hal::analog::adc::RegisterAccess + 'a,
+    CS: esp_hal::analog::adc::AdcCalScheme<ADCI>,
+{
+    for _ in 0..100 {
+        if let Ok(raw) = adc.read_oneshot(pin) {
+            let pin_mv = u32::from(raw) * 3100 / 4095;
+            let vbat_mv = pin_mv * 211 / 100;
+            println!("batt: raw {raw} pin {pin_mv}mV -> {vbat_mv}mV");
+            if raw >= 4090 {
+                return None;
+            }
+            return Some(vbat_mv);
+        }
+    }
+    None
+}
+
 /// microseconds since boot; the engine's monotonic clock.
 fn now_us() -> u64 {
     Instant::now().duration_since_epoch().as_micros()
@@ -226,6 +258,11 @@ fn main() -> ! {
         peripherals.GPIO33,
         InputConfig::default().with_pull(Pull::None),
     );
+    // battery sense: gpio1 through the board's divider into adc1.
+    let mut adc_config = AdcConfig::new();
+    let mut bat_pin = adc_config.enable_pin(peripherals.GPIO1, Attenuation::_11dB);
+    let mut adc = Adc::new(peripherals.ADC1, adc_config);
+
     // power the radio's oscillator rail (gpio35); see the rx example.
     let _radio_pow = Output::new(peripherals.GPIO35, Level::High, OutputConfig::default());
     Delay::new().delay_ms(10);
@@ -335,7 +372,17 @@ fn main() -> ! {
     );
 
     display.init().unwrap();
-    render_status(&mut display, node_id, &engine, now_us(), 0, 0, None, "");
+    render_status(
+        &mut display,
+        node_id,
+        &engine,
+        now_us(),
+        0,
+        0,
+        None,
+        battery_mv(&mut adc, &mut bat_pin),
+        "",
+    );
     display.refresh().unwrap();
 
     radio.start_receive().unwrap();
@@ -345,7 +392,7 @@ fn main() -> ! {
     let mut rx_count: u32 = 0;
     let mut tx_count: u32 = 0;
     let mut refreshes: u32 = 0;
-    let mut last_rssi_dbm: Option<i16> = None;
+    let mut last_signal: Option<(i16, i16)> = None;
     let mut last_text = FmtBuf::new();
 
     loop {
@@ -383,8 +430,8 @@ fn main() -> ! {
                 Ok(Some(info)) => {
                     got_packet = true;
                     rx_count = rx_count.wrapping_add(1);
-                    last_rssi_dbm = Some(info.rssi_dbm);
-                    match engine.on_packet(t, &buf[..info.len], info.rssi_dbm) {
+                    last_signal = Some((info.rssi_dbm, info.snr_db));
+                    match engine.on_packet(t, &buf[..info.len], info.rssi_dbm, info.snr_db) {
                         Ok(received) => println!(
                             "rx {}B {received} rssi {} dBm snr {} dB",
                             info.len, info.rssi_dbm, info.snr_db
@@ -429,7 +476,8 @@ fn main() -> ! {
                     now_us(),
                     rx_count,
                     tx_count,
-                    last_rssi_dbm,
+                    last_signal,
+                    battery_mv(&mut adc, &mut bat_pin),
                     last_text.as_str(),
                 );
                 let _ = display.refresh_partial();
@@ -499,7 +547,8 @@ fn main() -> ! {
                 now_us(),
                 rx_count,
                 tx_count,
-                last_rssi_dbm,
+                last_signal,
+                battery_mv(&mut adc, &mut bat_pin),
                 last_text.as_str(),
             );
             refreshes = refreshes.wrapping_add(1);
@@ -521,7 +570,8 @@ fn render_status<D>(
     now_us: u64,
     rx_count: u32,
     tx_count: u32,
-    last_rssi_dbm: Option<i16>,
+    last_signal: Option<(i16, i16)>,
+    battery_mv: Option<u32>,
     last_text: &str,
 ) where
     D: DrawTarget<Color = BinaryColor>,
@@ -555,8 +605,8 @@ fn render_status<D>(
         }
     }
     let _ = write!(line2, "  peers {}", engine.peer_count(now_us));
-    if let Some(dbm) = last_rssi_dbm {
-        let _ = write!(line2, " {dbm}dBm");
+    if let Some((dbm, snr)) = last_signal {
+        let _ = write!(line2, " {dbm}dBm {snr}dB");
     }
     let mut line3 = FmtBuf::new();
     let _ = write!(
@@ -564,6 +614,16 @@ fn render_status<D>(
         "rx {rx_count}  tx {tx_count}  store {}",
         engine.store_len()
     );
+    match battery_mv {
+        Some(mv) => {
+            // 3.30 V empty to 4.20 V full, the usual crude lipo estimate
+            let pct = (mv.saturating_sub(3300) * 100 / 900).min(100);
+            let _ = write!(line3, "  {}.{:02}V {pct}%", mv / 1000, (mv % 1000) / 10);
+        }
+        None => {
+            let _ = write!(line3, "  batt n/a");
+        }
+    }
 
     let _ = display.clear(BinaryColor::Off);
     let _ = Text::new("nootmesh", Point::new(8, 24), title_style).draw(display);

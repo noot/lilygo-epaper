@@ -203,7 +203,7 @@ fn main() -> ! {
                 Ok(Some(n)) => {
                     replan = true;
                     rx_count = rx_count.wrapping_add(1);
-                    match engine.on_packet(t, &buf[..n], radio.rssi()) {
+                    match engine.on_packet(t, &buf[..n], radio.rssi(), radio.snr()) {
                         Ok(received) => println!(
                             "rx {}B {received} rssi {} dBm snr {} dB",
                             n,

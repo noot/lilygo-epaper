@@ -1,12 +1,14 @@
 //! SD-card persistence for the mesh chat log.
 //!
 //! Every message shown on the receive tab (and each one sent) is appended as
-//! a line to `MESH/CHAT.LOG`, already carrying its display stamp, so the log
-//! survives sleep and reboots. At load time the tail of the file becomes the
-//! receive tab's backlog; when the file outgrows its bound it is compacted
-//! down to that same tail, keeping writes cheap (one append per message)
-//! without unbounded growth. A missing or unreadable card degrades to
-//! RAM-only chat.
+//! a record to `MESH/CHAT.LOG`: a 16-hex `(origin, msg_id)` dedup key, `|`,
+//! then the display line with its stamp. The keys make the log's dedup
+//! outlive the engine — after a reboot a recap replays the relays' last 24 h,
+//! and without persisted keys those arrivals would duplicate the restored
+//! backlog (0 = keyless, e.g. own sent lines, exempt from matching). At load
+//! time the tail becomes the receive tab's backlog; past the size bound the
+//! file is compacted down to that same tail. A missing or unreadable card
+//! degrades to RAM-only chat.
 
 use alloc::{string::String, vec::Vec};
 
@@ -21,33 +23,48 @@ const PATH: &str = "MESH/CHAT.LOG";
 /// what the ram backlog retains, so compaction is rare.
 const MAX_BYTES: u64 = 128 * 1024;
 
-/// Read the retained tail of the chat log, and its current size for the
-/// append-side growth accounting.
-pub(crate) fn load(bus: &Bus<'static>) -> (Vec<String>, u64) {
+/// Read the retained tail of the chat log as parallel key + display-line
+/// vectors, and its size for the append-side growth accounting. Records
+/// without a key prefix (pre-key logs) load as keyless.
+pub(crate) fn load(bus: &Bus<'static>) -> (Vec<u64>, Vec<String>, u64) {
     let card = match SdCard::new(bus) {
         Ok(card) => card,
         Err(e) => {
             esp_println::println!("chatlog: mount failed: {e:?}");
-            return (Vec::new(), 0);
+            return (Vec::new(), Vec::new(), 0);
         }
     };
     if !card.exists(PATH).unwrap_or(false) {
-        return (Vec::new(), 0);
+        return (Vec::new(), Vec::new(), 0);
     }
     let bytes = match card.read_file(PATH) {
         Ok(bytes) => bytes,
         Err(e) => {
             esp_println::println!("chatlog: read failed: {e:?}");
-            return (Vec::new(), 0);
+            return (Vec::new(), Vec::new(), 0);
         }
     };
     let size = bytes.len() as u64;
     let text = String::from_utf8_lossy(&bytes);
-    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+    let mut keys = Vec::new();
+    let mut lines = Vec::new();
+    for record in text.lines() {
+        match record.split_once('|') {
+            Some((key, line)) if key.len() == 16 => {
+                keys.push(u64::from_str_radix(key, 16).unwrap_or(0));
+                lines.push(String::from(line));
+            }
+            _ => {
+                keys.push(0);
+                lines.push(String::from(record));
+            }
+        }
+    }
     if lines.len() > RECV_MAX {
+        keys.drain(..keys.len() - RECV_MAX);
         lines.drain(..lines.len() - RECV_MAX);
     }
-    (lines, size)
+    (keys, lines, size)
 }
 
 /// Delete the persisted history (the ram log is the caller's to clear).
@@ -69,10 +86,18 @@ pub(crate) fn clear(bus: &Bus<'static>, size: &mut u64) {
     }
 }
 
-/// Append one message line, compacting the file back down to `entries` (the
-/// ram backlog) once it exceeds the growth bound. `size` tracks the file's
-/// length across appends so the bound costs no metadata reads.
-pub(crate) fn append(bus: &Bus<'static>, line: &str, entries: &[String], size: &mut u64) {
+/// Append one keyed message record, compacting the file back down to the ram
+/// backlog (`keys` zipped with `lines`) once it exceeds the growth bound.
+/// `size` tracks the file's length across appends so the bound costs no
+/// metadata reads.
+pub(crate) fn append(
+    bus: &Bus<'static>,
+    key: u64,
+    line: &str,
+    keys: &[u64],
+    lines: &[String],
+    size: &mut u64,
+) {
     let card = match SdCard::new(bus) {
         Ok(card) => card,
         Err(e) => {
@@ -83,9 +108,8 @@ pub(crate) fn append(bus: &Bus<'static>, line: &str, entries: &[String], size: &
     card.create_dir_all(DIR).ok();
     if *size > MAX_BYTES {
         let mut compacted = String::new();
-        for entry in entries {
-            compacted.push_str(entry);
-            compacted.push('\n');
+        for (entry_key, entry) in keys.iter().zip(lines) {
+            compacted.push_str(&alloc::format!("{entry_key:016x}|{entry}\n"));
         }
         match card.write_file(PATH, compacted.as_bytes()) {
             Ok(()) => *size = compacted.len() as u64,
@@ -93,9 +117,7 @@ pub(crate) fn append(bus: &Bus<'static>, line: &str, entries: &[String], size: &
         }
         return;
     }
-    let mut record = String::with_capacity(line.len() + 1);
-    record.push_str(line);
-    record.push('\n');
+    let record = alloc::format!("{key:016x}|{line}\n");
     match card.append_file(PATH, record.as_bytes()) {
         Ok(()) => *size += record.len() as u64,
         Err(e) => esp_println::println!("chatlog: append failed: {e:?}"),

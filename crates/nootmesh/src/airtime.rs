@@ -75,6 +75,27 @@ impl Modulation {
 }
 
 impl Modulation {
+    /// The demodulation SNR limit for this spreading factor (LoRa decodes
+    /// below the noise floor; the limit deepens ~2.5 dB per SF step). Below
+    /// this, packets are gone. Rounded toward zero from the datasheet's
+    /// half-dB values.
+    pub fn snr_floor_db(&self) -> i16 {
+        (100 - 25 * i16::from(self.spreading_factor)) / 10
+    }
+
+    /// The receive sensitivity floor in dBm: thermal noise in this bandwidth
+    /// plus a typical SX126x noise figure (6 dB), plus the SNR limit.
+    /// Signals below this cannot be received at all; expect heavy loss
+    /// within ~10 dB above it (fading swings that much while walking).
+    pub fn sensitivity_floor_dbm(&self) -> i16 {
+        let bw_db = match self.bandwidth_hz {
+            250_000 => 54,
+            500_000 => 57,
+            _ => 51,
+        };
+        -174 + bw_db + 6 + self.snr_floor_db()
+    }
+
     pub fn spreading_factor(&self) -> u8 {
         self.spreading_factor
     }
@@ -127,6 +148,18 @@ mod tests {
         let m = Modulation::default();
         assert_eq!(m.packet_airtime_us(16), 164_864);
         assert_eq!(m.packet_airtime_us(71), 410_624);
+        assert_eq!(m.snr_floor_db(), -12);
+        assert_eq!(m.sensitivity_floor_dbm(), -129);
+    }
+
+    #[test]
+    fn link_floors_deepen_with_sf() {
+        let sf7 = Modulation::new(7, 125_000, 5, 8).unwrap();
+        assert_eq!(sf7.snr_floor_db(), -7);
+        assert_eq!(sf7.sensitivity_floor_dbm(), -124);
+        let sf12 = Modulation::new(12, 125_000, 5, 8).unwrap();
+        assert_eq!(sf12.snr_floor_db(), -20);
+        assert_eq!(sf12.sensitivity_floor_dbm(), -137);
     }
 
     #[test]

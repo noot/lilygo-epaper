@@ -154,9 +154,14 @@ pub(crate) enum Event {
     // one fetched tile of a bulk download, streamed as it arrives so only one
     // body is ever resident.
     #[cfg(feature = "gps")]
-    Tile { key: u32, body: Vec<u8> },
+    Tile {
+        key: u32,
+        body: Vec<u8>,
+    },
     #[cfg(feature = "gps")]
-    DownloadDone { fetched: usize },
+    DownloadDone {
+        fetched: usize,
+    },
 }
 
 // single-slot channels between the ui and the wifi task: the ui queues at most
