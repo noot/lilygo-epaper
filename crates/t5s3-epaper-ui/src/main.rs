@@ -38,7 +38,7 @@ use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
     delay::Delay,
-    gpio::Pin,
+    gpio::{Input, InputConfig, Pin, Pull},
     interrupt::software::SoftwareInterruptControl,
     system::{CpuControl, Stack},
     timer::timg::TimerGroup,
@@ -319,7 +319,7 @@ async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::_240MHz);
-    let peripherals = esp_hal::init(config);
+    let mut peripherals = esp_hal::init(config);
 
     // internal-RAM heaps for the wifi stack (its DMA buffers can't live in
     // PSRAM), plus a PSRAM heap for the display's large framebuffers. esp-hal
@@ -397,6 +397,14 @@ async fn main(spawner: Spawner) -> ! {
     let mut light =
         FrontLight::new(peripherals.LEDC, peripherals.GPIO11).expect("to initialize front light");
     light.set_brightness(settings.brightness);
+
+    // the boot button is a plain GPIO with no i2c involvement, so it's read
+    // directly here. reborrowed (not moved) so the owned pin is still
+    // available for the deep-sleep wake source after the loop drops this.
+    let boot_btn = Input::new(
+        peripherals.GPIO0.reborrow(),
+        InputConfig::default().with_pull(Pull::Up),
+    );
 
     let delay = Delay::new();
     display.power_on().expect("to power on");
@@ -541,6 +549,9 @@ async fn main(spawner: Spawner) -> ! {
     let mut brightness: u8 = settings.brightness;
     // whether the auxiliary button is currently held, so each press acts once.
     let mut aux_active = false;
+    // whether the boot button is currently held; seeded from a live read so a
+    // wake press still held when the loop starts doesn't immediately re-sleep.
+    let mut boot_active = boot_btn.is_low();
     // set when Power Off is tapped on the sleep screen, to branch the teardown
     // below into a full PMIC shutdown instead of deep sleep.
     let mut power_off = false;
@@ -1321,6 +1332,16 @@ async fn main(spawner: Spawner) -> ! {
             }
         } else {
             aux_active = false;
+        }
+
+        // the boot button always sleeps from any screen (it's also the wake
+        // source, so sleep stays reachable whatever io48 is bound to).
+        if boot_btn.is_low() {
+            if !boot_active {
+                break;
+            }
+        } else {
+            boot_active = false;
         }
 
         // home presses and taps arrive pre-edge-detected from the i2c worker's
@@ -3054,7 +3075,8 @@ async fn main(spawner: Spawner) -> ! {
         draw_screensaver(&mut display, pct);
     }
     display.flush(DrawMode::BlackOnWhite).expect("to flush");
-    // hand LPWR back from the clock for the deep-sleep path; GPIO0 is always
-    // enabled as a wake source and was never claimed elsewhere this boot.
+    // hand LPWR back from the clock for the deep-sleep path; the boot-button
+    // reader's borrow of GPIO0 ended with its last read in the loop, so the
+    // owned pin is free to become the wake source here.
     display.deep_sleep(clock.into_inner(), peripherals.GPIO0.degrade(), None)
 }
