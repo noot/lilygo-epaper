@@ -13,6 +13,8 @@ todo:
 - pubkey identities for remote peer verification
 - message encryption (optionally, can be required per-user) handshake to determine shared key (dh? noise protocol to prove remote actually has the key?)
 - routing/peer discovery (gossip flood that says "who's in the mesh", useful for determining topology)
+- coordinates message that sends gps coordinates; app can auto-determine distance/direction from self
+- notification for new mesh msg in radio always-on mode
 
 ## tdma (implemented in `crates/nootmesh/src/tdma`)
 

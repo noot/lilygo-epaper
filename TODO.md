@@ -33,12 +33,6 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 ## GPS
 - [x] cached map with location rendering
 
-## LoRa
-- [ ] define message types (protos?)
-- [ ] auto send coordinates in one click
-- [ ] automatically calculate distance from remote peer when coordinate message is received
-- [ ] always-on lora receive functionality with unread notification icon
-
 ## reader
 - [x] map auxiliary button to "next page" when in reader
 - [x] make dedicated reader page that shows currently reading, progress, covers, etc
@@ -57,12 +51,11 @@ hardware reference: [T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S
 - [x] pull home environment data (temp, humidity, co2)
 - [x] notes app - stores notes on sd card
 - [x] settings page should have "check internet access" or "force wifi clock sync" to check wifi (Sync clock button on the wifi settings page)
-- [ ] TLS implementation with esp-mbedtls
+- [x] TLS implementation
 
 # bug fixes
 
 - [x] sleep doesn't properly deep sleep - battery still drains quite a lot
 - [x] battery percentage only refreshes when a new page is loaded
-- [ ] keyboard "send" button is unresponsive at times (lower right corner issue?)
 - [x] if clock fails to sync it doesn't resync - have button in info to try to sync (Sync clock button on the wifi settings page forces a re-sync / internet check)
 - [x] saved wifi networks don't store password on disconnect - last 5 joined networks are now remembered, tap to reconnect

@@ -30,7 +30,7 @@ use embedded_hal_bus::spi::RefCellDevice;
 use embedded_sdmmc::{Mode as SdMode, VolumeIdx};
 use esp_backtrace as _;
 use esp_hal::{
-    analog::adc::{Adc, AdcConfig, Attenuation},
+    analog::adc::{Adc, AdcCalCurve, AdcConfig, Attenuation},
     delay::Delay,
     efuse::{self, InterfaceMacAddress},
     gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
@@ -167,14 +167,13 @@ where
     true
 }
 
-/// battery voltage in millivolts: GPIO1 nominally reads the pack through a
-/// 2:1 divider (Meshtastic's multiplier for the base T3-S3 is 2.11), sampled
-/// at 11 dB attenuation (~3.1 V full scale, uncalibrated). None when the ADC
-/// never settles OR reads railed at full scale — observed on the e-paper
-/// PCB revision, where the pin sits at the 3.3 V rail instead of half the
-/// pack voltage (the divider ratio in vendor headers is marked "assumption"
-/// and appears not to hold here); a railed sample would display as a bogus
-/// ~6.5 V. the raw value is logged for pcb-revision forensics.
+/// battery voltage in millivolts: GPIO1 reads the pack through a 2:1 divider
+/// (Meshtastic's multiplier for the T3-S3 is 2.11) at 11 dB attenuation. the
+/// pin is calibrated with the eFuse curve, so `read_oneshot` returns the pin
+/// voltage in mV directly. None when the ADC never settles OR the reconstructed
+/// pack voltage lands outside a plausible 1S-lipo window — a railed pin
+/// (divider not dividing) reads ~3.1 V full scale, i.e. a bogus ~6.5 V pack.
+/// the pin mV is logged for pcb-revision forensics.
 fn battery_mv<'a, PIN, ADCI, CS>(
     adc: &mut Adc<'a, ADCI, esp_hal::Blocking>,
     pin: &mut esp_hal::analog::adc::AdcPin<PIN, ADCI, CS>,
@@ -185,11 +184,13 @@ where
     CS: esp_hal::analog::adc::AdcCalScheme<ADCI>,
 {
     for _ in 0..100 {
-        if let Ok(raw) = adc.read_oneshot(pin) {
-            let pin_mv = u32::from(raw) * 3100 / 4095;
+        if let Ok(pin_mv) = adc.read_oneshot(pin) {
+            let pin_mv = u32::from(pin_mv);
             let vbat_mv = pin_mv * 211 / 100;
-            println!("batt: raw {raw} pin {pin_mv}mV -> {vbat_mv}mV");
-            if raw >= 4090 {
+            println!("batt: pin {pin_mv}mV -> {vbat_mv}mV");
+            // a real 1S lipo sits ~3.0-4.3 V; outside that the sense path is
+            // railed or disconnected, not a battery reading.
+            if !(2500..=4600).contains(&vbat_mv) {
                 return None;
             }
             return Some(vbat_mv);
@@ -258,9 +259,13 @@ fn main() -> ! {
         peripherals.GPIO33,
         InputConfig::default().with_pull(Pull::None),
     );
-    // battery sense: gpio1 through the board's divider into adc1.
+    // battery sense: gpio1 through the board's divider into adc1. read with the
+    // eFuse curve calibration (AdcCalCurve) like the t5 battery reader — the
+    // esp32-s3 raw adc curve is compressed near full scale, so an uncalibrated
+    // read of the divided pack voltage pegs high and looks railed.
     let mut adc_config = AdcConfig::new();
-    let mut bat_pin = adc_config.enable_pin(peripherals.GPIO1, Attenuation::_11dB);
+    let mut bat_pin =
+        adc_config.enable_pin_with_cal::<_, AdcCalCurve<_>>(peripherals.GPIO1, Attenuation::_11dB);
     let mut adc = Adc::new(peripherals.ADC1, adc_config);
 
     // power the radio's oscillator rail (gpio35); see the rx example.
