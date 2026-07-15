@@ -214,6 +214,53 @@ impl IconSize {
     }
 }
 
+// IO48 auxiliary button behavior when pressed.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Io48Action {
+    Sleep,
+    Backlight,
+    LoraReceive,
+    Nothing,
+}
+
+impl Io48Action {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Io48Action::Sleep => Io48Action::Backlight,
+            Io48Action::Backlight => Io48Action::LoraReceive,
+            Io48Action::LoraReceive => Io48Action::Nothing,
+            Io48Action::Nothing => Io48Action::Sleep,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Io48Action::Sleep => "Sleep",
+            Io48Action::Backlight => "Backlight",
+            Io48Action::LoraReceive => "LoRa RX",
+            Io48Action::Nothing => "Nothing",
+        }
+    }
+
+    fn to_byte(self) -> u8 {
+        match self {
+            Io48Action::Sleep => 0,
+            Io48Action::Backlight => 1,
+            Io48Action::LoraReceive => 2,
+            Io48Action::Nothing => 3,
+        }
+    }
+
+    fn from_byte(b: u8) -> Self {
+        match b {
+            1 => Io48Action::Backlight,
+            2 => Io48Action::LoraReceive,
+            3 => Io48Action::Nothing,
+            _ => Io48Action::Sleep,
+        }
+    }
+}
+
 // the reader's text styling, bundled so it can be passed in one argument.
 #[derive(Clone, Copy)]
 pub(crate) struct ReaderStyle {
@@ -343,6 +390,7 @@ pub(crate) struct Settings {
     pub(crate) reader_line_spacing: LineSpacing,
     pub(crate) icon_style: IconStyle,
     pub(crate) icon_size: IconSize,
+    pub(crate) io48_action: Io48Action,
     /// keep the lora radio and mesh membership alive on every screen (at a
     /// standing rx current cost), instead of only while the lora page is open.
     pub(crate) mesh_background: bool,
@@ -370,6 +418,7 @@ impl Default for Settings {
             reader_line_spacing: LineSpacing::Normal,
             icon_style: IconStyle::Lucide,
             icon_size: IconSize::Regular,
+            io48_action: Io48Action::Sleep,
             mesh_background: false,
             mesh_alias: [0; ALIAS_CAP],
             mesh_alias_len: 0,
@@ -384,17 +433,24 @@ impl Default for Settings {
 // flash, older/newer layout, corruption) falls back to defaults, except the
 // immediately previous version which is migrated (see `decode_v5`).
 const MAGIC: [u8; 2] = [0x54, 0x35];
-const VERSION: u8 = 8;
+const VERSION: u8 = 9;
 /// mesh display-name capacity, matching nootmesh's wire cap.
 pub(crate) const ALIAS_CAP: usize = 12;
-// 12 scalar bytes, an alias (len + 12), a saved-network count, then
-// WIFI_NETWORK_CAP fixed-size network entries (ssid len + 32, password len +
-// 64), then a trailing xor checksum.
-const ALIAS_OFF: usize = 12;
+// 13 scalar bytes (added io48_action at byte 12), an alias (len + 12), a
+// saved-network count, then WIFI_NETWORK_CAP fixed-size network entries (ssid
+// len + 32, password len + 64), then a trailing xor checksum.
+const ALIAS_OFF: usize = 13;
 const NETWORKS_OFF: usize = ALIAS_OFF + 1 + ALIAS_CAP + 1;
 const NETWORK_SIZE: usize = 1 + SSID_CAP + 1 + PASSWORD_CAP;
 const CHECKSUM_OFF: usize = NETWORKS_OFF + WIFI_NETWORK_CAP * NETWORK_SIZE;
 const BLOB_LEN: usize = CHECKSUM_OFF + 1;
+
+// the version-8 layout: identical except it lacked the io48_action field, so
+// the alias offset was at 12 instead of 13.
+const V8_VERSION: u8 = 8;
+const V8_ALIAS_OFF: usize = 12;
+const V8_NETWORKS_OFF: usize = V8_ALIAS_OFF + 1 + ALIAS_CAP + 1;
+const V8_CHECKSUM_OFF: usize = V8_NETWORKS_OFF + WIFI_NETWORK_CAP * NETWORK_SIZE;
 
 // the version-7 layout: identical except it lacked the alias field, so the
 // network table sat 13 bytes earlier.
@@ -437,6 +493,7 @@ impl Settings {
         buf[9] = self.icon_style.to_byte();
         buf[10] = self.icon_size.to_byte();
         buf[11] = u8::from(self.mesh_background);
+        buf[12] = self.io48_action.to_byte();
         buf[ALIAS_OFF] = self.mesh_alias_len.min(ALIAS_CAP as u8);
         buf[ALIAS_OFF + 1..ALIAS_OFF + 1 + ALIAS_CAP].copy_from_slice(&self.mesh_alias);
         buf[NETWORKS_OFF - 1] = self.wifi_network_count.min(WIFI_NETWORK_CAP as u8);
@@ -457,6 +514,9 @@ impl Settings {
         }
         if buf[2] == V5_VERSION {
             return Self::decode_v5(buf);
+        }
+        if buf[2] == V8_VERSION {
+            return Self::decode_v8(buf);
         }
         if buf[2] == V7_VERSION {
             return Self::decode_v7(buf);
@@ -490,6 +550,7 @@ impl Settings {
             icon_style: IconStyle::from_byte(buf[9]),
             icon_size: IconSize::from_byte(buf[10]),
             mesh_background: buf[11] != 0,
+            io48_action: Io48Action::from_byte(buf[12]),
             mesh_alias: {
                 let mut alias = [0; ALIAS_CAP];
                 alias.copy_from_slice(&buf[ALIAS_OFF + 1..ALIAS_OFF + 1 + ALIAS_CAP]);
@@ -501,8 +562,46 @@ impl Settings {
         })
     }
 
+    // migrate a version-8 blob: identical scalars, no io48_action (defaults to
+    // Sleep), alias offset at 12 instead of 13.
+    fn decode_v8(buf: &[u8; BLOB_LEN]) -> Option<Self> {
+        let checksum = buf[0..V8_CHECKSUM_OFF].iter().fold(0u8, |acc, &b| acc ^ b);
+        if checksum != buf[V8_CHECKSUM_OFF] {
+            return None;
+        }
+        let mut wifi_networks = [WifiNetwork::EMPTY; WIFI_NETWORK_CAP];
+        for (i, net) in wifi_networks.iter_mut().enumerate() {
+            let off = V8_NETWORKS_OFF + i * NETWORK_SIZE;
+            net.ssid_len = buf[off].min(SSID_CAP as u8);
+            net.ssid.copy_from_slice(&buf[off + 1..off + 1 + SSID_CAP]);
+            net.password_len = buf[off + 1 + SSID_CAP].min(PASSWORD_CAP as u8);
+            net.password
+                .copy_from_slice(&buf[off + 2 + SSID_CAP..off + NETWORK_SIZE]);
+        }
+        Some(Self {
+            tz_offset_hours: buf[3] as i8,
+            time_24h: buf[4] != 0,
+            brightness: buf[5].min(100),
+            reader_font_size: FontSize::from_byte(buf[6]),
+            reader_font_family: FontFamily::from_byte(buf[7]),
+            reader_line_spacing: LineSpacing::from_byte(buf[8]),
+            icon_style: IconStyle::from_byte(buf[9]),
+            icon_size: IconSize::from_byte(buf[10]),
+            mesh_background: buf[11] != 0,
+            io48_action: Io48Action::Sleep,
+            mesh_alias: {
+                let mut alias = [0; ALIAS_CAP];
+                alias.copy_from_slice(&buf[V8_ALIAS_OFF + 1..V8_ALIAS_OFF + 1 + ALIAS_CAP]);
+                alias
+            },
+            mesh_alias_len: buf[V8_ALIAS_OFF].min(ALIAS_CAP as u8),
+            wifi_networks,
+            wifi_network_count: buf[V8_NETWORKS_OFF - 1].min(WIFI_NETWORK_CAP as u8),
+        })
+    }
+
     // migrate a version-7 blob: identical scalars, no alias (empty), network
-    // table 13 bytes earlier.
+    // table 13 bytes earlier, no io48_action (defaults to Sleep).
     fn decode_v7(buf: &[u8; BLOB_LEN]) -> Option<Self> {
         let checksum = buf[0..V7_CHECKSUM_OFF].iter().fold(0u8, |acc, &b| acc ^ b);
         if checksum != buf[V7_CHECKSUM_OFF] {
@@ -527,6 +626,7 @@ impl Settings {
             icon_style: IconStyle::from_byte(buf[9]),
             icon_size: IconSize::from_byte(buf[10]),
             mesh_background: buf[11] != 0,
+            io48_action: Io48Action::Sleep,
             mesh_alias: [0; ALIAS_CAP],
             mesh_alias_len: 0,
             wifi_networks,
@@ -535,7 +635,7 @@ impl Settings {
     }
 
     // migrate a version-6 blob: identical scalars, network table one byte
-    // earlier, and no mesh-background flag (defaults off).
+    // earlier, and no mesh-background flag (defaults off), no io48_action.
     fn decode_v6(buf: &[u8; BLOB_LEN]) -> Option<Self> {
         let checksum = buf[0..V6_CHECKSUM_OFF].iter().fold(0u8, |acc, &b| acc ^ b);
         if checksum != buf[V6_CHECKSUM_OFF] {
@@ -560,6 +660,7 @@ impl Settings {
             icon_style: IconStyle::from_byte(buf[9]),
             icon_size: IconSize::from_byte(buf[10]),
             mesh_background: false,
+            io48_action: Io48Action::Sleep,
             mesh_alias: [0; ALIAS_CAP],
             mesh_alias_len: 0,
             wifi_networks,
@@ -568,7 +669,7 @@ impl Settings {
     }
 
     // migrate a version-5 blob: identical scalars, and its single stored
-    // network becomes the first (most recently used) table entry.
+    // network becomes the first (most recently used) table entry, no io48_action.
     fn decode_v5(buf: &[u8; BLOB_LEN]) -> Option<Self> {
         let checksum = buf[0..V5_CHECKSUM_OFF].iter().fold(0u8, |acc, &b| acc ^ b);
         if checksum != buf[V5_CHECKSUM_OFF] {
@@ -594,6 +695,7 @@ impl Settings {
             icon_style: IconStyle::from_byte(buf[9]),
             icon_size: IconSize::from_byte(buf[10]),
             mesh_background: false,
+            io48_action: Io48Action::Sleep,
             mesh_alias: [0; ALIAS_CAP],
             mesh_alias_len: 0,
             wifi_networks,

@@ -1290,21 +1290,38 @@ async fn main(spawner: Spawner) -> ! {
             }
         }
 
-        // the auxiliary button turns the page in the reader, and sleeps from any
-        // other screen (the current screen is restored on wake). edge-detected so
-        // holding it acts once; it's a polled level (not an event), so the
-        // debounce still lives here rather than in the i2c worker.
+        // the auxiliary button (IO48) behavior depends on the setting and current
+        // screen. edge-detected so holding it acts once; it's a polled level
+        // (not an event), so the debounce still lives here rather than in the i2c
+        // worker.
         if t5s3_epaper_core::i2c::aux_button_pressed() {
             if !aux_active {
                 aux_active = true;
                 if current_screen == Screen::Reader {
+                    // in reader, IO48 always turns the page regardless of setting
                     if let Some(doc) = &mut reader_doc {
                         if doc.next_page() {
                             needs_redraw = true;
                         }
                     }
                 } else {
-                    break;
+                    // in other screens, behavior depends on io48_action setting
+                    use crate::settings::Io48Action;
+                    match settings.io48_action {
+                        Io48Action::Sleep => {
+                            break;
+                        }
+                        Io48Action::Backlight => {
+                            current_screen = Screen::Frontlight;
+                            needs_redraw = true;
+                        }
+                        Io48Action::LoraReceive => {
+                            current_screen = Screen::Lora;
+                            lora_tab = LoraTab::Recv;
+                            needs_redraw = true;
+                        }
+                        Io48Action::Nothing => {}
+                    }
                 }
             }
         } else {
@@ -1964,6 +1981,14 @@ async fn main(spawner: Spawner) -> ! {
                                     .flush_partial_fast(
                                         settings_page::system::icon_size_button_rect(),
                                     )
+                                    .ok();
+                            }
+                            Some(settings_page::system::Hit::CycleIo48) => {
+                                settings.io48_action = settings.io48_action.next();
+                                settings_dirty = true;
+                                settings_page::system::redraw_io48(&mut display, &settings);
+                                display
+                                    .flush_partial_fast(settings_page::system::io48_button_rect())
                                     .ok();
                             }
                             None => {}
