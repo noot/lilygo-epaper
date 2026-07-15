@@ -9,7 +9,7 @@ use core::{format_args, time::Duration};
 use embedded_graphics::prelude::*;
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use esp_backtrace as _;
-use esp_hal::{delay::Delay, main};
+use esp_hal::{delay::Delay, gpio::Pin, main};
 use t5s3_epaper_core::{pin_config, power, rtc::Clock, Display, DrawMode};
 use u8g2_fonts::FontRenderer;
 
@@ -61,21 +61,30 @@ fn main() -> ! {
     let (year, month, day, hour, minute, second) = format_uk_datetime(now_us / 1_000_000);
     let uptime = clock.uptime();
 
-    let i2c_bus =
-        t5s3_epaper_core::i2c::Bus::new(peripherals.I2C0, peripherals.GPIO39, peripherals.GPIO40)
-            .expect("to build i2c bus");
+    let i2c_worker = t5s3_epaper_core::i2c::Worker::new(
+        peripherals.I2C0,
+        peripherals.GPIO39,
+        peripherals.GPIO40,
+        t5s3_epaper_core::touch_pin_config!(peripherals),
+    )
+    .expect("to build i2c worker");
+    static mut I2C_CORE_STACK: esp_hal::system::Stack<16384> = esp_hal::system::Stack::new();
+    let mut cpu_control = esp_hal::system::CpuControl::new(peripherals.CPU_CTRL);
+    let i2c_core_guard = cpu_control
+        .start_app_core(
+            unsafe { &mut *core::ptr::addr_of_mut!(I2C_CORE_STACK) },
+            move || i2c_worker.run(),
+        )
+        .expect("to start the i2c worker on the second core");
+    core::mem::forget(i2c_core_guard);
+
     let mut display = Display::new(
         pin_config!(peripherals),
-        &i2c_bus,
         peripherals.DMA_CH0,
         peripherals.LCD_CAM,
         peripherals.RMT,
     )
     .expect("to initialize display");
-    let input_ctl = t5s3_epaper_core::input::Controller::new(
-        &i2c_bus,
-        t5s3_epaper_core::input_pin_config!(peripherals),
-    );
 
     let delay = Delay::new();
 
@@ -119,5 +128,9 @@ fn main() -> ! {
     delay.delay_millis(100);
 
     let lpwr = clock.into_inner();
-    display.deep_sleep(lpwr, input_ctl, Some(Duration::from_secs(30)));
+    display.deep_sleep(
+        lpwr,
+        peripherals.GPIO0.degrade(),
+        Some(Duration::from_secs(30)),
+    );
 }

@@ -38,12 +38,25 @@ fn main() -> ! {
     // Create PSRAM allocator
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
 
-    let i2c_bus =
-        t5s3_epaper_core::i2c::Bus::new(peripherals.I2C0, peripherals.GPIO39, peripherals.GPIO40)
-            .expect("to build i2c bus");
+    let i2c_worker = t5s3_epaper_core::i2c::Worker::new(
+        peripherals.I2C0,
+        peripherals.GPIO39,
+        peripherals.GPIO40,
+        t5s3_epaper_core::touch_pin_config!(peripherals),
+    )
+    .expect("to build i2c worker");
+    static mut I2C_CORE_STACK: esp_hal::system::Stack<16384> = esp_hal::system::Stack::new();
+    let mut cpu_control = esp_hal::system::CpuControl::new(peripherals.CPU_CTRL);
+    let i2c_core_guard = cpu_control
+        .start_app_core(
+            unsafe { &mut *core::ptr::addr_of_mut!(I2C_CORE_STACK) },
+            move || i2c_worker.run(),
+        )
+        .expect("to start the i2c worker on the second core");
+    core::mem::forget(i2c_core_guard);
+
     let mut display = Display::new(
         pin_config!(peripherals),
-        &i2c_bus,
         peripherals.DMA_CH0,
         peripherals.LCD_CAM,
         peripherals.RMT,

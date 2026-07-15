@@ -69,6 +69,6 @@ pub fn deep_sleep(lpwr: LPWR<'_>, mut boot_button: AnyPin<'_>, timer: Option<Dur
 /// On the Paper Pro Lite this uses the BQ25896 BATFET-off path from the
 /// official firmware. It is intended for battery-powered operation; with USB
 /// connected the board may remain powered.
-pub fn shutdown(display: Display<'_, '_>) -> Result<()> {
+pub fn shutdown(display: Display<'_>) -> Result<()> {
     display.shutdown_inner()
 }

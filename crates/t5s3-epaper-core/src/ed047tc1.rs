@@ -1,10 +1,7 @@
-use core::cell::RefCell;
-
 use esp_hal::{
     dma::DmaTxBuf,
     dma_buffers,
     gpio::{Level, Output, OutputConfig},
-    i2c::master::I2c,
     lcd_cam::{
         lcd::{i8080, i8080::Command},
         LcdCam,
@@ -15,7 +12,10 @@ use esp_hal::{
     Blocking,
 };
 
-use crate::rmt;
+use crate::{
+    pca9555::{ADDR as PCA9555_ADDR, REG_INPUT_PORT1 as PCA9555_REG_INPUT_PORT1},
+    rmt,
+};
 
 macro_rules! pulse {
     ($high:expr, $low:expr) => {
@@ -34,9 +34,7 @@ macro_rules! pulse {
 }
 
 const DMA_BUFFER_SIZE: usize = 248;
-const PCA9555_ADDR: u8 = 0x20;
-const TPS65185_ADDR: u8 = 0x68;
-const PCA9555_REG_INPUT_PORT1: u8 = 1;
+pub(crate) const TPS65185_ADDR: u8 = 0x68;
 const PCA9555_REG_OUTPUT_PORT0: u8 = 2;
 const PCA9555_REG_OUTPUT_PORT1: u8 = 3;
 const PCA9555_REG_INVERT_PORT0: u8 = 4;
@@ -72,8 +70,7 @@ struct ConfigRegister {
     wakeup: bool,
 }
 
-struct ConfigWriter<'a, 'd> {
-    i2c: &'a RefCell<I2c<'d, Blocking>>,
+struct ConfigWriter<'d> {
     leh: Output<'d>,
     stv: Output<'d>,
     output_port0: u8,
@@ -81,14 +78,9 @@ struct ConfigWriter<'a, 'd> {
     config: ConfigRegister,
 }
 
-impl<'a, 'd> ConfigWriter<'a, 'd> {
-    fn new(
-        i2c: &'a RefCell<I2c<'d, Blocking>>,
-        leh: peripherals::GPIO42<'d>,
-        stv: peripherals::GPIO45<'d>,
-    ) -> crate::Result<Self> {
+impl<'d> ConfigWriter<'d> {
+    fn new(leh: peripherals::GPIO42<'d>, stv: peripherals::GPIO45<'d>) -> crate::Result<Self> {
         let mut writer = ConfigWriter {
-            i2c,
             leh: Output::new(leh, Level::Low, OutputConfig::default()),
             stv: Output::new(stv, Level::High, OutputConfig::default()),
             output_port0: 0xFF,
@@ -199,53 +191,48 @@ impl<'a, 'd> ConfigWriter<'a, 'd> {
     }
 
     fn read_register(&mut self, device: u8, reg: u8) -> crate::Result<u8> {
-        let mut value = [0u8; 1];
-        self.i2c
-            .borrow_mut()
-            .write_read(device, &[reg], &mut value)
-            .map_err(crate::Error::I2c)?;
-        Ok(value[0])
+        crate::i2c::read_byte(device, reg)
     }
 
     fn write_register(&mut self, device: u8, payload: &[u8]) -> crate::Result<()> {
-        self.i2c
-            .borrow_mut()
-            .write(device, payload)
-            .map_err(crate::Error::I2c)
+        debug_assert_eq!(payload.len(), 2, "PCA9555/TPS65185 registers are 8-bit");
+        crate::i2c::write_byte(device, payload[0], payload[1])
     }
 
     fn battery_voltage_mv(&mut self) -> crate::Result<u16> {
-        crate::bq27220::voltage_mv(&mut self.i2c.borrow_mut())
+        crate::bq27220::battery_voltage_mv()
     }
 
     fn battery_state_of_charge(&mut self) -> crate::Result<u16> {
-        crate::bq27220::state_of_charge(&mut self.i2c.borrow_mut())
+        crate::bq27220::battery_state_of_charge()
     }
 
     fn battery_time_to_full_minutes(&mut self) -> crate::Result<Option<u16>> {
-        crate::bq27220::time_to_full_minutes(&mut self.i2c.borrow_mut())
+        crate::bq27220::battery_time_to_full_minutes()
     }
 
     fn fuel_gauge_diagnostics(&mut self) -> crate::Result<crate::bq27220::Diagnostics> {
-        crate::bq27220::diagnostics(&mut self.i2c.borrow_mut())
+        crate::bq27220::fuel_gauge_diagnostics()
     }
 
     fn fuel_gauge_exit_config_update(&mut self) -> crate::Result<()> {
-        crate::bq27220::exit_config_update(&mut self.i2c.borrow_mut())
+        crate::bq27220::fuel_gauge_exit_config_update()
     }
 
     fn fuel_gauge_program_capacity(&mut self, capacity_mah: u16) -> crate::Result<()> {
-        crate::bq27220::program_capacity(&mut self.i2c.borrow_mut(), capacity_mah)
+        crate::bq27220::fuel_gauge_program_capacity(capacity_mah)
     }
 
     fn shutdown(&mut self) -> crate::Result<()> {
-        crate::bq25896::disable_batfet(&mut self.i2c.borrow_mut())
+        crate::bq25896::charger_shutdown()
     }
 
     fn charger_status(&mut self) -> crate::Result<crate::bq25896::Status> {
-        crate::bq25896::read_status(&mut self.i2c.borrow_mut())
+        crate::bq25896::charger_status()
     }
 }
+
+impl crate::i2c::Registered for crate::i2c::Addr<{ TPS65185_ADDR }> {}
 
 pub struct PinConfig<'a> {
     pub data0: peripherals::GPIO5<'a>,
@@ -263,24 +250,27 @@ pub struct PinConfig<'a> {
     pub stv: peripherals::GPIO45<'a>,
 }
 
-pub(crate) struct ED047TC1<'a, 'd> {
+pub(crate) struct ED047TC1<'d> {
     i8080: Option<i8080::I8080<'d, Blocking>>,
-    cfg_writer: ConfigWriter<'a, 'd>,
+    cfg_writer: ConfigWriter<'d>,
     rmt: rmt::Rmt<'d>,
     dma_buf: Option<DmaTxBuf>,
 }
 
-impl<'a, 'd> ED047TC1<'a, 'd> {
+impl<'d> ED047TC1<'d> {
+    // PCA9555 register writes here go through the channel to core 1's i2c
+    // worker (see `crate::i2c`), which must already be running by this point
+    // — this is called after `CpuControl::start_app_core` spawns it, not
+    // before.
     pub(crate) fn new(
         pins: PinConfig<'d>,
-        i2c: &'a crate::i2c::Bus<'d>,
         dma: peripherals::DMA_CH0<'d>,
         lcd_cam: peripherals::LCD_CAM<'d>,
         rmt: peripherals::RMT<'d>,
     ) -> crate::Result<Self> {
         let lcd_cam = LcdCam::new(lcd_cam);
 
-        let mut cfg_writer = ConfigWriter::new(&i2c.i2c, pins.leh, pins.stv)?;
+        let mut cfg_writer = ConfigWriter::new(pins.leh, pins.stv)?;
         cfg_writer.write()?;
 
         let (_, _, tx_buffer, tx_descriptors) = dma_buffers!(0, DMA_BUFFER_SIZE);

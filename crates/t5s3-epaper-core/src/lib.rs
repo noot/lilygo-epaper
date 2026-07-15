@@ -40,8 +40,9 @@
 //! use esp_hal::{
 //!     delay::Delay,
 //!     prelude::*,
+//!     system::{CpuControl, Stack},
 //! };
-//! use t5s3_epaper_core::{pin_config, Display, DrawMode};
+//! use t5s3_epaper_core::{pin_config, touch_pin_config, Display, DrawMode, I2cWorker};
 //!
 //! #[entry]
 //! fn main() -> ! {
@@ -49,16 +50,30 @@
 //!     let delay = Delay::new();
 //!     // Create PSRAM allocator
 //!     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
-//!     // Build the shared I2C bus, then initialise the display on it
-//!     let i2c_bus = t5s3_epaper_core::i2c::Bus::new(
+//!     // The i2c bus (touch, panel power, battery, charger, rtc) is owned
+//!     // entirely by a worker running on the second core; everything else
+//!     // (this core) talks to it over a channel — see `t5s3_epaper_core::i2c`.
+//!     let worker = I2cWorker::new(
 //!         peripherals.I2C0,
 //!         peripherals.GPIO39,
 //!         peripherals.GPIO40,
+//!         touch_pin_config!(peripherals),
 //!     )
-//!     .expect("to build i2c bus");
+//!     .expect("to build i2c worker");
+//!     static mut APP_CORE_STACK: Stack<8192> = Stack::new();
+//!     let mut cpu_control = CpuControl::new(peripherals.CPU_CTRL);
+//!     let guard = cpu_control
+//!         .start_app_core(unsafe { &mut *core::ptr::addr_of_mut!(APP_CORE_STACK) }, move || {
+//!             worker.run()
+//!         })
+//!         .expect("to start the i2c worker on the second core");
+//!     core::mem::forget(guard);
+//!
+//!     // Display::new() only runs once the worker above is draining the
+//!     // channel, since its constructor writes the panel's initial power
+//!     // sequencing registers.
 //!     let mut display = Display::new(
 //!         pin_config!(peripherals),
-//!         &i2c_bus,
 //!         peripherals.DMA_CH0,
 //!         peripherals.LCD_CAM,
 //!         peripherals.RMT,
@@ -108,7 +123,6 @@ pub mod bq27220;
 pub mod display;
 pub mod frontlight;
 pub mod i2c;
-pub mod input;
 pub mod pcf8563;
 pub mod power;
 pub mod rtc;
@@ -127,6 +141,8 @@ pub mod lora;
 
 mod battery;
 mod ed047tc1;
+mod gt911;
+mod pca9555;
 mod rmt;
 
 /// Errors
@@ -219,7 +235,7 @@ pub use crate::{
     display::{Display, DrawMode},
     ed047tc1::PinConfig,
     frontlight::FrontLight,
-    input::{Buttons, Controller, InputState},
+    i2c::{Event as InputEvent, Worker as I2cWorker},
     power::WakeStatus,
     rtc::Clock,
     sdcard::{DirectoryEntry as SdDirectoryEntry, SdCard},
@@ -248,14 +264,13 @@ macro_rules! pin_config {
     }};
 }
 
-/// Convenience macro to build the input controller's pin config struct.
+/// Convenience macro to build the touch controller's pin config struct.
 #[macro_export]
-macro_rules! input_pin_config {
+macro_rules! touch_pin_config {
     ($name:expr) => {{
-        t5s3_epaper_core::input::PinConfig {
+        t5s3_epaper_core::i2c::TouchPinConfig {
             touch_int: $name.GPIO3,
             touch_rst: $name.GPIO9,
-            boot_btn: $name.GPIO0,
         }
     }};
 }

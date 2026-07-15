@@ -469,10 +469,6 @@ pub(crate) fn lora_status_native_rect() -> t5s3_epaper_core::display::Rectangle 
     screen_to_native_rect(MSG_X, LORA_STATUS_Y, MSG_W as i32, STATUS_H as i32)
 }
 
-pub(crate) fn sent_native_rect() -> t5s3_epaper_core::display::Rectangle {
-    screen_to_native_rect(MSG_X, SENT_Y, MSG_W as i32, LIST_H as i32)
-}
-
 pub(crate) fn recv_native_rect() -> t5s3_epaper_core::display::Rectangle {
     screen_to_native_rect(0, RECV_TOP - 4, 540, RECV_ROWS * RECV_ROW_H + 8)
 }
