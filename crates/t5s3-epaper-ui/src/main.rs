@@ -1312,8 +1312,17 @@ async fn main(spawner: Spawner) -> ! {
                             break;
                         }
                         Io48Action::Backlight => {
-                            current_screen = Screen::Frontlight;
-                            needs_redraw = true;
+                            // toggle the front light between off and its last
+                            // set brightness, without leaving the current screen.
+                            if light.brightness() > 0 {
+                                light.off();
+                            } else if brightness > 0 {
+                                light.set_brightness(brightness);
+                            } else {
+                                // never set this boot; use a mid-range level so
+                                // the toggle visibly does something.
+                                light.set_brightness(50);
+                            }
                         }
                         Io48Action::LoraReceive => {
                             current_screen = Screen::Lora;
