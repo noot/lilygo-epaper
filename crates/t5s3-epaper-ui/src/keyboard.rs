@@ -1,18 +1,15 @@
 use alloc::vec::Vec;
 
 use embedded_graphics::{
-    mono_font::{ascii::FONT_9X15, MonoTextStyle},
+    image::GetPixel,
+    mono_font::{ascii::FONT_9X15, MonoFont, MonoTextStyle},
+    pixelcolor::BinaryColor,
     prelude::*,
     primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle, Triangle},
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use t5s3_epaper_core::Display;
-use u8g2_fonts::{
-    fonts,
-    types::{FontColor, HorizontalAlignment, VerticalPosition},
-    FontRenderer,
-};
 
 use crate::layout::{screen_to_native_rect, SAFE_W, SAFE_X, SCREEN_W};
 
@@ -35,9 +32,11 @@ const KB_FULL_W: i32 = SAFE_W;
 const KB_TOGGLE_W: i32 = 90;
 const KB_ENTER_W: i32 = 110;
 
-// twice the cap height of the FONT_9X15 label these replaced, for a letter
-// key that's actually legible at arm's length on the composer/editor pages.
-static CHAR_FONT: FontRenderer = FontRenderer::new::<fonts::u8g2_font_fub25_tf>();
+// letter keys draw FONT_9X15 nearest-neighbor scaled up by this factor
+// (see draw_scaled_char), rather than switching to a different, larger font
+// face: legible at arm's length while still reading as the same glyphs used
+// everywhere else in the ui.
+const CHAR_SCALE: i32 = 2;
 
 const KB_LETTERS: [&str; 3] = ["qwertyuiop", "asdfghjkl", "zxcvbnm"];
 const KB_SYMBOLS: [&str; 3] = ["1234567890", "@#$&-+()/", "*\"':;!?,"];
@@ -231,6 +230,54 @@ fn draw_backspace_icon(display: &mut Display, cx: i32, cy: i32, color: Gray4) {
         .ok();
 }
 
+// draws `c` from `font`'s bitmap nearest-neighbor scaled up by `scale`,
+// centered at (cx, cy): looks up the glyph's cell in the font's raw image
+// (the same lookup MonoFont uses internally) and blits each "on" pixel as a
+// `scale`-sized square, merging consecutive on-pixels within a row into one
+// rectangle so a glyph is a handful of draw calls rather than one per pixel.
+fn draw_scaled_char(
+    display: &mut Display,
+    font: &MonoFont,
+    c: char,
+    cx: i32,
+    cy: i32,
+    scale: i32,
+    color: Gray4,
+) {
+    let cell = font.character_size;
+    let glyphs_per_row = font.image.size().width / cell.width;
+    let glyph_index = font.glyph_mapping.index(c) as u32;
+    let row = glyph_index / glyphs_per_row;
+    let col = glyph_index - row * glyphs_per_row;
+    let origin = Point::new((col * cell.width) as i32, (row * cell.height) as i32);
+    let top_left = Point::new(
+        cx - (cell.width as i32 * scale) / 2,
+        cy - (cell.height as i32 * scale) / 2,
+    );
+    let style = PrimitiveStyle::with_fill(color);
+    for gy in 0..cell.height as i32 {
+        let mut run_start: Option<i32> = None;
+        for gx in 0..=cell.width as i32 {
+            let on = gx < cell.width as i32
+                && font.image.pixel(origin + Point::new(gx, gy)) == Some(BinaryColor::On);
+            match (on, run_start) {
+                (true, None) => run_start = Some(gx),
+                (false, Some(start)) => {
+                    Rectangle::new(
+                        Point::new(top_left.x + start * scale, top_left.y + gy * scale),
+                        Size::new(((gx - start) * scale) as u32, scale as u32),
+                    )
+                    .into_styled(style)
+                    .draw(display)
+                    .ok();
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 pub(crate) fn draw(display: &mut Display, symbols: bool, shift: bool, enter_label: &str) {
     for k in keyboard(symbols, shift) {
         // draw the active shift key inverted so its state is visible.
@@ -259,19 +306,7 @@ pub(crate) fn draw(display: &mut Display, symbols: bool, shift: bool, enter_labe
         match k.key {
             Key::Shift => draw_shift_icon(display, cx, cy, fg),
             Key::Backspace => draw_backspace_icon(display, cx, cy, fg),
-            Key::Char(c) => {
-                let mut buf = [0u8; 4];
-                CHAR_FONT
-                    .render_aligned(
-                        c.encode_utf8(&mut buf) as &str,
-                        Point::new(cx, cy),
-                        VerticalPosition::Center,
-                        HorizontalAlignment::Center,
-                        FontColor::Transparent(fg),
-                        display,
-                    )
-                    .ok();
-            }
+            Key::Char(c) => draw_scaled_char(display, &FONT_9X15, c, cx, cy, CHAR_SCALE, fg),
             Key::Symbols if symbols => draw_label(display, cx, cy, "abc", fg),
             Key::Symbols => draw_label(display, cx, cy, "123", fg),
             Key::Space => draw_label(display, cx, cy, "space", fg),
