@@ -11,15 +11,15 @@ use embedded_graphics::{
         MonoTextStyle,
     },
     prelude::*,
-    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
+    primitives::{PrimitiveStyle, Rectangle},
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use t5s3_epaper_core::{sdcard::Error, spi::Bus, Display, SdCard};
 
 use crate::{
-    keyboard,
     layout::{screen_to_native_rect, SCREEN_W},
+    text_field::TextField,
     widgets::{draw_back_button, draw_button},
 };
 
@@ -55,14 +55,12 @@ const DELETE_W: i32 = 120;
 const DELETE_H: i32 = 30;
 
 // the editor's text area sits between the status bar and the keyboard.
-const EDIT_X: i32 = 20;
-const EDIT_Y: i32 = 100;
-const EDIT_W: i32 = 500;
-const EDIT_H: i32 = 490;
+pub(crate) const EDIT_X: i32 = 20;
+pub(crate) const EDIT_Y: i32 = 100;
+pub(crate) const EDIT_W: i32 = 500;
+pub(crate) const EDIT_H: i32 = 490;
 const EDIT_LINE_H: i32 = 20;
-// FONT_9X15 is 9px wide; the area is padded 12px on each side.
-const EDIT_COLS: usize = ((EDIT_W - 24) / 9) as usize;
-const EDIT_LINES: usize = ((EDIT_H - 30) / EDIT_LINE_H) as usize;
+pub(crate) const EDIT_LINES: usize = ((EDIT_H - 30) / EDIT_LINE_H) as usize;
 
 pub(crate) struct Entry {
     pub(crate) name: String,
@@ -318,95 +316,11 @@ pub(crate) fn footer_native_rect() -> t5s3_epaper_core::display::Rectangle {
     screen_to_native_rect(LIST_X, FOOTER_Y - 16, LIST_W, 24)
 }
 
-// wrap `text` into byte ranges of at most EDIT_COLS characters per line,
-// breaking at newlines and, when a line overflows, at its last space. the
-// final (possibly empty) line is always emitted so the cursor has a home.
-fn wrap_ranges(text: &str) -> Vec<(usize, usize)> {
-    let mut lines = Vec::new();
-    let mut start = 0;
-    let mut count = 0;
-    let mut last_space = None;
-    for (i, c) in text.char_indices() {
-        if c == '\n' {
-            lines.push((start, i));
-            start = i + 1;
-            count = 0;
-            last_space = None;
-            continue;
-        }
-        if count == EDIT_COLS {
-            match last_space {
-                Some(s) => {
-                    lines.push((start, s));
-                    start = s + 1;
-                }
-                None => {
-                    lines.push((start, i));
-                    start = i;
-                }
-            }
-            count = text[start..i].chars().count();
-            last_space = None;
-        }
-        if c == ' ' {
-            last_space = Some(i);
-        }
-        count += 1;
-    }
-    lines.push((start, text.len()));
-    lines
-}
-
-// the editor's text area: the wrapped text's last screenful with a cursor bar
-// at the end, so typing always edits in view.
-pub(crate) fn draw_note_text(display: &mut Display, text: &str) {
-    Rectangle::new(
-        Point::new(EDIT_X, EDIT_Y),
-        Size::new(EDIT_W as u32, EDIT_H as u32),
-    )
-    .into_styled(
-        PrimitiveStyleBuilder::new()
-            .stroke_color(Gray4::BLACK)
-            .stroke_width(2)
-            .fill_color(Gray4::WHITE)
-            .build(),
-    )
-    .draw(display)
-    .ok();
-
-    let font = MonoTextStyle::new(&FONT_9X15, Gray4::BLACK);
-    let lines = wrap_ranges(text);
-    let first = lines.len().saturating_sub(EDIT_LINES);
-    let mut y = EDIT_Y + 26;
-    let mut cursor = Point::new(EDIT_X + 12, y);
-    for &(a, b) in &lines[first..] {
-        Text::new(&text[a..b], Point::new(EDIT_X + 12, y), font)
-            .draw(display)
-            .ok();
-        cursor = Point::new(EDIT_X + 12 + text[a..b].chars().count() as i32 * 9, y);
-        y += EDIT_LINE_H;
-    }
-    Rectangle::new(Point::new(cursor.x + 1, cursor.y - 12), Size::new(2, 15))
-        .into_styled(PrimitiveStyle::with_fill(Gray4::BLACK))
-        .draw(display)
-        .ok();
-    if text.is_empty() {
-        Text::new(
-            "type a note...",
-            Point::new(cursor.x + 8, cursor.y),
-            MonoTextStyle::new(&FONT_9X15, Gray4::new(4)),
-        )
-        .draw(display)
-        .ok();
-    }
-}
-
 pub(crate) fn draw_edit_screen(
     display: &mut Display,
     name: &str,
     text: &str,
-    symbols: bool,
-    shift: bool,
+    field: &TextField,
     delete_armed: bool,
 ) {
     draw_back_button(display);
@@ -420,10 +334,5 @@ pub(crate) fn draw_edit_screen(
     .draw(display)
     .ok();
     draw_delete_button(display, delete_armed);
-    draw_note_text(display, text);
-    keyboard::draw(display, symbols, shift, "RET");
-}
-
-pub(crate) fn text_area_native_rect() -> t5s3_epaper_core::display::Rectangle {
-    screen_to_native_rect(EDIT_X, EDIT_Y, EDIT_W, EDIT_H)
+    field.draw_full(display, text);
 }

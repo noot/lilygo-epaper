@@ -14,6 +14,7 @@ mod pages;
 mod screen;
 mod settings;
 mod state;
+mod text_field;
 mod tls;
 mod widgets;
 mod wifi;
@@ -93,7 +94,6 @@ use crate::pages::gps::{
 };
 use crate::{
     datetime::{status_date, status_time, status_time_secs},
-    keyboard::Key,
     layout::{touch_to_screen, SCREEN_W},
     pages::{
         environment,
@@ -135,12 +135,10 @@ use crate::{
             draw_info_tab,
             draw_lora_screen,
             draw_lora_status,
-            draw_message,
             draw_recv_list,
             info_native_rect,
             lora_status_native_rect,
             make_radio,
-            message_box_native_rect,
             recv_clear_hit,
             recv_fetch_hit,
             recv_native_rect,
@@ -151,7 +149,11 @@ use crate::{
             tab_hit,
             Tab as LoraTab,
             LIST_MAX,
+            MSG_H,
             MSG_MAX,
+            MSG_W,
+            MSG_X,
+            MSG_Y,
             RECV_MAX,
         },
         music,
@@ -171,6 +173,7 @@ use crate::{
     screen::Screen,
     settings::Settings,
     state::Remote,
+    text_field::{EnterKey, FieldEvent, TextField, Wrap},
     widgets::{
         back_button_hit,
         draw_back_button,
@@ -252,12 +255,6 @@ fn now_us() -> u64 {
         .duration_since_epoch()
         .as_micros()
 }
-
-// how long the lora message box must go untouched before a pending quick
-// flush's ghosting gets cleaned up with a full-quality one; long enough that
-// it doesn't fire between characters of the same typing burst (bursts land
-// well under this), short enough that it settles right after the user stops.
-const MESSAGE_SETTLE_IDLE_US: u64 = 400_000;
 
 // after a timezone or time-format change, repaint the status-bar clock so the
 // shown time reflects the new setting immediately; returns the minute now shown
@@ -560,6 +557,16 @@ async fn main(spawner: Spawner) -> ! {
     // loop): entering the screen joins the nootmesh TDMA mesh, leaving it drops
     // out (peers forget this node's slot claim a few frames later).
     let mut lora_message = String::new();
+    let mut lora_field = TextField::new(
+        MSG_X,
+        MSG_Y,
+        MSG_W,
+        MSG_H,
+        Wrap::CharFill,
+        EnterKey::Submit,
+        "type a message...",
+        "SEND",
+    );
     let mut lora_status = String::from("type a message, then SEND");
     let mut lora_sent: Vec<String> = Vec::new();
     let mut lora_recv: Vec<String> = Vec::new();
@@ -578,6 +585,16 @@ async fn main(spawner: Spawner) -> ! {
     // mesh-settings name editor: whether the keyboard is up, and the draft.
     let mut mesh_name_editing = false;
     let mut mesh_name_draft = String::new();
+    let mut mesh_field = TextField::new(
+        settings_page::mesh::EDIT_X,
+        settings_page::mesh::EDIT_Y,
+        settings_page::mesh::EDIT_W,
+        settings_page::mesh::EDIT_H,
+        Wrap::CharFill,
+        EnterKey::Submit,
+        "",
+        "SAVE",
+    );
     // the mesh page's send/receive tab, the receive log's scroll position
     // (in wrapped lines), and the sd chat archive's load-once flag + size.
     let mut lora_tab = LoraTab::Info;
@@ -589,21 +606,8 @@ async fn main(spawner: Spawner) -> ! {
     // else refreshes the send tab's action line since the info tab took
     // over the periodic status).
     let mut lora_send_pending = false;
-    // set when a keystroke changed the lora message but its flush was
-    // deferred to the end of this pass's touch-event drain, so a burst of
-    // queued taps (typing outpaced the previous flush) batches into one
-    // panel write instead of one per character.
-    let mut lora_message_dirty = false;
-    // set when the last message-box flush used the cheaper, fewer-frame
-    // waveform (see flush_partial_quick) rather than skipped entirely: it
-    // leaves a ghosting debt that a later full-quality flush needs to pay off
-    // once typing catches up.
-    let mut lora_message_quick_pending = false;
-    let mut lora_message_last_edit_us: u64 = 0;
     let mut chat_loaded = false;
     let mut chat_size: u64 = 0;
-    let mut kb_symbols = false;
-    let mut kb_shift = false;
     // ticks since the info page was last refreshed (uptime/temp/voltage).
     let mut info_refresh: u16 = 0;
     // ticks since the status-bar battery indicator was last refreshed.
@@ -633,6 +637,18 @@ async fn main(spawner: Spawner) -> ! {
     let mut notes_dirty = current_screen == Screen::Notes;
     let mut note_name = String::new();
     let mut note_text = String::new();
+    let mut notes_field = TextField::new(
+        notes::EDIT_X,
+        notes::EDIT_Y,
+        notes::EDIT_W,
+        notes::EDIT_H,
+        Wrap::WordScroll {
+            visible_lines: notes::EDIT_LINES,
+        },
+        EnterKey::Newline,
+        "type a note...",
+        "RET",
+    );
     let mut note_dirty = false;
     // whether the editor's delete button is armed (two-tap confirm).
     let mut note_delete_armed = false;
@@ -693,6 +709,16 @@ async fn main(spawner: Spawner) -> ! {
     let mut wifi_pw_mode = false;
     let mut wifi_pw_ssid = String::new();
     let mut wifi_pw_buf = String::new();
+    let mut wifi_field = TextField::new(
+        settings_page::wifi::PW_BOX_X,
+        settings_page::wifi::PW_BOX_Y,
+        settings_page::wifi::PW_BOX_W,
+        settings_page::wifi::PW_BOX_H,
+        Wrap::Truncate,
+        EnterKey::Submit,
+        "",
+        "SAVE",
+    );
     // set when the pending join is a reconnect to the already-saved network using
     // its stored password: on failure we fall back to the password keyboard so
     // stale credentials can be re-entered, rather than reporting a plain error.
@@ -804,8 +830,7 @@ async fn main(spawner: Spawner) -> ! {
                         // typo for a fresh join): drop into the keyboard
                         // pre-filled with it so it can be corrected rather than
                         // retyped.
-                        kb_symbols = false;
-                        kb_shift = false;
+                        wifi_field.reset_keyboard();
                         wifi_pw_mode = true;
                         wifi_status = if reconnect {
                             String::from("reconnect failed - re-enter password")
@@ -1053,8 +1078,7 @@ async fn main(spawner: Spawner) -> ! {
                     &lora_sent,
                     &lora_recv,
                     lora_scroll,
-                    kb_symbols,
-                    kb_shift,
+                    &lora_field,
                     lora_mesh.as_ref(),
                 ),
                 Screen::Frontlight => draw_frontlight_screen(&mut display, brightness),
@@ -1114,6 +1138,7 @@ async fn main(spawner: Spawner) -> ! {
                     &settings,
                     mesh_name_editing,
                     &mesh_name_draft,
+                    &mesh_field,
                 ),
                 Screen::SettingsReader => settings_page::reader::draw(&mut display, &settings),
                 Screen::SettingsWifi => {
@@ -1123,8 +1148,7 @@ async fn main(spawner: Spawner) -> ! {
                             &wifi_pw_ssid,
                             &wifi_pw_buf,
                             &wifi_status,
-                            kb_symbols,
-                            kb_shift,
+                            &wifi_field,
                         );
                     } else {
                         settings_page::wifi::draw_status(
@@ -1146,8 +1170,7 @@ async fn main(spawner: Spawner) -> ! {
                     &mut display,
                     &note_name,
                     &note_text,
-                    kb_symbols,
-                    kb_shift,
+                    &notes_field,
                     note_delete_armed,
                 ),
                 Screen::Environment => environment::draw_screen(&mut display, &env.view),
@@ -1315,29 +1338,24 @@ async fn main(spawner: Spawner) -> ! {
         // autonomous touch poll on the second core (see `t5s3_epaper_core::i2c`),
         // so every event here is already a fresh press; drain all of them before
         // drawing so a screen change or a flush in between never loses one.
-        // more than one lora message-box edit landing in the same drain means
-        // typing outpaced the last flush, so the flush below picks the cheaper
-        // waveform instead of adding to that backlog.
-        let mut lora_chars_this_pass = 0u32;
         while let Some(event) = t5s3_epaper_core::i2c::poll_event() {
             match event {
                 InputEvent::Home => {
                     if current_screen != Screen::Home {
-                        if current_screen == Screen::Reader {
-                            if let Some(doc) = &reader_doc {
-                                doc.save(&bus);
+                        match current_screen {
+                            Screen::Reader => {
+                                if let Some(doc) = &reader_doc {
+                                    doc.save(&bus);
+                                }
                             }
-                        }
-                        if current_screen == Screen::NoteEdit {
-                            notes::save(&bus, &note_name, &note_text);
-                        }
-                        if current_screen == Screen::Lora
-                            && lora_tab == LoraTab::Send
-                            && lora_message_dirty
-                        {
-                            display.flush_partial_fast(message_box_native_rect()).ok();
-                            lora_message_dirty = false;
-                            lora_message_quick_pending = false;
+                            Screen::NoteEdit => {
+                                notes::save(&bus, &note_name, &note_text);
+                                notes_field.flush_pending(&mut display);
+                            }
+                            Screen::Lora if lora_tab == LoraTab::Send => {
+                                lora_field.flush_pending(&mut display);
+                            }
+                            _ => {}
                         }
                         current_screen = Screen::Home;
                         needs_redraw = true;
@@ -1431,19 +1449,15 @@ async fn main(spawner: Spawner) -> ! {
                         }
                         Screen::Lora => {
                             if back_button_hit(sx, sy) {
-                                if lora_tab == LoraTab::Send && lora_message_dirty {
-                                    display.flush_partial_fast(message_box_native_rect()).ok();
-                                    lora_message_dirty = false;
-                                    lora_message_quick_pending = false;
+                                if lora_tab == LoraTab::Send {
+                                    lora_field.flush_pending(&mut display);
                                 }
                                 current_screen = Screen::Home;
                                 needs_redraw = true;
                             } else if let Some(tab) = tab_hit(sx, sy) {
                                 if tab != lora_tab {
-                                    if lora_tab == LoraTab::Send && lora_message_dirty {
-                                        display.flush_partial_fast(message_box_native_rect()).ok();
-                                        lora_message_dirty = false;
-                                        lora_message_quick_pending = false;
+                                    if lora_tab == LoraTab::Send {
+                                        lora_field.flush_pending(&mut display);
                                     }
                                     lora_tab = tab;
                                     // newest-first: open at the top
@@ -1525,20 +1539,20 @@ async fn main(spawner: Spawner) -> ! {
                                     }
                                 }
                             } else if let (LoraTab::Send, Some(key)) =
-                                (lora_tab, keyboard::hit(sx, sy, kb_symbols, kb_shift))
+                                (lora_tab, lora_field.hit_key(sx, sy))
                             {
-                                match key {
-                                    Key::Shift => {
-                                        kb_shift = !kb_shift;
-                                        keyboard::draw(&mut display, kb_symbols, kb_shift, "SEND");
-                                        display.flush_partial_fast(keyboard::native_rect()).ok();
-                                    }
-                                    Key::Symbols => {
-                                        kb_symbols = !kb_symbols;
-                                        keyboard::draw(&mut display, kb_symbols, kb_shift, "SEND");
-                                        display.flush_partial_fast(keyboard::native_rect()).ok();
-                                    }
-                                    Key::Enter => {
+                                // cap typing at what one data slot can carry.
+                                let msg_cap = lora_mesh
+                                    .as_ref()
+                                    .map_or(MSG_MAX, |m| m.max_text_len().min(MSG_MAX));
+                                match lora_field.handle_key(
+                                    &mut display,
+                                    &mut lora_message,
+                                    key,
+                                    msg_cap,
+                                    now_us(),
+                                ) {
+                                    FieldEvent::Submit => {
                                         if lora_message.is_empty() {
                                             lora_status = String::from("nothing to send");
                                         } else if let Some(m) = &mut lora_mesh {
@@ -1577,8 +1591,7 @@ async fn main(spawner: Spawner) -> ! {
                                                         &mut chat_size,
                                                     );
                                                     lora_message.clear();
-                                                    lora_message_dirty = false;
-                                                    lora_message_quick_pending = false;
+                                                    lora_field.clear_pending();
                                                     // a full refresh (not a partial DU flush)
                                                     // clears the message box's prior text
                                                     // without the ghosting a fast partial
@@ -1603,47 +1616,14 @@ async fn main(spawner: Spawner) -> ! {
                                         // line too. also flush an earlier debounced keystroke
                                         // rather than leaving it unflushed.
                                         if !needs_redraw {
-                                            if lora_message_dirty {
-                                                display
-                                                    .flush_partial_fast(message_box_native_rect())
-                                                    .ok();
-                                                lora_message_dirty = false;
-                                                lora_message_quick_pending = false;
-                                            }
+                                            lora_field.flush_pending(&mut display);
                                             draw_lora_status(&mut display, &lora_status);
                                             display
                                                 .flush_partial_fast(lora_status_native_rect())
                                                 .ok();
                                         }
                                     }
-                                    other => {
-                                        // cap typing at what one data slot can carry.
-                                        let msg_cap = lora_mesh
-                                            .as_ref()
-                                            .map_or(MSG_MAX, |m| m.max_text_len().min(MSG_MAX));
-                                        let changed = match other {
-                                            Key::Char(c) if lora_message.len() < msg_cap => {
-                                                lora_message.push(c);
-                                                true
-                                            }
-                                            Key::Space if lora_message.len() < msg_cap => {
-                                                lora_message.push(' ');
-                                                true
-                                            }
-                                            Key::Backspace => lora_message.pop().is_some(),
-                                            _ => false,
-                                        };
-                                        if changed {
-                                            // draw now (cheap, framebuffer-only) but defer the
-                                            // flush to the end of this pass's event-drain loop,
-                                            // so a backlog of queued keystrokes (typing outpaced
-                                            // the previous flush) batches into one panel write.
-                                            draw_message(&mut display, &lora_message);
-                                            lora_message_dirty = true;
-                                            lora_chars_this_pass += 1;
-                                            lora_message_last_edit_us = now_us();
-                                        }
-                                    }
+                                    FieldEvent::Changed | FieldEvent::None => {}
                                 }
                             }
                         }
@@ -1745,8 +1725,7 @@ async fn main(spawner: Spawner) -> ! {
                                     Some(name) => {
                                         note_name = name;
                                         note_text.clear();
-                                        kb_symbols = false;
-                                        kb_shift = false;
+                                        notes_field.reset_keyboard();
                                         note_delete_armed = false;
                                         current_screen = Screen::NoteEdit;
                                         needs_redraw = true;
@@ -1764,8 +1743,7 @@ async fn main(spawner: Spawner) -> ! {
                             {
                                 if let Some(entry) = notes_entries.get(i) {
                                     note_name = entry.name.clone();
-                                    kb_symbols = false;
-                                    kb_shift = false;
+                                    notes_field.reset_keyboard();
                                     note_delete_armed = false;
                                     // the editor draws only after the note's text is
                                     // read (below), mirroring the reader.
@@ -1777,6 +1755,7 @@ async fn main(spawner: Spawner) -> ! {
                         Screen::NoteEdit => {
                             if back_button_hit(sx, sy) {
                                 notes::save(&bus, &note_name, &note_text);
+                                notes_field.clear_pending();
                                 // back to the list, rescanned so the saved note's
                                 // preview is current.
                                 notes_dirty = true;
@@ -1784,6 +1763,7 @@ async fn main(spawner: Spawner) -> ! {
                             } else if notes::delete_hit(sx, sy) {
                                 if note_delete_armed {
                                     notes::delete(&bus, &note_name);
+                                    notes_field.clear_pending();
                                     notes_dirty = true;
                                     current_screen = Screen::Notes;
                                 } else {
@@ -1798,56 +1778,14 @@ async fn main(spawner: Spawner) -> ! {
                                     notes::draw_delete_button(&mut display, false);
                                     display.flush_partial_fast(notes::delete_native_rect()).ok();
                                 }
-                                if let Some(key) = keyboard::hit(sx, sy, kb_symbols, kb_shift) {
-                                    match key {
-                                        Key::Shift => {
-                                            kb_shift = !kb_shift;
-                                            keyboard::draw(
-                                                &mut display,
-                                                kb_symbols,
-                                                kb_shift,
-                                                "RET",
-                                            );
-                                            display
-                                                .flush_partial_fast(keyboard::native_rect())
-                                                .ok();
-                                        }
-                                        Key::Symbols => {
-                                            kb_symbols = !kb_symbols;
-                                            keyboard::draw(
-                                                &mut display,
-                                                kb_symbols,
-                                                kb_shift,
-                                                "RET",
-                                            );
-                                            display
-                                                .flush_partial_fast(keyboard::native_rect())
-                                                .ok();
-                                        }
-                                        other => {
-                                            match other {
-                                                Key::Char(c)
-                                                    if note_text.len() < notes::NOTE_MAX =>
-                                                {
-                                                    note_text.push(c)
-                                                }
-                                                Key::Space if note_text.len() < notes::NOTE_MAX => {
-                                                    note_text.push(' ')
-                                                }
-                                                Key::Enter if note_text.len() < notes::NOTE_MAX => {
-                                                    note_text.push('\n')
-                                                }
-                                                Key::Backspace => {
-                                                    note_text.pop();
-                                                }
-                                                _ => {}
-                                            }
-                                            notes::draw_note_text(&mut display, &note_text);
-                                            display
-                                                .flush_partial_fast(notes::text_area_native_rect())
-                                                .ok();
-                                        }
-                                    }
+                                if let Some(key) = notes_field.hit_key(sx, sy) {
+                                    notes_field.handle_key(
+                                        &mut display,
+                                        &mut note_text,
+                                        key,
+                                        notes::NOTE_MAX,
+                                        now_us(),
+                                    );
                                 }
                             }
                         }
@@ -1972,59 +1910,25 @@ async fn main(spawner: Spawner) -> ! {
                             if mesh_name_editing {
                                 // keyboard-driven name entry; SAVE commits to the
                                 // settings blob and the live mesh
-                                if let Some(key) = keyboard::hit(sx, sy, false, false) {
-                                    match key {
-                                        Key::Enter => {
+                                if let Some(key) = mesh_field.hit_key(sx, sy) {
+                                    match mesh_field.handle_key(
+                                        &mut display,
+                                        &mut mesh_name_draft,
+                                        key,
+                                        settings::ALIAS_CAP,
+                                        now_us(),
+                                    ) {
+                                        FieldEvent::Submit => {
                                             settings.set_mesh_alias(&mesh_name_draft);
                                             settings_dirty = true;
                                             if let Some(m) = &mut lora_mesh {
                                                 m.set_alias(settings.mesh_alias());
                                             }
+                                            mesh_field.clear_pending();
                                             mesh_name_editing = false;
                                             needs_redraw = true;
                                         }
-                                        Key::Char(c)
-                                            if mesh_name_draft.len() < settings::ALIAS_CAP =>
-                                        {
-                                            mesh_name_draft.push(c);
-                                            settings_page::mesh::draw_editor(
-                                                &mut display,
-                                                &mesh_name_draft,
-                                            );
-                                            display
-                                                .flush_partial_fast(
-                                                    settings_page::mesh::editor_rect(),
-                                                )
-                                                .ok();
-                                        }
-                                        Key::Space
-                                            if mesh_name_draft.len() < settings::ALIAS_CAP =>
-                                        {
-                                            mesh_name_draft.push(' ');
-                                            settings_page::mesh::draw_editor(
-                                                &mut display,
-                                                &mesh_name_draft,
-                                            );
-                                            display
-                                                .flush_partial_fast(
-                                                    settings_page::mesh::editor_rect(),
-                                                )
-                                                .ok();
-                                        }
-                                        Key::Backspace => {
-                                            mesh_name_draft.pop();
-                                            settings_page::mesh::clear_editor(&mut display);
-                                            settings_page::mesh::draw_editor(
-                                                &mut display,
-                                                &mesh_name_draft,
-                                            );
-                                            display
-                                                .flush_partial_fast(
-                                                    settings_page::mesh::editor_rect(),
-                                                )
-                                                .ok();
-                                        }
-                                        _ => {}
+                                        FieldEvent::Changed | FieldEvent::None => {}
                                     }
                                 }
                             } else {
@@ -2035,6 +1939,7 @@ async fn main(spawner: Spawner) -> ! {
                                     }
                                     Some(settings_page::mesh::Hit::EditName) => {
                                         mesh_name_draft = String::from(settings.mesh_alias());
+                                        mesh_field.reset_keyboard();
                                         mesh_name_editing = true;
                                         needs_redraw = true;
                                     }
@@ -2092,68 +1997,28 @@ async fn main(spawner: Spawner) -> ! {
                             if wifi_pw_mode {
                                 if back_button_hit(sx, sy) {
                                     // cancel password entry, back to the status view.
+                                    wifi_field.clear_pending();
                                     wifi_pw_mode = false;
                                     wifi_status = String::from("join cancelled");
                                     needs_redraw = true;
-                                } else if let Some(key) =
-                                    keyboard::hit(sx, sy, kb_symbols, kb_shift)
-                                {
-                                    match key {
-                                        Key::Shift => {
-                                            kb_shift = !kb_shift;
-                                            keyboard::draw(
-                                                &mut display,
-                                                kb_symbols,
-                                                kb_shift,
-                                                "SAVE",
-                                            );
-                                            display
-                                                .flush_partial_fast(keyboard::native_rect())
-                                                .ok();
-                                        }
-                                        Key::Symbols => {
-                                            kb_symbols = !kb_symbols;
-                                            keyboard::draw(
-                                                &mut display,
-                                                kb_symbols,
-                                                kb_shift,
-                                                "SAVE",
-                                            );
-                                            display
-                                                .flush_partial_fast(keyboard::native_rect())
-                                                .ok();
-                                        }
-                                        Key::Enter => {
+                                } else if let Some(key) = wifi_field.hit_key(sx, sy) {
+                                    match wifi_field.handle_key(
+                                        &mut display,
+                                        &mut wifi_pw_buf,
+                                        key,
+                                        settings_page::wifi::PASSWORD_MAX,
+                                        now_us(),
+                                    ) {
+                                        FieldEvent::Submit => {
                                             // leave the keyboard and attempt the join on
                                             // the next pass (so "connecting..." paints).
+                                            wifi_field.clear_pending();
                                             wifi_pw_mode = false;
                                             wifi_join_dirty = true;
                                             wifi_status = String::from("connecting...");
                                             needs_redraw = true;
                                         }
-                                        other => {
-                                            match other {
-                                                Key::Char(c) if wifi_pw_buf.len() < 63 => {
-                                                    wifi_pw_buf.push(c)
-                                                }
-                                                Key::Space if wifi_pw_buf.len() < 63 => {
-                                                    wifi_pw_buf.push(' ')
-                                                }
-                                                Key::Backspace => {
-                                                    wifi_pw_buf.pop();
-                                                }
-                                                _ => {}
-                                            }
-                                            settings_page::wifi::redraw_password(
-                                                &mut display,
-                                                &wifi_pw_buf,
-                                            );
-                                            display
-                                                .flush_partial_fast(
-                                                    settings_page::wifi::password_box_rect(),
-                                                )
-                                                .ok();
-                                        }
+                                        FieldEvent::Changed | FieldEvent::None => {}
                                     }
                                 }
                             } else {
@@ -2201,8 +2066,7 @@ async fn main(spawner: Spawner) -> ! {
                                                 wifi_reconnect = false;
                                                 if entry.secured {
                                                     // secured: collect the passphrase first.
-                                                    kb_symbols = false;
-                                                    kb_shift = false;
+                                                    wifi_field.reset_keyboard();
                                                     wifi_pw_mode = true;
                                                     wifi_status =
                                                         String::from("enter password, then SAVE");
@@ -2354,30 +2218,28 @@ async fn main(spawner: Spawner) -> ! {
             }
         }
 
-        // flush the lora message box once for whatever this pass's event
-        // drain changed, instead of once per character: a normal single
-        // keystroke still flushes right away (the loop above drained exactly
-        // one event), but a backlog of queued taps (typing outpaced the
-        // previous flush) gets drawn character-by-character above and
-        // written to the panel in this one pass. more than one character in
-        // the same pass means the panel is still behind, so take the
-        // cheaper waveform to keep draining rather than add to that debt;
-        // the settle branch below pays it off once typing actually pauses.
-        if lora_message_dirty {
-            if lora_chars_this_pass > 1 {
-                display.flush_partial_quick(message_box_native_rect()).ok();
-                lora_message_quick_pending = true;
-            } else {
-                display.flush_partial_fast(message_box_native_rect()).ok();
-                lora_message_quick_pending = false;
+        // flush whichever text field is active once per this pass's event
+        // drain, instead of once per character: a normal single keystroke
+        // still flushes right away (the loop above drained exactly one
+        // event), but a backlog of queued taps (typing outpaced the previous
+        // flush) gets drawn character-by-character above and written to the
+        // panel in this one pass, using the cheaper waveform to keep
+        // draining rather than add to that debt. `end_pass` pays off a
+        // pending cheap flush's ghosting once typing actually pauses.
+        match current_screen {
+            Screen::Lora if lora_tab == LoraTab::Send => {
+                lora_field.end_pass(&mut display, &lora_message, now_us());
             }
-            lora_message_dirty = false;
-        } else if lora_message_quick_pending
-            && now_us().saturating_sub(lora_message_last_edit_us) > MESSAGE_SETTLE_IDLE_US
-        {
-            draw_message(&mut display, &lora_message);
-            display.flush_partial_fast(message_box_native_rect()).ok();
-            lora_message_quick_pending = false;
+            Screen::NoteEdit => {
+                notes_field.end_pass(&mut display, &note_text, now_us());
+            }
+            Screen::SettingsWifi if wifi_pw_mode => {
+                wifi_field.end_pass(&mut display, &wifi_pw_buf, now_us());
+            }
+            Screen::SettingsMesh if mesh_name_editing => {
+                mesh_field.end_pass(&mut display, &mesh_name_draft, now_us());
+            }
+            _ => {}
         }
 
         // persist any settings change once, after leaving the settings screens
