@@ -7,6 +7,7 @@ extern crate t5s3_epaper_core;
 mod chatlog;
 mod datetime;
 mod fmt;
+mod io48;
 mod keyboard;
 mod layout;
 mod mesh;
@@ -1305,31 +1306,16 @@ async fn main(spawner: Spawner) -> ! {
                         }
                     }
                 } else {
-                    // in other screens, behavior depends on io48_action setting
-                    use crate::settings::Io48Action;
-                    match settings.io48_action {
-                        Io48Action::Sleep => {
-                            break;
-                        }
-                        Io48Action::Backlight => {
-                            // toggle the front light between off and its last
-                            // set brightness, without leaving the current screen.
-                            if light.brightness() > 0 {
-                                light.off();
-                            } else if brightness > 0 {
-                                light.set_brightness(brightness);
-                            } else {
-                                // never set this boot; use a mid-range level so
-                                // the toggle visibly does something.
-                                light.set_brightness(50);
-                            }
-                        }
-                        Io48Action::LoraReceive => {
+                    // on other screens the press maps to the settings-selected
+                    // action; see `io48::dispatch`.
+                    match io48::dispatch(settings.io48_action, &mut light, brightness) {
+                        io48::Outcome::Sleep => break,
+                        io48::Outcome::OpenLoraRecv => {
                             current_screen = Screen::Lora;
                             lora_tab = LoraTab::Recv;
                             needs_redraw = true;
                         }
-                        Io48Action::Nothing => {}
+                        io48::Outcome::Done => {}
                     }
                 }
             }
