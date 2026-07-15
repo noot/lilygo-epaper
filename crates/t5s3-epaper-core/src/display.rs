@@ -67,6 +67,13 @@ const BYTES_PER_LINE: usize = Display::WIDTH as usize / 4;
 const LINE_BYTES_4BPP: usize = Display::WIDTH as usize / 2;
 const LINE_BYTES_DIFFERENCE: usize = Display::WIDTH as usize;
 const DU_FRAME_TIMES: [u16; 5] = [1000, 1000, 1000, 1000, 1000];
+// same per-row pulse width as DU_FRAME_TIMES, fewer repetitions: the du
+// waveform pushes pixels toward their target with each repeated pulse, so
+// cutting frames trades completeness of that push (more visible ghosting on
+// incomplete transitions) for proportionally less row-scan time. Meant for
+// bursty input where a full-quality flush would only add to a backlog that's
+// growing faster than the panel can drain it; see `flush_partial_quick`.
+const DU_FRAME_TIMES_FAST: [u16; 2] = [1000, 1000];
 const DU_LUT_PHASE: [[u8; 4]; 16] = [
     [0x15, 0x55, 0x55, 0x55],
     [0x00, 0x00, 0x00, 0x00],
@@ -86,8 +93,8 @@ const DU_LUT_PHASE: [[u8; 4]; 16] = [
     [0xAA, 0xAA, 0xAA, 0xA8],
 ];
 
-pub struct Display<'a, 'd> {
-    epd: ed047tc1::ED047TC1<'a, 'd>,
+pub struct Display<'d> {
+    epd: ed047tc1::ED047TC1<'d>,
     skipping: u16,
     framebuffer: Box<[u8; FRAMEBUFFER_SIZE]>,
     previous_framebuffer: Box<[u8; FRAMEBUFFER_SIZE]>,
@@ -98,7 +105,7 @@ pub struct Display<'a, 'd> {
     lut: Vec<u8>,
 }
 
-impl<'a, 'd> Display<'a, 'd> {
+impl<'d> Display<'d> {
     /// Width of the screen.
     pub const WIDTH: u16 = 960;
     /// Height of the screen
@@ -110,15 +117,18 @@ impl<'a, 'd> Display<'a, 'd> {
         width: Self::WIDTH,
         height: Self::HEIGHT,
     };
+    /// Build the display. The panel's I2C registers (power sequencing,
+    /// battery, charger) are accessed through `crate::i2c`'s channel, so the
+    /// i2c worker (see `crate::i2c::Worker`) must already be running on the
+    /// second core by the time this is called.
     pub fn new(
         pins: ed047tc1::PinConfig<'d>,
-        i2c: &'a crate::i2c::Bus<'d>,
         dma: peripherals::DMA_CH0<'d>,
         lcd_cam: peripherals::LCD_CAM<'d>,
         rmt: peripherals::RMT<'d>,
     ) -> Result<Self> {
         Ok(Display {
-            epd: ed047tc1::ED047TC1::new(pins, i2c, dma, lcd_cam, rmt)?,
+            epd: ed047tc1::ED047TC1::new(pins, dma, lcd_cam, rmt)?,
             skipping: 0,
             framebuffer: Box::new([0xFF; FRAMEBUFFER_SIZE]),
             previous_framebuffer: Box::new([0xFF; FRAMEBUFFER_SIZE]),
@@ -159,24 +169,22 @@ impl<'a, 'd> Display<'a, 'd> {
 
     /// Power the display down and enter deep sleep.
     ///
-    /// The boot button (`GPIO0`) is always enabled as a wake source. If
-    /// `timer` is provided, it is enabled as an additional wake source.
+    /// `boot_btn` (`GPIO0`) is always enabled as a wake source. If `timer` is
+    /// provided, it is enabled as an additional wake source.
+    ///
+    /// Every step here that touches the i2c bus (panel power-off, the
+    /// LoRa/GPS rail, the GT911 touch controller) must run before
+    /// [`crate::i2c::sleep_and_park`]; nothing after it may submit an i2c
+    /// request, since that call is core 1's cue to stop servicing the queue
+    /// for good.
     pub fn deep_sleep(
         mut self,
         lpwr: peripherals::LPWR<'d>,
-        input: crate::input::Controller<'_, 'd>,
+        boot_btn: esp_hal::gpio::AnyPin<'d>,
         timer: Option<Duration>,
     ) -> ! {
-        let mut input = input;
         if let Err(err) = self.power_off() {
             warn!("display power off before sleep failed: {:?}", err);
-        }
-
-        // put the GT911 touch controller to sleep; it lives on the always-on
-        // 3.3 V rail and keeps scanning otherwise. its internal sleep state
-        // survives the chip's deep sleep (a reset on the next boot wakes it).
-        if let Err(err) = input.sleep() {
-            warn!("touch sleep before deep sleep failed: {:?}", err);
         }
 
         // cut the GPS/LoRa 3.3 V rail; left on it draws tens of mA through deep
@@ -185,6 +193,13 @@ impl<'a, 'd> Display<'a, 'd> {
         if let Err(err) = self.epd.lora_gps_power_off() {
             warn!("lora/gps power off before sleep failed: {:?}", err);
         }
+
+        // put the GT911 touch controller to sleep; it lives on the always-on
+        // 3.3 V rail and keeps scanning otherwise. its internal sleep state
+        // survives the chip's deep sleep (a reset on the next boot wakes it).
+        // this must happen on core 1 (which owns the touch pins), so hand it
+        // off through the sleep/park handshake and wait for it to finish.
+        crate::i2c::sleep_and_park(&Delay::new());
 
         // With that rail cut the SX1262 is unpowered, but its reset line idles
         // high and would back-power the dead chip through its pull-up. Drive
@@ -197,7 +212,7 @@ impl<'a, 'd> Display<'a, 'd> {
         let _lora_rst = Output::new(lora_rst_pin, Level::Low, OutputConfig::default());
         unsafe { peripherals::GPIO1::steal() }.rtcio_pad_hold(true);
 
-        crate::power::deep_sleep(lpwr, input.into_boot_button(), timer)
+        crate::power::deep_sleep(lpwr, boot_btn, timer)
     }
 
     /// Read the panel temperature in degrees Celsius from the TPS65185 PMIC.
@@ -380,13 +395,28 @@ impl<'a, 'd> Display<'a, 'd> {
     /// This is intended for small text/UI regions where reduced flicker matters
     /// more than perfect grayscale handling.
     pub fn flush_partial_fast(&mut self, area: Rectangle) -> Result<()> {
+        self.flush_partial_du(area, &DU_FRAME_TIMES)
+    }
+
+    /// Like [`Display::flush_partial_fast`], but repeats the direct-update
+    /// waveform fewer times, trading completeness of the pixel transition
+    /// (more visible ghosting) for a proportionally shorter row-scan. Meant
+    /// for a caller that's falling behind bursty input and wants to keep
+    /// draining it rather than spend the full flush cost on every update;
+    /// follow up with [`Display::flush_partial_fast`] on the same area once
+    /// the caller catches up, to clean up any ghosting left behind.
+    pub fn flush_partial_quick(&mut self, area: Rectangle) -> Result<()> {
+        self.flush_partial_du(area, &DU_FRAME_TIMES_FAST)
+    }
+
+    fn flush_partial_du(&mut self, area: Rectangle, frame_times: &[u16]) -> Result<()> {
         let area = self.clip_rectangle(area);
         if area.width == 0 || area.height == 0 {
             return Ok(());
         }
 
         debug!("display flush partial fast");
-        self.draw_partial_du(area)?;
+        self.draw_partial_du(area, frame_times)?;
         copy_rect(&mut self.previous_framebuffer, &self.framebuffer, area);
         self.framebuffer.fill(0xFF);
         self.tainted_rows.fill(0);
@@ -405,14 +435,15 @@ impl<'a, 'd> Display<'a, 'd> {
         Ok(())
     }
 
-    fn draw_partial_du(&mut self, area: Rectangle) -> Result<()> {
-        // the du lut depends only on the fixed phase table: build it once for
-        // all frames, in the display-owned buffer (no allocation).
+    fn draw_partial_du(&mut self, area: Rectangle, frame_times: &[u16]) -> Result<()> {
+        // the du lut depends only on the fixed phase table, not on how many
+        // frames get driven below: build it once for all frames, in the
+        // display-owned buffer (no allocation).
         update_du_lut(&mut self.lut, &DU_LUT_PHASE);
         let mut line = [0u8; LINE_BYTES_DIFFERENCE];
         let mut buf = [0u8; BYTES_PER_LINE];
 
-        for output_time in DU_FRAME_TIMES {
+        for output_time in frame_times.iter().copied() {
             self.skipping = 0;
             self.epd.frame_start()?;
 

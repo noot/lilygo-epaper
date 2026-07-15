@@ -1,12 +1,13 @@
 //! Driver for the on-board BQ25896 battery charger PMIC.
 //!
-//! The chip shares the panel I2C bus owned by the display driver, so register
-//! access goes through [`crate::Display::charger_status`] and
-//! [`crate::power::shutdown`] rather than this module owning the bus.
+//! The chip shares the panel I2C bus owned by [`crate::i2c::Worker`], so
+//! register access goes through this module's channel-based accessors
+//! (queued as [`Request`]/[`Response`] and dispatched from the worker's
+//! owning core) rather than this module owning the bus directly.
 
 use esp_hal::{delay::Delay, i2c::master::I2c, Blocking};
 
-const ADDR: u8 = 0x6B;
+pub(crate) const ADDR: u8 = 0x6B;
 const REG_ADC_CONTROL: u8 = 0x02;
 const REG_MISC_OPERATION: u8 = 0x09;
 const REG_STATUS: u8 = 0x0B;
@@ -60,9 +61,43 @@ pub struct Status {
     pub charge_ma: u16,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Request {
+    Status,
+    Shutdown,
+}
+
+pub(crate) enum Response {
+    Status(crate::Result<Status>),
+    Unit(crate::Result<()>),
+}
+
+/// Dispatch a queued request against the owned i2c bus. Called from
+/// `crate::i2c::Worker::dispatch`, which runs on the core that owns `i2c`.
+pub(crate) fn dispatch(i2c: &mut I2c<'_, Blocking>, request: Request) -> Response {
+    match request {
+        Request::Status => Response::Status(read_status(i2c)),
+        Request::Shutdown => Response::Unit(disable_batfet(i2c)),
+    }
+}
+
+pub(crate) fn charger_status() -> crate::Result<Status> {
+    match crate::i2c::submit(crate::i2c::Request::Charger(Request::Status)) {
+        crate::i2c::Response::Charger(Response::Status(r)) => r,
+        _ => unreachable!("bq25896: Status always answers Response::Status"),
+    }
+}
+
+pub(crate) fn charger_shutdown() -> crate::Result<()> {
+    match crate::i2c::submit(crate::i2c::Request::Charger(Request::Shutdown)) {
+        crate::i2c::Response::Charger(Response::Unit(r)) => r,
+        _ => unreachable!("bq25896: Shutdown always answers Response::Unit"),
+    }
+}
+
 // kick a one-shot ADC conversion so the voltage/current registers hold fresh
 // values, wait for it to finish, then decode the status registers.
-pub(crate) fn read_status(i2c: &mut I2c<'_, Blocking>) -> crate::Result<Status> {
+fn read_status(i2c: &mut I2c<'_, Blocking>) -> crate::Result<Status> {
     // CONV_RATE is cleared in case continuous mode was left enabled, so that
     // CONV_START reliably self-clears when the conversion completes.
     let adc = read_register(i2c, REG_ADC_CONTROL)?;
@@ -113,7 +148,7 @@ pub(crate) fn read_status(i2c: &mut I2c<'_, Blocking>) -> crate::Result<Status> 
 
 // turn the BATFET off, disconnecting the battery from the system rail. this is
 // the full power-off path used by `power::shutdown`.
-pub(crate) fn disable_batfet(i2c: &mut I2c<'_, Blocking>) -> crate::Result<()> {
+fn disable_batfet(i2c: &mut I2c<'_, Blocking>) -> crate::Result<()> {
     let value = read_register(i2c, REG_MISC_OPERATION)?;
     write_register(i2c, REG_MISC_OPERATION, value | BATFET_DIS)
 }
@@ -128,3 +163,5 @@ fn read_register(i2c: &mut I2c<'_, Blocking>, reg: u8) -> crate::Result<u8> {
 fn write_register(i2c: &mut I2c<'_, Blocking>, reg: u8, value: u8) -> crate::Result<()> {
     i2c.write(ADDR, &[reg, value]).map_err(crate::Error::I2c)
 }
+
+impl crate::i2c::Registered for crate::i2c::Addr<{ ADDR }> {}

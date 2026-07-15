@@ -29,7 +29,7 @@ const KB_ENTER_W: i32 = 110;
 const KB_LETTERS: [&str; 3] = ["qwertyuiop", "asdfghjkl", "zxcvbnm"];
 const KB_SYMBOLS: [&str; 3] = ["1234567890", "@#$&-+()/", "*\"':;!?,"];
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Key {
     Char(char),
     Shift,
@@ -145,9 +145,29 @@ fn keyboard(symbols: bool, shift: bool) -> Vec<KeyBox> {
     keys
 }
 
+// hit() polls this once per touch press while a keyboard screen is active, so
+// avoid rebuilding all ~30 KeyBox entries (with heap allocation) on every call
+// when the (symbols, shift) layer hasn't changed since the last hit(). hit()
+// is only ever called from core 0's single UI task, so the unsynchronized
+// static is sound.
+static mut KB_CACHE: Option<(bool, bool, Vec<KeyBox>)> = None;
+
+fn cached_keyboard(symbols: bool, shift: bool) -> &'static [KeyBox] {
+    unsafe {
+        let cache = &mut *core::ptr::addr_of_mut!(KB_CACHE);
+        if !matches!(cache, Some((s, sh, _)) if *s == symbols && *sh == shift) {
+            *cache = Some((symbols, shift, keyboard(symbols, shift)));
+        }
+        match cache {
+            Some((_, _, keys)) => keys,
+            None => &[],
+        }
+    }
+}
+
 pub(crate) fn hit(sx: i32, sy: i32, symbols: bool, shift: bool) -> Option<Key> {
-    keyboard(symbols, shift)
-        .into_iter()
+    cached_keyboard(symbols, shift)
+        .iter()
         .find_map(|k| (sx >= k.x && sx < k.x + k.w && sy >= k.y && sy < k.y + k.h).then_some(k.key))
 }
 

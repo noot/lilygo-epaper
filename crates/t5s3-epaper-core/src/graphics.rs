@@ -5,7 +5,7 @@ use crate::{
     Error,
 };
 
-impl DrawTarget for Display<'_, '_> {
+impl DrawTarget for Display<'_> {
     type Color = Gray4;
 
     type Error = Error;
@@ -52,7 +52,7 @@ fn translate_coord_rotation(x: i32, y: i32, rotation: &DisplayRotation) -> Optio
     }
 }
 
-impl OriginDimensions for Display<'_, '_> {
+impl OriginDimensions for Display<'_> {
     fn size(&self) -> Size {
         match self.rotation() {
             DisplayRotation::Rotate0 | DisplayRotation::Rotate180 => {

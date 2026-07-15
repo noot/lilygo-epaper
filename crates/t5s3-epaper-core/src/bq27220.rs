@@ -1,12 +1,13 @@
 //! Driver for the on-board BQ27220 battery fuel gauge.
 //!
-//! The chip shares the panel I2C bus owned by the display driver, so register
-//! access goes through the [`crate::Display`] battery methods rather than
-//! this module owning the bus.
+//! The chip shares the panel I2C bus owned by [`crate::i2c::Worker`], so
+//! register access goes through this module's channel-based accessors
+//! (queued as [`Request`]/[`Response`] and dispatched from the worker's
+//! owning core) rather than this module owning the bus directly.
 
 use esp_hal::{delay::Delay, i2c::master::I2c, Blocking};
 
-const ADDR: u8 = 0x55;
+pub(crate) const ADDR: u8 = 0x55;
 const REG_CONTROL: u8 = 0x00;
 const REG_VOLTAGE: u8 = 0x08;
 const REG_BATTERY_STATUS: u8 = 0x0A;
@@ -69,17 +70,91 @@ pub struct Diagnostics {
     pub sealed: bool,
 }
 
-pub(crate) fn voltage_mv(i2c: &mut I2c<'_, Blocking>) -> crate::Result<u16> {
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Request {
+    VoltageMv,
+    StateOfCharge,
+    TimeToFullMinutes,
+    Diagnostics,
+    ExitConfigUpdate,
+    ProgramCapacity(u16),
+}
+
+pub(crate) enum Response {
+    U16(crate::Result<u16>),
+    OptU16(crate::Result<Option<u16>>),
+    Diagnostics(crate::Result<Diagnostics>),
+    Unit(crate::Result<()>),
+}
+
+/// Dispatch a queued request against the owned i2c bus. Called from
+/// `crate::i2c::Worker::dispatch`, which runs on the core that owns `i2c`.
+pub(crate) fn dispatch(i2c: &mut I2c<'_, Blocking>, request: Request) -> Response {
+    match request {
+        Request::VoltageMv => Response::U16(voltage_mv(i2c)),
+        Request::StateOfCharge => Response::U16(state_of_charge(i2c)),
+        Request::TimeToFullMinutes => Response::OptU16(time_to_full_minutes(i2c)),
+        Request::Diagnostics => Response::Diagnostics(diagnostics(i2c)),
+        Request::ExitConfigUpdate => Response::Unit(exit_config_update(i2c)),
+        Request::ProgramCapacity(mah) => Response::Unit(program_capacity(i2c, mah)),
+    }
+}
+
+pub(crate) fn battery_voltage_mv() -> crate::Result<u16> {
+    match crate::i2c::submit(crate::i2c::Request::Battery(Request::VoltageMv)) {
+        crate::i2c::Response::Battery(Response::U16(r)) => r,
+        _ => unreachable!("bq27220: VoltageMv always answers Response::U16"),
+    }
+}
+
+pub(crate) fn battery_state_of_charge() -> crate::Result<u16> {
+    match crate::i2c::submit(crate::i2c::Request::Battery(Request::StateOfCharge)) {
+        crate::i2c::Response::Battery(Response::U16(r)) => r,
+        _ => unreachable!("bq27220: StateOfCharge always answers Response::U16"),
+    }
+}
+
+pub(crate) fn battery_time_to_full_minutes() -> crate::Result<Option<u16>> {
+    match crate::i2c::submit(crate::i2c::Request::Battery(Request::TimeToFullMinutes)) {
+        crate::i2c::Response::Battery(Response::OptU16(r)) => r,
+        _ => unreachable!("bq27220: TimeToFullMinutes always answers Response::OptU16"),
+    }
+}
+
+pub(crate) fn fuel_gauge_diagnostics() -> crate::Result<Diagnostics> {
+    match crate::i2c::submit(crate::i2c::Request::Battery(Request::Diagnostics)) {
+        crate::i2c::Response::Battery(Response::Diagnostics(r)) => r,
+        _ => unreachable!("bq27220: Diagnostics always answers Response::Diagnostics"),
+    }
+}
+
+pub(crate) fn fuel_gauge_exit_config_update() -> crate::Result<()> {
+    match crate::i2c::submit(crate::i2c::Request::Battery(Request::ExitConfigUpdate)) {
+        crate::i2c::Response::Battery(Response::Unit(r)) => r,
+        _ => unreachable!("bq27220: ExitConfigUpdate always answers Response::Unit"),
+    }
+}
+
+pub(crate) fn fuel_gauge_program_capacity(capacity_mah: u16) -> crate::Result<()> {
+    match crate::i2c::submit(crate::i2c::Request::Battery(Request::ProgramCapacity(
+        capacity_mah,
+    ))) {
+        crate::i2c::Response::Battery(Response::Unit(r)) => r,
+        _ => unreachable!("bq27220: ProgramCapacity always answers Response::Unit"),
+    }
+}
+
+fn voltage_mv(i2c: &mut I2c<'_, Blocking>) -> crate::Result<u16> {
     read_word(i2c, REG_VOLTAGE)
 }
 
-pub(crate) fn state_of_charge(i2c: &mut I2c<'_, Blocking>) -> crate::Result<u16> {
+fn state_of_charge(i2c: &mut I2c<'_, Blocking>) -> crate::Result<u16> {
     read_word(i2c, REG_STATE_OF_CHARGE)
 }
 
 // predicted minutes until full based on the average charge current, including
 // the gauge's taper-time extension; None when the battery is not charging.
-pub(crate) fn time_to_full_minutes(i2c: &mut I2c<'_, Blocking>) -> crate::Result<Option<u16>> {
+fn time_to_full_minutes(i2c: &mut I2c<'_, Blocking>) -> crate::Result<Option<u16>> {
     let minutes = read_word(i2c, REG_TIME_TO_FULL)?;
     if minutes == TIME_TO_FULL_NOT_CHARGING {
         Ok(None)
@@ -88,7 +163,7 @@ pub(crate) fn time_to_full_minutes(i2c: &mut I2c<'_, Blocking>) -> crate::Result
     }
 }
 
-pub(crate) fn diagnostics(i2c: &mut I2c<'_, Blocking>) -> crate::Result<Diagnostics> {
+fn diagnostics(i2c: &mut I2c<'_, Blocking>) -> crate::Result<Diagnostics> {
     let battery_status = read_word(i2c, REG_BATTERY_STATUS)?;
     let operation_status = read_word(i2c, REG_OPERATION_STATUS)?;
     Ok(Diagnostics {
@@ -106,7 +181,7 @@ pub(crate) fn diagnostics(i2c: &mut I2c<'_, Blocking>) -> crate::Result<Diagnost
 // in that mode (e.g. by an interrupted configuration write from a previous
 // firmware) stops updating its state of charge entirely; the re-init also
 // re-seeds the charge estimate from an open-circuit voltage measurement.
-pub(crate) fn exit_config_update(i2c: &mut I2c<'_, Blocking>) -> crate::Result<()> {
+fn exit_config_update(i2c: &mut I2c<'_, Blocking>) -> crate::Result<()> {
     control(i2c, SUBCMD_EXIT_CFG_UPDATE_REINIT)
 }
 
@@ -115,10 +190,7 @@ pub(crate) fn exit_config_update(i2c: &mut I2c<'_, Blocking>) -> crate::Result<(
 // the gauge ever loses battery power), so callers re-apply this whenever the
 // stored design capacity differs. exiting re-initializes gauging, re-seeding
 // the charge estimate against the new capacity.
-pub(crate) fn program_capacity(
-    i2c: &mut I2c<'_, Blocking>,
-    capacity_mah: u16,
-) -> crate::Result<()> {
+fn program_capacity(i2c: &mut I2c<'_, Blocking>, capacity_mah: u16) -> crate::Result<()> {
     let delay = Delay::new();
 
     // data-memory writes need full access: send the unseal key pair followed
@@ -216,3 +288,5 @@ fn read_word(i2c: &mut I2c<'_, Blocking>, reg: u8) -> crate::Result<u16> {
         .map_err(crate::Error::I2c)?;
     Ok(u16::from_le_bytes(value))
 }
+
+impl crate::i2c::Registered for crate::i2c::Addr<{ ADDR }> {}

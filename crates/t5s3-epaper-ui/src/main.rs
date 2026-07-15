@@ -37,20 +37,24 @@ use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
     delay::Delay,
+    gpio::Pin,
     interrupt::software::SoftwareInterruptControl,
+    system::{CpuControl, Stack},
     timer::timg::TimerGroup,
 };
 use t5s3_epaper_core::{
     display::DisplayRotation,
-    input_pin_config,
     lora::Lora,
+    pcf8563,
     pin_config,
     sdcard::DirectoryEntry,
+    touch_pin_config,
     Clock,
-    Controller,
     Display,
     DrawMode,
     FrontLight,
+    I2cWorker,
+    InputEvent,
 };
 #[cfg(feature = "gps")]
 use t5s3_epaper_core::{gps::Gps, gps_pin_config, SdCard};
@@ -129,7 +133,6 @@ use crate::{
         library,
         lora::{
             draw_info_tab,
-            draw_list,
             draw_lora_screen,
             draw_lora_status,
             draw_message,
@@ -145,13 +148,11 @@ use crate::{
             recv_scroll_max,
             recv_scroll_up_hit,
             recv_visible_rows,
-            sent_native_rect,
             tab_hit,
             Tab as LoraTab,
             LIST_MAX,
             MSG_MAX,
             RECV_MAX,
-            SENT_Y,
         },
         music,
         notes,
@@ -245,6 +246,18 @@ fn mesh_stamp(clock: &mut Clock, settings: &Settings, utc_seconds: Option<u64>) 
         format!("[{h12}:{m:02}:{s:02}{suffix}] ")
     }
 }
+
+fn now_us() -> u64 {
+    esp_hal::time::Instant::now()
+        .duration_since_epoch()
+        .as_micros()
+}
+
+// how long the lora message box must go untouched before a pending quick
+// flush's ghosting gets cleaned up with a full-quality one; long enough that
+// it doesn't fire between characters of the same typing burst (bursts land
+// well under this), short enough that it settles right after the user stops.
+const MESSAGE_SETTLE_IDLE_US: u64 = 400_000;
 
 // after a timezone or time-format change, repaint the status-bar clock so the
 // shown time reflects the new setting immediately; returns the minute now shown
@@ -342,24 +355,41 @@ async fn main(spawner: Spawner) -> ! {
     // boot or if the stored blob is missing/invalid.
     let mut settings = Settings::load();
 
-    let i2c_bus =
-        t5s3_epaper_core::i2c::Bus::new(peripherals.I2C0, peripherals.GPIO39, peripherals.GPIO40)
-            .expect("to build i2c bus");
+    // the i2c bus (touch, panel power, battery, charger, external rtc) is
+    // owned entirely by a worker running on the second core; every
+    // i2c-touching driver on this core (Display, pcf8563) goes through its
+    // request/response channel instead of borrowing the peripheral directly.
+    // an earlier design shared the bus across cores behind a spinlock, which
+    // corrupted the GT911 protocol under load (duplicated keystrokes); a
+    // single owner removes that failure mode entirely, and running the touch
+    // poll on its own core keeps taps responsive while core 0 is busy with a
+    // display flush, mesh service slice, or blocking sd scan.
+    let i2c_worker = I2cWorker::new(
+        peripherals.I2C0,
+        peripherals.GPIO39,
+        peripherals.GPIO40,
+        touch_pin_config!(peripherals),
+    )
+    .expect("to build i2c worker");
+    static mut I2C_CORE_STACK: Stack<16384> = Stack::new();
+    let mut cpu_control = CpuControl::new(peripherals.CPU_CTRL);
+    let i2c_core_guard = cpu_control
+        .start_app_core(
+            unsafe { &mut *core::ptr::addr_of_mut!(I2C_CORE_STACK) },
+            move || i2c_worker.run(),
+        )
+        .expect("to start the i2c worker on the second core");
+    core::mem::forget(i2c_core_guard);
+
+    // Display::new() writes the panel's initial power-sequencing registers
+    // over the channel, so it must run after the worker above is looping.
     let mut display = Display::new(
         pin_config!(peripherals),
-        &i2c_bus,
         peripherals.DMA_CH0,
         peripherals.LCD_CAM,
         peripherals.RMT,
     )
     .expect("to initialize display");
-    // input (touch + all three buttons) runs on the shared i2c bus,
-    // independent of the display driver.
-    let mut input_ctl = Controller::new(&i2c_bus, input_pin_config!(peripherals));
-    // battery-backed external rtc, also on the shared i2c bus: restored from
-    // below whenever the internal clock was reset, written back on every
-    // successful ntp sync.
-    let rtc_ext = t5s3_epaper_core::pcf8563::Rtc::new(&i2c_bus);
 
     display.set_rotation(DisplayRotation::Rotate270);
 
@@ -457,7 +487,7 @@ async fn main(spawner: Spawner) -> ! {
     // the battery-backed external rtc keeps ticking: restore from it, so wifi
     // is only needed when that too has lost time (first boot / battery pull).
     if !clock_synced {
-        match rtc_ext.read_unix() {
+        match pcf8563::read_unix() {
             Ok(Some(unix)) => {
                 clock.set_now_us(unix * 1_000_000);
                 clock_synced = true;
@@ -490,7 +520,7 @@ async fn main(spawner: Spawner) -> ! {
             WifiEvent::TimeSynced(Some(unix)) => {
                 set_utc_time(&mut clock, unix);
                 clock_synced = true;
-                if let Err(e) = rtc_ext.set_unix(unix) {
+                if let Err(e) = pcf8563::set_unix(unix) {
                     esp_println::println!("clock: external rtc write failed: {e}");
                 }
             }
@@ -508,8 +538,6 @@ async fn main(spawner: Spawner) -> ! {
     };
     let mut needs_redraw = true;
     let mut brightness: u8 = settings.brightness;
-    // whether a finger is currently down, so each tap is handled once on press.
-    let mut touch_active = false;
     // whether the auxiliary button is currently held, so each press acts once.
     let mut aux_active = false;
     // set when Power Off is tapped on the sleep screen, to branch the teardown
@@ -561,6 +589,17 @@ async fn main(spawner: Spawner) -> ! {
     // else refreshes the send tab's action line since the info tab took
     // over the periodic status).
     let mut lora_send_pending = false;
+    // set when a keystroke changed the lora message but its flush was
+    // deferred to the end of this pass's touch-event drain, so a burst of
+    // queued taps (typing outpaced the previous flush) batches into one
+    // panel write instead of one per character.
+    let mut lora_message_dirty = false;
+    // set when the last message-box flush used the cheaper, fewer-frame
+    // waveform (see flush_partial_quick) rather than skipped entirely: it
+    // leaves a ghosting debt that a later full-quality flush needs to pay off
+    // once typing catches up.
+    let mut lora_message_quick_pending = false;
+    let mut lora_message_last_edit_us: u64 = 0;
     let mut chat_loaded = false;
     let mut chat_size: u64 = 0;
     let mut kb_symbols = false;
@@ -711,7 +750,7 @@ async fn main(spawner: Spawner) -> ! {
                             clock_synced = true;
                             needs_redraw = true;
                             resync_retry_secs = RETRY_INTERVAL_SECS;
-                            if let Err(e) = rtc_ext.set_unix(unix) {
+                            if let Err(e) = pcf8563::set_unix(unix) {
                                 esp_println::println!("clock: external rtc write failed: {e}");
                             }
                             if sync_check {
@@ -1251,35 +1290,11 @@ async fn main(spawner: Spawner) -> ! {
             }
         }
 
-        // poll touch/buttons every pass so input stays responsive. the GPS
-        // work below is non-blocking, so it never stalls this poll. a transient
-        // read error shouldn't reboot the ui, so log it and retry next pass.
-        let input = match input_ctl.state() {
-            Ok(input) => input,
-            Err(e) => {
-                esp_println::println!("input read failed: {e}");
-                delay.delay_millis(50);
-                continue;
-            }
-        };
-
-        if input.buttons.home && current_screen != Screen::Home {
-            if current_screen == Screen::Reader {
-                if let Some(doc) = &reader_doc {
-                    doc.save(&bus);
-                }
-            }
-            if current_screen == Screen::NoteEdit {
-                notes::save(&bus, &note_name, &note_text);
-            }
-            current_screen = Screen::Home;
-            needs_redraw = true;
-        }
-
         // the auxiliary button turns the page in the reader, and sleeps from any
         // other screen (the current screen is restored on wake). edge-detected so
-        // holding it acts once.
-        if input.buttons.auxiliary {
+        // holding it acts once; it's a polled level (not an event), so the
+        // debounce still lives here rather than in the i2c worker.
+        if t5s3_epaper_core::i2c::aux_button_pressed() {
             if !aux_active {
                 aux_active = true;
                 if current_screen == Screen::Reader {
@@ -1296,913 +1311,1073 @@ async fn main(spawner: Spawner) -> ! {
             aux_active = false;
         }
 
-        // edge-detect touches: act only on the press (untouched -> touched) and
-        // wait for release before accepting the next, so a tap held longer than
-        // one poll doesn't register repeatedly (double letters).
-        match input.touch.and_then(|s| s.first_point()) {
-            Some(point) if !touch_active => {
-                touch_active = true;
-                let (sx, sy) = touch_to_screen(point.x, point.y);
+        // home presses and taps arrive pre-edge-detected from the i2c worker's
+        // autonomous touch poll on the second core (see `t5s3_epaper_core::i2c`),
+        // so every event here is already a fresh press; drain all of them before
+        // drawing so a screen change or a flush in between never loses one.
+        // more than one lora message-box edit landing in the same drain means
+        // typing outpaced the last flush, so the flush below picks the cheaper
+        // waveform instead of adding to that backlog.
+        let mut lora_chars_this_pass = 0u32;
+        while let Some(event) = t5s3_epaper_core::i2c::poll_event() {
+            match event {
+                InputEvent::Home => {
+                    if current_screen != Screen::Home {
+                        if current_screen == Screen::Reader {
+                            if let Some(doc) = &reader_doc {
+                                doc.save(&bus);
+                            }
+                        }
+                        if current_screen == Screen::NoteEdit {
+                            notes::save(&bus, &note_name, &note_text);
+                        }
+                        if current_screen == Screen::Lora
+                            && lora_tab == LoraTab::Send
+                            && lora_message_dirty
+                        {
+                            display.flush_partial_fast(message_box_native_rect()).ok();
+                            lora_message_dirty = false;
+                            lora_message_quick_pending = false;
+                        }
+                        current_screen = Screen::Home;
+                        needs_redraw = true;
+                    }
+                }
+                InputEvent::Tap { x, y } => {
+                    let (sx, sy) = touch_to_screen(x, y);
 
-                match current_screen {
-                    Screen::Home => {
-                        if let Some(idx) = hit_test(sx, sy) {
-                            current_screen = ICONS[idx].screen;
-                            // the file browser draws only after its listing is
-                            // loaded (below), so it sets `files_dirty` instead of
-                            // redrawing now with an empty list.
-                            match current_screen {
-                                Screen::Files => {
-                                    files_path = String::from("/");
-                                    files_dirty = true;
-                                }
-                                // the notes list draws only after its listing is
-                                // loaded too.
-                                Screen::Notes => {
-                                    notes_dirty = true;
-                                }
-                                // the server pages paint a "loading" view now,
-                                // then fetch over wifi on the next pass.
-                                Screen::Music => {
-                                    music.refresh(music::View::Loading);
-                                    music_command = None;
-                                    music_inline = false;
-                                    music_status = None;
-                                    music_anchor = None;
-                                    needs_redraw = true;
-                                }
-                                Screen::Environment => {
-                                    env.refresh(environment::View::Loading);
-                                    needs_redraw = true;
-                                }
-                                Screen::Weather => {
-                                    weather.refresh(weather::View::Loading);
-                                    needs_redraw = true;
-                                }
-                                // the shelf paints a "scanning" view now, then
-                                // scans the card on the next pass.
-                                Screen::Library => {
-                                    library.refresh(library::View::Loading);
-                                    library_scroll = 0;
-                                    needs_redraw = true;
-                                }
-                                // the gps page paints its map panel as "loading"
-                                // now, then fetches over wifi on the next pass.
-                                #[cfg(feature = "gps")]
-                                Screen::Gps => {
-                                    gps_map.refresh(MapView::Loading);
-                                    needs_redraw = true;
-                                }
-                                _ => needs_redraw = true,
-                            }
-                        }
-                    }
-                    Screen::Frontlight => {
-                        if back_button_hit(sx, sy) {
-                            current_screen = Screen::Home;
-                            needs_redraw = true;
-                        } else if minus_hit(sx, sy) {
-                            brightness = brightness.saturating_sub(BRIGHTNESS_STEP);
-                            light.set_brightness(brightness);
-                            draw_brightness_area(&mut display, brightness);
-                            display.flush_partial_fast(brightness_native_rect()).ok();
-                        } else if plus_hit(sx, sy) {
-                            brightness = brightness.saturating_add(BRIGHTNESS_STEP).min(100);
-                            light.set_brightness(brightness);
-                            draw_brightness_area(&mut display, brightness);
-                            display.flush_partial_fast(brightness_native_rect()).ok();
-                        }
-                    }
-                    Screen::Sleep => {
-                        if back_button_hit(sx, sy) {
-                            current_screen = Screen::Home;
-                            needs_redraw = true;
-                        } else if sleep_now_hit(sx, sy) {
-                            // leave the loop to draw the screensaver and enter
-                            // deep sleep below
-                            break;
-                        } else if power_off_hit(sx, sy) {
-                            // leave the loop to power the board off below
-                            power_off = true;
-                            break;
-                        }
-                    }
-                    Screen::Lora => {
-                        if back_button_hit(sx, sy) {
-                            current_screen = Screen::Home;
-                            needs_redraw = true;
-                        } else if let Some(tab) = tab_hit(sx, sy) {
-                            if tab != lora_tab {
-                                lora_tab = tab;
-                                // newest-first: open at the top
-                                lora_scroll = 0;
-                                recv_clear_armed = false;
-                                recv_fetch_sent = false;
-                                needs_redraw = true;
-                            }
-                        } else if lora_tab == LoraTab::Recv {
-                            if recv_fetch_hit(sx, sy) {
-                                if let Some(m) = &mut lora_mesh {
-                                    m.request_recap();
-                                    esp_println::println!("mesh: manual recap requested");
-                                    recv_fetch_sent = true;
-                                }
-                                recv_clear_armed = false;
-                                draw_recv_list(
-                                    &mut display,
-                                    &lora_recv,
-                                    lora_scroll,
-                                    false,
-                                    recv_fetch_sent,
-                                );
-                                display.flush_partial_fast(recv_native_rect()).ok();
-                            } else if recv_clear_hit(sx, sy) {
-                                if recv_clear_armed {
-                                    // confirmed: wipe the ram log and the sd
-                                    // archive (mesh stores elsewhere are
-                                    // untouched — history returns via recap
-                                    // only as far as relays still hold it)
-                                    lora_recv.clear();
-                                    lora_recv_keys.clear();
-                                    chatlog::clear(&bus, &mut chat_size);
-                                    // deleting history also forgets delivery
-                                    // state, so a fetch can repopulate
-                                    if let Some(m) = &mut lora_mesh {
-                                        m.clear_seen();
+                    match current_screen {
+                        Screen::Home => {
+                            if let Some(idx) = hit_test(sx, sy) {
+                                current_screen = ICONS[idx].screen;
+                                // the file browser draws only after its listing is
+                                // loaded (below), so it sets `files_dirty` instead of
+                                // redrawing now with an empty list.
+                                match current_screen {
+                                    Screen::Files => {
+                                        files_path = String::from("/");
+                                        files_dirty = true;
                                     }
+                                    // the notes list draws only after its listing is
+                                    // loaded too.
+                                    Screen::Notes => {
+                                        notes_dirty = true;
+                                    }
+                                    // the server pages paint a "loading" view now,
+                                    // then fetch over wifi on the next pass.
+                                    Screen::Music => {
+                                        music.refresh(music::View::Loading);
+                                        music_command = None;
+                                        music_inline = false;
+                                        music_status = None;
+                                        music_anchor = None;
+                                        needs_redraw = true;
+                                    }
+                                    Screen::Environment => {
+                                        env.refresh(environment::View::Loading);
+                                        needs_redraw = true;
+                                    }
+                                    Screen::Weather => {
+                                        weather.refresh(weather::View::Loading);
+                                        needs_redraw = true;
+                                    }
+                                    // the shelf paints a "scanning" view now, then
+                                    // scans the card on the next pass.
+                                    Screen::Library => {
+                                        library.refresh(library::View::Loading);
+                                        library_scroll = 0;
+                                        needs_redraw = true;
+                                    }
+                                    // the gps page paints its map panel as "loading"
+                                    // now, then fetches over wifi on the next pass.
+                                    #[cfg(feature = "gps")]
+                                    Screen::Gps => {
+                                        gps_map.refresh(MapView::Loading);
+                                        needs_redraw = true;
+                                    }
+                                    _ => needs_redraw = true,
+                                }
+                            }
+                        }
+                        Screen::Frontlight => {
+                            if back_button_hit(sx, sy) {
+                                current_screen = Screen::Home;
+                                needs_redraw = true;
+                            } else if minus_hit(sx, sy) {
+                                brightness = brightness.saturating_sub(BRIGHTNESS_STEP);
+                                light.set_brightness(brightness);
+                                draw_brightness_area(&mut display, brightness);
+                                display.flush_partial_fast(brightness_native_rect()).ok();
+                            } else if plus_hit(sx, sy) {
+                                brightness = brightness.saturating_add(BRIGHTNESS_STEP).min(100);
+                                light.set_brightness(brightness);
+                                draw_brightness_area(&mut display, brightness);
+                                display.flush_partial_fast(brightness_native_rect()).ok();
+                            }
+                        }
+                        Screen::Sleep => {
+                            if back_button_hit(sx, sy) {
+                                current_screen = Screen::Home;
+                                needs_redraw = true;
+                            } else if sleep_now_hit(sx, sy) {
+                                // leave the loop to draw the screensaver and enter
+                                // deep sleep below
+                                break;
+                            } else if power_off_hit(sx, sy) {
+                                // leave the loop to power the board off below
+                                power_off = true;
+                                break;
+                            }
+                        }
+                        Screen::Lora => {
+                            if back_button_hit(sx, sy) {
+                                if lora_tab == LoraTab::Send && lora_message_dirty {
+                                    display.flush_partial_fast(message_box_native_rect()).ok();
+                                    lora_message_dirty = false;
+                                    lora_message_quick_pending = false;
+                                }
+                                current_screen = Screen::Home;
+                                needs_redraw = true;
+                            } else if let Some(tab) = tab_hit(sx, sy) {
+                                if tab != lora_tab {
+                                    if lora_tab == LoraTab::Send && lora_message_dirty {
+                                        display.flush_partial_fast(message_box_native_rect()).ok();
+                                        lora_message_dirty = false;
+                                        lora_message_quick_pending = false;
+                                    }
+                                    lora_tab = tab;
+                                    // newest-first: open at the top
                                     lora_scroll = 0;
                                     recv_clear_armed = false;
-                                } else {
-                                    recv_clear_armed = true;
-                                }
-                                recv_fetch_sent = false;
-                                draw_recv_list(
-                                    &mut display,
-                                    &lora_recv,
-                                    lora_scroll,
-                                    recv_clear_armed,
-                                    false,
-                                );
-                                display.flush_partial_fast(recv_native_rect()).ok();
-                            } else {
-                                // page up/down through the wrapped log, one
-                                // row of overlap so context carries across
-                                // pages; any tap disarms a pending clear
-                                let page = recv_visible_rows() - 1;
-                                let target = if recv_scroll_up_hit(sx, sy) {
-                                    Some(lora_scroll.saturating_sub(page))
-                                } else if recv_scroll_down_hit(sx, sy) {
-                                    Some((lora_scroll + page).min(recv_scroll_max(&lora_recv)))
-                                } else if recv_clear_armed {
-                                    Some(lora_scroll)
-                                } else {
-                                    None
-                                };
-                                if let Some(target) = target {
-                                    lora_scroll = target;
-                                    recv_clear_armed = false;
                                     recv_fetch_sent = false;
+                                    needs_redraw = true;
+                                }
+                            } else if lora_tab == LoraTab::Recv {
+                                if recv_fetch_hit(sx, sy) {
+                                    if let Some(m) = &mut lora_mesh {
+                                        m.request_recap();
+                                        esp_println::println!("mesh: manual recap requested");
+                                        recv_fetch_sent = true;
+                                    }
+                                    recv_clear_armed = false;
                                     draw_recv_list(
                                         &mut display,
                                         &lora_recv,
                                         lora_scroll,
                                         false,
+                                        recv_fetch_sent,
+                                    );
+                                    display.flush_partial_fast(recv_native_rect()).ok();
+                                } else if recv_clear_hit(sx, sy) {
+                                    if recv_clear_armed {
+                                        // confirmed: wipe the ram log and the sd
+                                        // archive (mesh stores elsewhere are
+                                        // untouched — history returns via recap
+                                        // only as far as relays still hold it)
+                                        lora_recv.clear();
+                                        lora_recv_keys.clear();
+                                        chatlog::clear(&bus, &mut chat_size);
+                                        // deleting history also forgets delivery
+                                        // state, so a fetch can repopulate
+                                        if let Some(m) = &mut lora_mesh {
+                                            m.clear_seen();
+                                        }
+                                        lora_scroll = 0;
+                                        recv_clear_armed = false;
+                                    } else {
+                                        recv_clear_armed = true;
+                                    }
+                                    recv_fetch_sent = false;
+                                    draw_recv_list(
+                                        &mut display,
+                                        &lora_recv,
+                                        lora_scroll,
+                                        recv_clear_armed,
                                         false,
                                     );
                                     display.flush_partial_fast(recv_native_rect()).ok();
-                                }
-                            }
-                        } else if let (LoraTab::Send, Some(key)) =
-                            (lora_tab, keyboard::hit(sx, sy, kb_symbols, kb_shift))
-                        {
-                            match key {
-                                Key::Shift => {
-                                    kb_shift = !kb_shift;
-                                    keyboard::draw(&mut display, kb_symbols, kb_shift, "SEND");
-                                    display.flush_partial_fast(keyboard::native_rect()).ok();
-                                }
-                                Key::Symbols => {
-                                    kb_symbols = !kb_symbols;
-                                    keyboard::draw(&mut display, kb_symbols, kb_shift, "SEND");
-                                    display.flush_partial_fast(keyboard::native_rect()).ok();
-                                }
-                                Key::Enter => {
-                                    if lora_message.is_empty() {
-                                        lora_status = String::from("nothing to send");
-                                    } else if let Some(m) = &mut lora_mesh {
-                                        // the mesh owns the airtime: the text is
-                                        // queued and broadcast in this node's next
-                                        // data slot (up to one frame away).
-                                        match m.queue_text(lora_message.as_bytes()) {
-                                            Ok(()) => {
-                                                esp_println::println!(
-                                                    "mesh queued: {lora_message}"
-                                                );
-                                                lora_status = String::from("queued for our slot");
-                                                lora_send_pending = true;
-                                                let stamp = lora_stamp(&mut clock, &settings);
-                                                lora_sent.push(format!("{stamp}{lora_message}"));
-                                                if lora_sent.len() > LIST_MAX {
-                                                    lora_sent.remove(0);
-                                                }
-                                                // own messages join the receive
-                                                // tab's timeline and the sd log
-                                                let line = format!("{stamp}me: {lora_message}");
-                                                lora_recv_keys.push(0);
-                                                lora_recv.push(line.clone());
-                                                if lora_recv.len() > RECV_MAX {
-                                                    lora_recv_keys.remove(0);
-                                                    lora_recv.remove(0);
-                                                }
-                                                chatlog::append(
-                                                    &bus,
-                                                    0,
-                                                    &line,
-                                                    &lora_recv_keys,
-                                                    &lora_recv,
-                                                    &mut chat_size,
-                                                );
-                                                lora_message.clear();
-                                            }
-                                            Err(e) => {
-                                                esp_println::println!("mesh queue: {e}");
-                                                lora_status = format!("{e}");
-                                            }
-                                        }
-                                        draw_message(&mut display, &lora_message);
-                                        display.flush_partial_fast(message_box_native_rect()).ok();
-                                        draw_list(&mut display, SENT_Y, "sent", &lora_sent);
-                                        display.flush_partial_fast(sent_native_rect()).ok();
+                                } else {
+                                    // page up/down through the wrapped log, one
+                                    // row of overlap so context carries across
+                                    // pages; any tap disarms a pending clear
+                                    let page = recv_visible_rows() - 1;
+                                    let target = if recv_scroll_up_hit(sx, sy) {
+                                        Some(lora_scroll.saturating_sub(page))
+                                    } else if recv_scroll_down_hit(sx, sy) {
+                                        Some((lora_scroll + page).min(recv_scroll_max(&lora_recv)))
+                                    } else if recv_clear_armed {
+                                        Some(lora_scroll)
                                     } else {
-                                        lora_status = String::from("mesh not ready");
+                                        None
+                                    };
+                                    if let Some(target) = target {
+                                        lora_scroll = target;
+                                        recv_clear_armed = false;
+                                        recv_fetch_sent = false;
+                                        draw_recv_list(
+                                            &mut display,
+                                            &lora_recv,
+                                            lora_scroll,
+                                            false,
+                                            false,
+                                        );
+                                        display.flush_partial_fast(recv_native_rect()).ok();
                                     }
-                                    draw_lora_status(&mut display, &lora_status);
-                                    display.flush_partial_fast(lora_status_native_rect()).ok();
                                 }
-                                other => {
-                                    // cap typing at what one data slot can carry.
-                                    let msg_cap = lora_mesh
-                                        .as_ref()
-                                        .map_or(MSG_MAX, |m| m.max_text_len().min(MSG_MAX));
-                                    match other {
-                                        Key::Char(c) if lora_message.len() < msg_cap => {
-                                            lora_message.push(c)
-                                        }
-                                        Key::Space if lora_message.len() < msg_cap => {
-                                            lora_message.push(' ')
-                                        }
-                                        Key::Backspace => {
-                                            lora_message.pop();
-                                        }
-                                        _ => {}
+                            } else if let (LoraTab::Send, Some(key)) =
+                                (lora_tab, keyboard::hit(sx, sy, kb_symbols, kb_shift))
+                            {
+                                match key {
+                                    Key::Shift => {
+                                        kb_shift = !kb_shift;
+                                        keyboard::draw(&mut display, kb_symbols, kb_shift, "SEND");
+                                        display.flush_partial_fast(keyboard::native_rect()).ok();
                                     }
-                                    draw_message(&mut display, &lora_message);
-                                    display.flush_partial_fast(message_box_native_rect()).ok();
+                                    Key::Symbols => {
+                                        kb_symbols = !kb_symbols;
+                                        keyboard::draw(&mut display, kb_symbols, kb_shift, "SEND");
+                                        display.flush_partial_fast(keyboard::native_rect()).ok();
+                                    }
+                                    Key::Enter => {
+                                        if lora_message.is_empty() {
+                                            lora_status = String::from("nothing to send");
+                                        } else if let Some(m) = &mut lora_mesh {
+                                            // the mesh owns the airtime: the text is
+                                            // queued and broadcast in this node's next
+                                            // data slot (up to one frame away).
+                                            match m.queue_text(lora_message.as_bytes()) {
+                                                Ok(()) => {
+                                                    esp_println::println!(
+                                                        "mesh queued: {lora_message}"
+                                                    );
+                                                    lora_status =
+                                                        String::from("queued for our slot");
+                                                    lora_send_pending = true;
+                                                    let stamp = lora_stamp(&mut clock, &settings);
+                                                    lora_sent
+                                                        .push(format!("{stamp}{lora_message}"));
+                                                    if lora_sent.len() > LIST_MAX {
+                                                        lora_sent.remove(0);
+                                                    }
+                                                    // own messages join the receive
+                                                    // tab's timeline and the sd log
+                                                    let line = format!("{stamp}me: {lora_message}");
+                                                    lora_recv_keys.push(0);
+                                                    lora_recv.push(line.clone());
+                                                    if lora_recv.len() > RECV_MAX {
+                                                        lora_recv_keys.remove(0);
+                                                        lora_recv.remove(0);
+                                                    }
+                                                    chatlog::append(
+                                                        &bus,
+                                                        0,
+                                                        &line,
+                                                        &lora_recv_keys,
+                                                        &lora_recv,
+                                                        &mut chat_size,
+                                                    );
+                                                    lora_message.clear();
+                                                    lora_message_dirty = false;
+                                                    lora_message_quick_pending = false;
+                                                    // a full refresh (not a partial DU flush)
+                                                    // clears the message box's prior text
+                                                    // without the ghosting a fast partial
+                                                    // update leaves behind; a send is
+                                                    // infrequent enough that the slower
+                                                    // full-panel flash is a non-issue here.
+                                                    needs_redraw = true;
+                                                }
+                                                Err(e) => {
+                                                    esp_println::println!("mesh queue: {e}");
+                                                    lora_status = format!("{e}");
+                                                }
+                                            }
+                                        } else {
+                                            lora_status = String::from("mesh not ready");
+                                        }
+                                        // only reached when nothing was actually sent (empty
+                                        // message, mesh not ready, or a queue error): the
+                                        // message box wasn't touched, so a status-line partial
+                                        // refresh is enough. a full redraw is already queued
+                                        // above on a successful send, which covers the status
+                                        // line too. also flush an earlier debounced keystroke
+                                        // rather than leaving it unflushed.
+                                        if !needs_redraw {
+                                            if lora_message_dirty {
+                                                display
+                                                    .flush_partial_fast(message_box_native_rect())
+                                                    .ok();
+                                                lora_message_dirty = false;
+                                                lora_message_quick_pending = false;
+                                            }
+                                            draw_lora_status(&mut display, &lora_status);
+                                            display
+                                                .flush_partial_fast(lora_status_native_rect())
+                                                .ok();
+                                        }
+                                    }
+                                    other => {
+                                        // cap typing at what one data slot can carry.
+                                        let msg_cap = lora_mesh
+                                            .as_ref()
+                                            .map_or(MSG_MAX, |m| m.max_text_len().min(MSG_MAX));
+                                        let changed = match other {
+                                            Key::Char(c) if lora_message.len() < msg_cap => {
+                                                lora_message.push(c);
+                                                true
+                                            }
+                                            Key::Space if lora_message.len() < msg_cap => {
+                                                lora_message.push(' ');
+                                                true
+                                            }
+                                            Key::Backspace => lora_message.pop().is_some(),
+                                            _ => false,
+                                        };
+                                        if changed {
+                                            // draw now (cheap, framebuffer-only) but defer the
+                                            // flush to the end of this pass's event-drain loop,
+                                            // so a backlog of queued keystrokes (typing outpaced
+                                            // the previous flush) batches into one panel write.
+                                            draw_message(&mut display, &lora_message);
+                                            lora_message_dirty = true;
+                                            lora_chars_this_pass += 1;
+                                            lora_message_last_edit_us = now_us();
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                    Screen::Files => {
-                        if back_button_hit(sx, sy) {
-                            current_screen = Screen::Home;
-                            needs_redraw = true;
-                        } else if files_scroll_up_hit(sx, sy) {
-                            if files_scroll > 0 {
-                                files_scroll = files_scroll.saturating_sub(VISIBLE_ROWS);
-                                draw_file_list(
-                                    &mut display,
-                                    &files_path,
-                                    &files_entries,
-                                    files_scroll,
-                                );
-                                display.flush_partial_fast(file_list_native_rect()).ok();
-                            }
-                        } else if files_scroll_down_hit(sx, sy) {
-                            let total = display_row_count(&files_path, files_entries.len());
-                            if files_scroll + VISIBLE_ROWS < total {
-                                files_scroll += VISIBLE_ROWS;
-                                draw_file_list(
-                                    &mut display,
-                                    &files_path,
-                                    &files_entries,
-                                    files_scroll,
-                                );
-                                display.flush_partial_fast(file_list_native_rect()).ok();
-                            }
-                        } else if let Some(row) =
-                            list_hit(sx, sy, &files_path, files_entries.len(), files_scroll)
-                        {
-                            match row {
-                                Row::Parent => {
-                                    files_path = parent_path(&files_path);
-                                    files_dirty = true;
+                        Screen::Files => {
+                            if back_button_hit(sx, sy) {
+                                current_screen = Screen::Home;
+                                needs_redraw = true;
+                            } else if files_scroll_up_hit(sx, sy) {
+                                if files_scroll > 0 {
+                                    files_scroll = files_scroll.saturating_sub(VISIBLE_ROWS);
+                                    draw_file_list(
+                                        &mut display,
+                                        &files_path,
+                                        &files_entries,
+                                        files_scroll,
+                                    );
+                                    display.flush_partial_fast(file_list_native_rect()).ok();
                                 }
-                                Row::Entry(i) => {
-                                    if let Some(entry) = files_entries.get(i) {
-                                        if entry.is_directory {
-                                            files_path = entry.path.clone();
-                                            files_dirty = true;
-                                        } else if is_bmp(&entry.name) {
-                                            image_path = entry.path.clone();
-                                            current_screen = Screen::Image;
-                                            needs_redraw = true;
-                                        } else if is_reader(&entry.name) {
-                                            reader_path = entry.path.clone();
-                                            reader_dirty = true;
-                                            reader_return = Screen::Files;
-                                            current_screen = Screen::Reader;
-                                        } else {
-                                            files_status =
-                                                format!("{} - {} bytes", entry.name, entry.size);
-                                            draw_files_footer(&mut display, &files_status);
+                            } else if files_scroll_down_hit(sx, sy) {
+                                let total = display_row_count(&files_path, files_entries.len());
+                                if files_scroll + VISIBLE_ROWS < total {
+                                    files_scroll += VISIBLE_ROWS;
+                                    draw_file_list(
+                                        &mut display,
+                                        &files_path,
+                                        &files_entries,
+                                        files_scroll,
+                                    );
+                                    display.flush_partial_fast(file_list_native_rect()).ok();
+                                }
+                            } else if let Some(row) =
+                                list_hit(sx, sy, &files_path, files_entries.len(), files_scroll)
+                            {
+                                match row {
+                                    Row::Parent => {
+                                        files_path = parent_path(&files_path);
+                                        files_dirty = true;
+                                    }
+                                    Row::Entry(i) => {
+                                        if let Some(entry) = files_entries.get(i) {
+                                            if entry.is_directory {
+                                                files_path = entry.path.clone();
+                                                files_dirty = true;
+                                            } else if is_bmp(&entry.name) {
+                                                image_path = entry.path.clone();
+                                                current_screen = Screen::Image;
+                                                needs_redraw = true;
+                                            } else if is_reader(&entry.name) {
+                                                reader_path = entry.path.clone();
+                                                reader_dirty = true;
+                                                reader_return = Screen::Files;
+                                                current_screen = Screen::Reader;
+                                            } else {
+                                                files_status = format!(
+                                                    "{} - {} bytes",
+                                                    entry.name, entry.size
+                                                );
+                                                draw_files_footer(&mut display, &files_status);
+                                                display
+                                                    .flush_partial_fast(files_footer_native_rect())
+                                                    .ok();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Screen::Image => {
+                            // any tap dismisses the image and returns to the listing.
+                            current_screen = Screen::Files;
+                            needs_redraw = true;
+                        }
+                        Screen::Notes => {
+                            if back_button_hit(sx, sy) {
+                                current_screen = Screen::Home;
+                                needs_redraw = true;
+                            } else if notes::scroll_up_hit(sx, sy) {
+                                if notes_scroll > 0 {
+                                    notes_scroll = notes_scroll.saturating_sub(notes::VISIBLE);
+                                    notes::draw_note_list(
+                                        &mut display,
+                                        &notes_entries,
+                                        notes_scroll,
+                                    );
+                                    display.flush_partial_fast(notes::list_native_rect()).ok();
+                                }
+                            } else if notes::scroll_down_hit(sx, sy) {
+                                if notes_scroll + notes::VISIBLE < notes_entries.len() {
+                                    notes_scroll += notes::VISIBLE;
+                                    notes::draw_note_list(
+                                        &mut display,
+                                        &notes_entries,
+                                        notes_scroll,
+                                    );
+                                    display.flush_partial_fast(notes::list_native_rect()).ok();
+                                }
+                            } else if notes::new_hit(sx, sy) {
+                                match notes::next_name(&notes_entries) {
+                                    Some(name) => {
+                                        note_name = name;
+                                        note_text.clear();
+                                        kb_symbols = false;
+                                        kb_shift = false;
+                                        note_delete_armed = false;
+                                        current_screen = Screen::NoteEdit;
+                                        needs_redraw = true;
+                                    }
+                                    None => {
+                                        notes_status = String::from("notes full");
+                                        notes::draw_notes_footer(&mut display, &notes_status);
+                                        display
+                                            .flush_partial_fast(notes::footer_native_rect())
+                                            .ok();
+                                    }
+                                }
+                            } else if let Some(i) =
+                                notes::list_hit(sx, sy, notes_entries.len(), notes_scroll)
+                            {
+                                if let Some(entry) = notes_entries.get(i) {
+                                    note_name = entry.name.clone();
+                                    kb_symbols = false;
+                                    kb_shift = false;
+                                    note_delete_armed = false;
+                                    // the editor draws only after the note's text is
+                                    // read (below), mirroring the reader.
+                                    note_dirty = true;
+                                    current_screen = Screen::NoteEdit;
+                                }
+                            }
+                        }
+                        Screen::NoteEdit => {
+                            if back_button_hit(sx, sy) {
+                                notes::save(&bus, &note_name, &note_text);
+                                // back to the list, rescanned so the saved note's
+                                // preview is current.
+                                notes_dirty = true;
+                                current_screen = Screen::Notes;
+                            } else if notes::delete_hit(sx, sy) {
+                                if note_delete_armed {
+                                    notes::delete(&bus, &note_name);
+                                    notes_dirty = true;
+                                    current_screen = Screen::Notes;
+                                } else {
+                                    note_delete_armed = true;
+                                    notes::draw_delete_button(&mut display, true);
+                                    display.flush_partial_fast(notes::delete_native_rect()).ok();
+                                }
+                            } else {
+                                // any tap besides the second delete tap disarms it.
+                                if note_delete_armed {
+                                    note_delete_armed = false;
+                                    notes::draw_delete_button(&mut display, false);
+                                    display.flush_partial_fast(notes::delete_native_rect()).ok();
+                                }
+                                if let Some(key) = keyboard::hit(sx, sy, kb_symbols, kb_shift) {
+                                    match key {
+                                        Key::Shift => {
+                                            kb_shift = !kb_shift;
+                                            keyboard::draw(
+                                                &mut display,
+                                                kb_symbols,
+                                                kb_shift,
+                                                "RET",
+                                            );
                                             display
-                                                .flush_partial_fast(files_footer_native_rect())
+                                                .flush_partial_fast(keyboard::native_rect())
+                                                .ok();
+                                        }
+                                        Key::Symbols => {
+                                            kb_symbols = !kb_symbols;
+                                            keyboard::draw(
+                                                &mut display,
+                                                kb_symbols,
+                                                kb_shift,
+                                                "RET",
+                                            );
+                                            display
+                                                .flush_partial_fast(keyboard::native_rect())
+                                                .ok();
+                                        }
+                                        other => {
+                                            match other {
+                                                Key::Char(c)
+                                                    if note_text.len() < notes::NOTE_MAX =>
+                                                {
+                                                    note_text.push(c)
+                                                }
+                                                Key::Space if note_text.len() < notes::NOTE_MAX => {
+                                                    note_text.push(' ')
+                                                }
+                                                Key::Enter if note_text.len() < notes::NOTE_MAX => {
+                                                    note_text.push('\n')
+                                                }
+                                                Key::Backspace => {
+                                                    note_text.pop();
+                                                }
+                                                _ => {}
+                                            }
+                                            notes::draw_note_text(&mut display, &note_text);
+                                            display
+                                                .flush_partial_fast(notes::text_area_native_rect())
                                                 .ok();
                                         }
                                     }
                                 }
                             }
                         }
-                    }
-                    Screen::Image => {
-                        // any tap dismisses the image and returns to the listing.
-                        current_screen = Screen::Files;
-                        needs_redraw = true;
-                    }
-                    Screen::Notes => {
-                        if back_button_hit(sx, sy) {
-                            current_screen = Screen::Home;
-                            needs_redraw = true;
-                        } else if notes::scroll_up_hit(sx, sy) {
-                            if notes_scroll > 0 {
-                                notes_scroll = notes_scroll.saturating_sub(notes::VISIBLE);
-                                notes::draw_note_list(&mut display, &notes_entries, notes_scroll);
-                                display.flush_partial_fast(notes::list_native_rect()).ok();
-                            }
-                        } else if notes::scroll_down_hit(sx, sy) {
-                            if notes_scroll + notes::VISIBLE < notes_entries.len() {
-                                notes_scroll += notes::VISIBLE;
-                                notes::draw_note_list(&mut display, &notes_entries, notes_scroll);
-                                display.flush_partial_fast(notes::list_native_rect()).ok();
-                            }
-                        } else if notes::new_hit(sx, sy) {
-                            match notes::next_name(&notes_entries) {
-                                Some(name) => {
-                                    note_name = name;
-                                    note_text.clear();
-                                    kb_symbols = false;
-                                    kb_shift = false;
-                                    note_delete_armed = false;
-                                    current_screen = Screen::NoteEdit;
-                                    needs_redraw = true;
-                                }
-                                None => {
-                                    notes_status = String::from("notes full");
-                                    notes::draw_notes_footer(&mut display, &notes_status);
-                                    display.flush_partial_fast(notes::footer_native_rect()).ok();
-                                }
-                            }
-                        } else if let Some(i) =
-                            notes::list_hit(sx, sy, notes_entries.len(), notes_scroll)
-                        {
-                            if let Some(entry) = notes_entries.get(i) {
-                                note_name = entry.name.clone();
-                                kb_symbols = false;
-                                kb_shift = false;
-                                note_delete_armed = false;
-                                // the editor draws only after the note's text is
-                                // read (below), mirroring the reader.
-                                note_dirty = true;
-                                current_screen = Screen::NoteEdit;
-                            }
-                        }
-                    }
-                    Screen::NoteEdit => {
-                        if back_button_hit(sx, sy) {
-                            notes::save(&bus, &note_name, &note_text);
-                            // back to the list, rescanned so the saved note's
-                            // preview is current.
-                            notes_dirty = true;
-                            current_screen = Screen::Notes;
-                        } else if notes::delete_hit(sx, sy) {
-                            if note_delete_armed {
-                                notes::delete(&bus, &note_name);
-                                notes_dirty = true;
-                                current_screen = Screen::Notes;
-                            } else {
-                                note_delete_armed = true;
-                                notes::draw_delete_button(&mut display, true);
-                                display.flush_partial_fast(notes::delete_native_rect()).ok();
-                            }
-                        } else {
-                            // any tap besides the second delete tap disarms it.
-                            if note_delete_armed {
-                                note_delete_armed = false;
-                                notes::draw_delete_button(&mut display, false);
-                                display.flush_partial_fast(notes::delete_native_rect()).ok();
-                            }
-                            if let Some(key) = keyboard::hit(sx, sy, kb_symbols, kb_shift) {
-                                match key {
-                                    Key::Shift => {
-                                        kb_shift = !kb_shift;
-                                        keyboard::draw(&mut display, kb_symbols, kb_shift, "RET");
-                                        display.flush_partial_fast(keyboard::native_rect()).ok();
-                                    }
-                                    Key::Symbols => {
-                                        kb_symbols = !kb_symbols;
-                                        keyboard::draw(&mut display, kb_symbols, kb_shift, "RET");
-                                        display.flush_partial_fast(keyboard::native_rect()).ok();
-                                    }
-                                    other => {
-                                        match other {
-                                            Key::Char(c) if note_text.len() < notes::NOTE_MAX => {
-                                                note_text.push(c)
-                                            }
-                                            Key::Space if note_text.len() < notes::NOTE_MAX => {
-                                                note_text.push(' ')
-                                            }
-                                            Key::Enter if note_text.len() < notes::NOTE_MAX => {
-                                                note_text.push('\n')
-                                            }
-                                            Key::Backspace => {
-                                                note_text.pop();
-                                            }
-                                            _ => {}
-                                        }
-                                        notes::draw_note_text(&mut display, &note_text);
-                                        display
-                                            .flush_partial_fast(notes::text_area_native_rect())
-                                            .ok();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Screen::Reader => {
-                        if back_button_hit(sx, sy) {
-                            if let Some(doc) = &reader_doc {
-                                doc.save(&bus);
-                            }
-                            // returning to the shelf rescans so the just-read
-                            // book's progress is up to date (cache-fast).
-                            if reader_return == Screen::Library {
-                                library.invalidate();
-                            }
-                            current_screen = reader_return;
-                            needs_redraw = true;
-                        } else if let Some(doc) = &mut reader_doc {
-                            let changed = match tap_zone(sx, sy) {
-                                Tap::Prev => doc.prev_page(),
-                                Tap::Next => doc.next_page(),
-                                Tap::None => false,
-                            };
-                            if changed {
-                                needs_redraw = true;
-                            }
-                        }
-                    }
-                    Screen::Settings => match settings_page::menu_hit(sx, sy) {
-                        Some(MenuHit::Back) => {
-                            current_screen = Screen::Home;
-                            needs_redraw = true;
-                        }
-                        Some(MenuHit::System) => {
-                            current_screen = Screen::SettingsSystem;
-                            needs_redraw = true;
-                        }
-                        Some(MenuHit::Reader) => {
-                            current_screen = Screen::SettingsReader;
-                            needs_redraw = true;
-                        }
-                        Some(MenuHit::Wifi) => {
-                            wifi_pw_mode = false;
-                            // keep the previous scan list (and its status) cached;
-                            // only prompt to scan when there is nothing to show.
-                            if wifi_networks.is_empty() {
-                                wifi_status = String::from("tap Scan to find networks");
-                            }
-                            current_screen = Screen::SettingsWifi;
-                            needs_redraw = true;
-                        }
-                        Some(MenuHit::Mesh) => {
-                            current_screen = Screen::SettingsMesh;
-                            mesh_name_editing = false;
-                            needs_redraw = true;
-                        }
-                        None => {}
-                    },
-                    Screen::SettingsSystem => match settings_page::system::hit_test(sx, sy) {
-                        Some(settings_page::system::Hit::Back) => {
-                            current_screen = Screen::Settings;
-                            needs_redraw = true;
-                        }
-                        Some(settings_page::system::Hit::TzMinus) => {
-                            settings.tz_offset_hours = (settings.tz_offset_hours - 1).max(-12);
-                            settings_dirty = true;
-                            settings_page::system::redraw_tz(
-                                &mut display,
-                                settings.tz_offset_hours,
-                            );
-                            display
-                                .flush_partial_fast(settings_page::system::tz_value_rect())
-                                .ok();
-                            last_status_minute =
-                                refresh_statusbar_clock(&mut display, &mut clock, &settings);
-                        }
-                        Some(settings_page::system::Hit::TzPlus) => {
-                            settings.tz_offset_hours = (settings.tz_offset_hours + 1).min(14);
-                            settings_dirty = true;
-                            settings_page::system::redraw_tz(
-                                &mut display,
-                                settings.tz_offset_hours,
-                            );
-                            display
-                                .flush_partial_fast(settings_page::system::tz_value_rect())
-                                .ok();
-                            last_status_minute =
-                                refresh_statusbar_clock(&mut display, &mut clock, &settings);
-                        }
-                        Some(settings_page::system::Hit::ToggleFormat) => {
-                            settings.time_24h = !settings.time_24h;
-                            settings_dirty = true;
-                            settings_page::system::redraw_format(&mut display, settings.time_24h);
-                            display
-                                .flush_partial_fast(settings_page::system::format_button_rect())
-                                .ok();
-                            last_status_minute =
-                                refresh_statusbar_clock(&mut display, &mut clock, &settings);
-                        }
-                        Some(settings_page::system::Hit::CycleIcons) => {
-                            settings.icon_style = settings.icon_style.next();
-                            settings_dirty = true;
-                            settings_page::system::redraw_icons(&mut display, &settings);
-                            display
-                                .flush_partial_fast(settings_page::system::icons_button_rect())
-                                .ok();
-                        }
-                        Some(settings_page::system::Hit::CycleIconSize) => {
-                            settings.icon_size = settings.icon_size.next();
-                            settings_dirty = true;
-                            settings_page::system::redraw_icon_size(&mut display, &settings);
-                            display
-                                .flush_partial_fast(settings_page::system::icon_size_button_rect())
-                                .ok();
-                        }
-                        None => {}
-                    },
-                    Screen::SettingsMesh => {
-                        if mesh_name_editing {
-                            // keyboard-driven name entry; SAVE commits to the
-                            // settings blob and the live mesh
-                            if let Some(key) = keyboard::hit(sx, sy, false, false) {
-                                match key {
-                                    Key::Enter => {
-                                        settings.set_mesh_alias(&mesh_name_draft);
-                                        settings_dirty = true;
-                                        if let Some(m) = &mut lora_mesh {
-                                            m.set_alias(settings.mesh_alias());
-                                        }
-                                        mesh_name_editing = false;
-                                        needs_redraw = true;
-                                    }
-                                    Key::Char(c) if mesh_name_draft.len() < settings::ALIAS_CAP => {
-                                        mesh_name_draft.push(c);
-                                        settings_page::mesh::draw_editor(
-                                            &mut display,
-                                            &mesh_name_draft,
-                                        );
-                                        display
-                                            .flush_partial_fast(settings_page::mesh::editor_rect())
-                                            .ok();
-                                    }
-                                    Key::Space if mesh_name_draft.len() < settings::ALIAS_CAP => {
-                                        mesh_name_draft.push(' ');
-                                        settings_page::mesh::draw_editor(
-                                            &mut display,
-                                            &mesh_name_draft,
-                                        );
-                                        display
-                                            .flush_partial_fast(settings_page::mesh::editor_rect())
-                                            .ok();
-                                    }
-                                    Key::Backspace => {
-                                        mesh_name_draft.pop();
-                                        settings_page::mesh::clear_editor(&mut display);
-                                        settings_page::mesh::draw_editor(
-                                            &mut display,
-                                            &mesh_name_draft,
-                                        );
-                                        display
-                                            .flush_partial_fast(settings_page::mesh::editor_rect())
-                                            .ok();
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        } else {
-                            match settings_page::mesh::hit_test(sx, sy) {
-                                Some(settings_page::mesh::Hit::Back) => {
-                                    current_screen = Screen::Settings;
-                                    needs_redraw = true;
-                                }
-                                Some(settings_page::mesh::Hit::EditName) => {
-                                    mesh_name_draft = String::from(settings.mesh_alias());
-                                    mesh_name_editing = true;
-                                    needs_redraw = true;
-                                }
-                                Some(settings_page::mesh::Hit::ToggleRadio) => {
-                                    settings.mesh_background = !settings.mesh_background;
-                                    settings_dirty = true;
-                                    settings_page::mesh::redraw_radio(
-                                        &mut display,
-                                        settings.mesh_background,
-                                    );
-                                    display
-                                        .flush_partial_fast(
-                                            settings_page::mesh::radio_button_rect(),
-                                        )
-                                        .ok();
-                                }
-                                None => {}
-                            }
-                        }
-                    }
-                    Screen::SettingsReader => match settings_page::reader::hit_test(sx, sy) {
-                        Some(settings_page::reader::Hit::Back) => {
-                            current_screen = Screen::Settings;
-                            needs_redraw = true;
-                        }
-                        Some(settings_page::reader::Hit::CycleFontSize) => {
-                            settings.reader_font_size = settings.reader_font_size.next();
-                            settings_dirty = true;
-                            settings_page::reader::redraw_font_size(&mut display, &settings);
-                            display
-                                .flush_partial_fast(settings_page::reader::font_size_button_rect())
-                                .ok();
-                        }
-                        Some(settings_page::reader::Hit::CycleFontFamily) => {
-                            settings.reader_font_family = settings.reader_font_family.next();
-                            settings_dirty = true;
-                            settings_page::reader::redraw_family(&mut display, &settings);
-                            display
-                                .flush_partial_fast(settings_page::reader::family_button_rect())
-                                .ok();
-                        }
-                        Some(settings_page::reader::Hit::CycleSpacing) => {
-                            settings.reader_line_spacing = settings.reader_line_spacing.next();
-                            settings_dirty = true;
-                            settings_page::reader::redraw_spacing(&mut display, &settings);
-                            display
-                                .flush_partial_fast(settings_page::reader::spacing_button_rect())
-                                .ok();
-                        }
-                        None => {}
-                    },
-                    Screen::SettingsWifi => {
-                        if wifi_pw_mode {
+                        Screen::Reader => {
                             if back_button_hit(sx, sy) {
-                                // cancel password entry, back to the status view.
-                                wifi_pw_mode = false;
-                                wifi_status = String::from("join cancelled");
+                                if let Some(doc) = &reader_doc {
+                                    doc.save(&bus);
+                                }
+                                // returning to the shelf rescans so the just-read
+                                // book's progress is up to date (cache-fast).
+                                if reader_return == Screen::Library {
+                                    library.invalidate();
+                                }
+                                current_screen = reader_return;
                                 needs_redraw = true;
-                            } else if let Some(key) = keyboard::hit(sx, sy, kb_symbols, kb_shift) {
-                                match key {
-                                    Key::Shift => {
-                                        kb_shift = !kb_shift;
-                                        keyboard::draw(&mut display, kb_symbols, kb_shift, "SAVE");
-                                        display.flush_partial_fast(keyboard::native_rect()).ok();
+                            } else if let Some(doc) = &mut reader_doc {
+                                let changed = match tap_zone(sx, sy) {
+                                    Tap::Prev => doc.prev_page(),
+                                    Tap::Next => doc.next_page(),
+                                    Tap::None => false,
+                                };
+                                if changed {
+                                    needs_redraw = true;
+                                }
+                            }
+                        }
+                        Screen::Settings => match settings_page::menu_hit(sx, sy) {
+                            Some(MenuHit::Back) => {
+                                current_screen = Screen::Home;
+                                needs_redraw = true;
+                            }
+                            Some(MenuHit::System) => {
+                                current_screen = Screen::SettingsSystem;
+                                needs_redraw = true;
+                            }
+                            Some(MenuHit::Reader) => {
+                                current_screen = Screen::SettingsReader;
+                                needs_redraw = true;
+                            }
+                            Some(MenuHit::Wifi) => {
+                                wifi_pw_mode = false;
+                                // keep the previous scan list (and its status) cached;
+                                // only prompt to scan when there is nothing to show.
+                                if wifi_networks.is_empty() {
+                                    wifi_status = String::from("tap Scan to find networks");
+                                }
+                                current_screen = Screen::SettingsWifi;
+                                needs_redraw = true;
+                            }
+                            Some(MenuHit::Mesh) => {
+                                current_screen = Screen::SettingsMesh;
+                                mesh_name_editing = false;
+                                needs_redraw = true;
+                            }
+                            None => {}
+                        },
+                        Screen::SettingsSystem => match settings_page::system::hit_test(sx, sy) {
+                            Some(settings_page::system::Hit::Back) => {
+                                current_screen = Screen::Settings;
+                                needs_redraw = true;
+                            }
+                            Some(settings_page::system::Hit::TzMinus) => {
+                                settings.tz_offset_hours = (settings.tz_offset_hours - 1).max(-12);
+                                settings_dirty = true;
+                                settings_page::system::redraw_tz(
+                                    &mut display,
+                                    settings.tz_offset_hours,
+                                );
+                                display
+                                    .flush_partial_fast(settings_page::system::tz_value_rect())
+                                    .ok();
+                                last_status_minute =
+                                    refresh_statusbar_clock(&mut display, &mut clock, &settings);
+                            }
+                            Some(settings_page::system::Hit::TzPlus) => {
+                                settings.tz_offset_hours = (settings.tz_offset_hours + 1).min(14);
+                                settings_dirty = true;
+                                settings_page::system::redraw_tz(
+                                    &mut display,
+                                    settings.tz_offset_hours,
+                                );
+                                display
+                                    .flush_partial_fast(settings_page::system::tz_value_rect())
+                                    .ok();
+                                last_status_minute =
+                                    refresh_statusbar_clock(&mut display, &mut clock, &settings);
+                            }
+                            Some(settings_page::system::Hit::ToggleFormat) => {
+                                settings.time_24h = !settings.time_24h;
+                                settings_dirty = true;
+                                settings_page::system::redraw_format(
+                                    &mut display,
+                                    settings.time_24h,
+                                );
+                                display
+                                    .flush_partial_fast(settings_page::system::format_button_rect())
+                                    .ok();
+                                last_status_minute =
+                                    refresh_statusbar_clock(&mut display, &mut clock, &settings);
+                            }
+                            Some(settings_page::system::Hit::CycleIcons) => {
+                                settings.icon_style = settings.icon_style.next();
+                                settings_dirty = true;
+                                settings_page::system::redraw_icons(&mut display, &settings);
+                                display
+                                    .flush_partial_fast(settings_page::system::icons_button_rect())
+                                    .ok();
+                            }
+                            Some(settings_page::system::Hit::CycleIconSize) => {
+                                settings.icon_size = settings.icon_size.next();
+                                settings_dirty = true;
+                                settings_page::system::redraw_icon_size(&mut display, &settings);
+                                display
+                                    .flush_partial_fast(
+                                        settings_page::system::icon_size_button_rect(),
+                                    )
+                                    .ok();
+                            }
+                            None => {}
+                        },
+                        Screen::SettingsMesh => {
+                            if mesh_name_editing {
+                                // keyboard-driven name entry; SAVE commits to the
+                                // settings blob and the live mesh
+                                if let Some(key) = keyboard::hit(sx, sy, false, false) {
+                                    match key {
+                                        Key::Enter => {
+                                            settings.set_mesh_alias(&mesh_name_draft);
+                                            settings_dirty = true;
+                                            if let Some(m) = &mut lora_mesh {
+                                                m.set_alias(settings.mesh_alias());
+                                            }
+                                            mesh_name_editing = false;
+                                            needs_redraw = true;
+                                        }
+                                        Key::Char(c)
+                                            if mesh_name_draft.len() < settings::ALIAS_CAP =>
+                                        {
+                                            mesh_name_draft.push(c);
+                                            settings_page::mesh::draw_editor(
+                                                &mut display,
+                                                &mesh_name_draft,
+                                            );
+                                            display
+                                                .flush_partial_fast(
+                                                    settings_page::mesh::editor_rect(),
+                                                )
+                                                .ok();
+                                        }
+                                        Key::Space
+                                            if mesh_name_draft.len() < settings::ALIAS_CAP =>
+                                        {
+                                            mesh_name_draft.push(' ');
+                                            settings_page::mesh::draw_editor(
+                                                &mut display,
+                                                &mesh_name_draft,
+                                            );
+                                            display
+                                                .flush_partial_fast(
+                                                    settings_page::mesh::editor_rect(),
+                                                )
+                                                .ok();
+                                        }
+                                        Key::Backspace => {
+                                            mesh_name_draft.pop();
+                                            settings_page::mesh::clear_editor(&mut display);
+                                            settings_page::mesh::draw_editor(
+                                                &mut display,
+                                                &mesh_name_draft,
+                                            );
+                                            display
+                                                .flush_partial_fast(
+                                                    settings_page::mesh::editor_rect(),
+                                                )
+                                                .ok();
+                                        }
+                                        _ => {}
                                     }
-                                    Key::Symbols => {
-                                        kb_symbols = !kb_symbols;
-                                        keyboard::draw(&mut display, kb_symbols, kb_shift, "SAVE");
-                                        display.flush_partial_fast(keyboard::native_rect()).ok();
-                                    }
-                                    Key::Enter => {
-                                        // leave the keyboard and attempt the join on
-                                        // the next pass (so "connecting..." paints).
-                                        wifi_pw_mode = false;
-                                        wifi_join_dirty = true;
-                                        wifi_status = String::from("connecting...");
+                                }
+                            } else {
+                                match settings_page::mesh::hit_test(sx, sy) {
+                                    Some(settings_page::mesh::Hit::Back) => {
+                                        current_screen = Screen::Settings;
                                         needs_redraw = true;
                                     }
-                                    other => {
-                                        match other {
-                                            Key::Char(c) if wifi_pw_buf.len() < 63 => {
-                                                wifi_pw_buf.push(c)
-                                            }
-                                            Key::Space if wifi_pw_buf.len() < 63 => {
-                                                wifi_pw_buf.push(' ')
-                                            }
-                                            Key::Backspace => {
-                                                wifi_pw_buf.pop();
-                                            }
-                                            _ => {}
-                                        }
-                                        settings_page::wifi::redraw_password(
+                                    Some(settings_page::mesh::Hit::EditName) => {
+                                        mesh_name_draft = String::from(settings.mesh_alias());
+                                        mesh_name_editing = true;
+                                        needs_redraw = true;
+                                    }
+                                    Some(settings_page::mesh::Hit::ToggleRadio) => {
+                                        settings.mesh_background = !settings.mesh_background;
+                                        settings_dirty = true;
+                                        settings_page::mesh::redraw_radio(
                                             &mut display,
-                                            &wifi_pw_buf,
+                                            settings.mesh_background,
                                         );
                                         display
                                             .flush_partial_fast(
-                                                settings_page::wifi::password_box_rect(),
+                                                settings_page::mesh::radio_button_rect(),
                                             )
                                             .ok();
                                     }
+                                    None => {}
                                 }
                             }
-                        } else {
-                            match settings_page::wifi::status_hit(sx, sy, &wifi_networks, &settings)
-                            {
-                                Some(settings_page::wifi::Hit::Back) => {
-                                    current_screen = Screen::Settings;
+                        }
+                        Screen::SettingsReader => match settings_page::reader::hit_test(sx, sy) {
+                            Some(settings_page::reader::Hit::Back) => {
+                                current_screen = Screen::Settings;
+                                needs_redraw = true;
+                            }
+                            Some(settings_page::reader::Hit::CycleFontSize) => {
+                                settings.reader_font_size = settings.reader_font_size.next();
+                                settings_dirty = true;
+                                settings_page::reader::redraw_font_size(&mut display, &settings);
+                                display
+                                    .flush_partial_fast(
+                                        settings_page::reader::font_size_button_rect(),
+                                    )
+                                    .ok();
+                            }
+                            Some(settings_page::reader::Hit::CycleFontFamily) => {
+                                settings.reader_font_family = settings.reader_font_family.next();
+                                settings_dirty = true;
+                                settings_page::reader::redraw_family(&mut display, &settings);
+                                display
+                                    .flush_partial_fast(settings_page::reader::family_button_rect())
+                                    .ok();
+                            }
+                            Some(settings_page::reader::Hit::CycleSpacing) => {
+                                settings.reader_line_spacing = settings.reader_line_spacing.next();
+                                settings_dirty = true;
+                                settings_page::reader::redraw_spacing(&mut display, &settings);
+                                display
+                                .flush_partial_fast(settings_page::reader::spacing_button_rect())
+                                .ok();
+                            }
+                            None => {}
+                        },
+                        Screen::SettingsWifi => {
+                            if wifi_pw_mode {
+                                if back_button_hit(sx, sy) {
+                                    // cancel password entry, back to the status view.
+                                    wifi_pw_mode = false;
+                                    wifi_status = String::from("join cancelled");
                                     needs_redraw = true;
-                                }
-                                Some(settings_page::wifi::Hit::Scan) => {
-                                    wifi_status = String::from("scanning...");
-                                    wifi_scan_dirty = true;
-                                    needs_redraw = true;
-                                }
-                                Some(settings_page::wifi::Hit::Sync) => {
-                                    if settings.wifi_ssid().is_empty() {
-                                        wifi_status =
-                                            String::from("no saved network - join one first");
-                                    } else {
-                                        wifi_status = String::from("checking internet...");
-                                        wifi_sync_dirty = true;
-                                    }
-                                    needs_redraw = true;
-                                }
-                                Some(settings_page::wifi::Hit::Network(i)) => {
-                                    if let Some(entry) = wifi_networks.get(i) {
-                                        if let Some(saved) =
-                                            settings.saved_wifi_password(&entry.ssid)
-                                        {
-                                            // already a saved network: reconnect
-                                            // with the stored password instead of
-                                            // re-prompting.
-                                            wifi_pw_ssid = entry.ssid.clone();
-                                            wifi_pw_buf = String::from(saved);
-                                            wifi_reconnect = true;
+                                } else if let Some(key) =
+                                    keyboard::hit(sx, sy, kb_symbols, kb_shift)
+                                {
+                                    match key {
+                                        Key::Shift => {
+                                            kb_shift = !kb_shift;
+                                            keyboard::draw(
+                                                &mut display,
+                                                kb_symbols,
+                                                kb_shift,
+                                                "SAVE",
+                                            );
+                                            display
+                                                .flush_partial_fast(keyboard::native_rect())
+                                                .ok();
+                                        }
+                                        Key::Symbols => {
+                                            kb_symbols = !kb_symbols;
+                                            keyboard::draw(
+                                                &mut display,
+                                                kb_symbols,
+                                                kb_shift,
+                                                "SAVE",
+                                            );
+                                            display
+                                                .flush_partial_fast(keyboard::native_rect())
+                                                .ok();
+                                        }
+                                        Key::Enter => {
+                                            // leave the keyboard and attempt the join on
+                                            // the next pass (so "connecting..." paints).
+                                            wifi_pw_mode = false;
                                             wifi_join_dirty = true;
-                                            wifi_status = String::from("reconnecting...");
-                                        } else {
-                                            wifi_pw_ssid = entry.ssid.clone();
-                                            wifi_pw_buf.clear();
-                                            wifi_reconnect = false;
-                                            if entry.secured {
-                                                // secured: collect the passphrase first.
-                                                kb_symbols = false;
-                                                kb_shift = false;
-                                                wifi_pw_mode = true;
-                                                wifi_status =
-                                                    String::from("enter password, then SAVE");
-                                            } else {
-                                                // open network: join straight away.
-                                                wifi_join_dirty = true;
-                                                wifi_status = String::from("connecting...");
+                                            wifi_status = String::from("connecting...");
+                                            needs_redraw = true;
+                                        }
+                                        other => {
+                                            match other {
+                                                Key::Char(c) if wifi_pw_buf.len() < 63 => {
+                                                    wifi_pw_buf.push(c)
+                                                }
+                                                Key::Space if wifi_pw_buf.len() < 63 => {
+                                                    wifi_pw_buf.push(' ')
+                                                }
+                                                Key::Backspace => {
+                                                    wifi_pw_buf.pop();
+                                                }
+                                                _ => {}
                                             }
+                                            settings_page::wifi::redraw_password(
+                                                &mut display,
+                                                &wifi_pw_buf,
+                                            );
+                                            display
+                                                .flush_partial_fast(
+                                                    settings_page::wifi::password_box_rect(),
+                                                )
+                                                .ok();
+                                        }
+                                    }
+                                }
+                            } else {
+                                match settings_page::wifi::status_hit(
+                                    sx,
+                                    sy,
+                                    &wifi_networks,
+                                    &settings,
+                                ) {
+                                    Some(settings_page::wifi::Hit::Back) => {
+                                        current_screen = Screen::Settings;
+                                        needs_redraw = true;
+                                    }
+                                    Some(settings_page::wifi::Hit::Scan) => {
+                                        wifi_status = String::from("scanning...");
+                                        wifi_scan_dirty = true;
+                                        needs_redraw = true;
+                                    }
+                                    Some(settings_page::wifi::Hit::Sync) => {
+                                        if settings.wifi_ssid().is_empty() {
+                                            wifi_status =
+                                                String::from("no saved network - join one first");
+                                        } else {
+                                            wifi_status = String::from("checking internet...");
+                                            wifi_sync_dirty = true;
                                         }
                                         needs_redraw = true;
                                     }
+                                    Some(settings_page::wifi::Hit::Network(i)) => {
+                                        if let Some(entry) = wifi_networks.get(i) {
+                                            if let Some(saved) =
+                                                settings.saved_wifi_password(&entry.ssid)
+                                            {
+                                                // already a saved network: reconnect
+                                                // with the stored password instead of
+                                                // re-prompting.
+                                                wifi_pw_ssid = entry.ssid.clone();
+                                                wifi_pw_buf = String::from(saved);
+                                                wifi_reconnect = true;
+                                                wifi_join_dirty = true;
+                                                wifi_status = String::from("reconnecting...");
+                                            } else {
+                                                wifi_pw_ssid = entry.ssid.clone();
+                                                wifi_pw_buf.clear();
+                                                wifi_reconnect = false;
+                                                if entry.secured {
+                                                    // secured: collect the passphrase first.
+                                                    kb_symbols = false;
+                                                    kb_shift = false;
+                                                    wifi_pw_mode = true;
+                                                    wifi_status =
+                                                        String::from("enter password, then SAVE");
+                                                } else {
+                                                    // open network: join straight away.
+                                                    wifi_join_dirty = true;
+                                                    wifi_status = String::from("connecting...");
+                                                }
+                                            }
+                                            needs_redraw = true;
+                                        }
+                                    }
+                                    Some(settings_page::wifi::Hit::Forget(i)) => {
+                                        if let Some(entry) = wifi_networks.get(i) {
+                                            settings.forget_wifi(&entry.ssid);
+                                            // persist immediately, like a join: the
+                                            // user expects the credentials gone.
+                                            settings.save();
+                                            settings_dirty = false;
+                                            wifi_status = format!("forgot {}", entry.ssid);
+                                            needs_redraw = true;
+                                        }
+                                    }
+                                    None => {}
                                 }
-                                Some(settings_page::wifi::Hit::Forget(i)) => {
-                                    if let Some(entry) = wifi_networks.get(i) {
-                                        settings.forget_wifi(&entry.ssid);
-                                        // persist immediately, like a join: the
-                                        // user expects the credentials gone.
-                                        settings.save();
-                                        settings_dirty = false;
-                                        wifi_status = format!("forgot {}", entry.ssid);
+                            }
+                        }
+                        Screen::Music => {
+                            if back_button_hit(sx, sy) {
+                                current_screen = Screen::Home;
+                                needs_redraw = true;
+                            } else if let Some(button) = music::hit(sx, sy) {
+                                // a control press keeps the page up and reports progress
+                                // on the bottom status line, then ok/error when done.
+                                music_command = Some(button);
+                                music_inline = true;
+                                music_anchor = None;
+                                music_status = Some("contacting server...");
+                                music_status_ticks = 0;
+                                music::draw_status(&mut display, "contacting server...");
+                                display.flush_partial_fast(music::status_rect()).ok();
+                                // no needs_redraw: keep the page, fetch on this pass.
+                                music.invalidate();
+                            } else {
+                                // a tap elsewhere refreshes the whole page.
+                                music_command = None;
+                                music_inline = false;
+                                music_status = None;
+                                music.refresh(music::View::Loading);
+                                music_anchor = None;
+                                needs_redraw = true;
+                            }
+                        }
+                        Screen::Environment => {
+                            if back_button_hit(sx, sy) {
+                                current_screen = Screen::Home;
+                                needs_redraw = true;
+                            } else {
+                                // a tap anywhere else re-fetches the latest reading.
+                                env.refresh(environment::View::Loading);
+                                needs_redraw = true;
+                            }
+                        }
+                        Screen::Weather => {
+                            if back_button_hit(sx, sy) {
+                                current_screen = Screen::Home;
+                                needs_redraw = true;
+                            } else {
+                                // a tap anywhere else re-fetches the latest forecast.
+                                weather.refresh(weather::View::Loading);
+                                needs_redraw = true;
+                            }
+                        }
+                        Screen::Library => {
+                            if back_button_hit(sx, sy) {
+                                current_screen = Screen::Home;
+                                needs_redraw = true;
+                            } else if let library::View::Ready(books) = &library.view {
+                                if library::scroll_up_hit(sx, sy) {
+                                    if library_scroll >= library::VISIBLE {
+                                        library_scroll -= library::VISIBLE;
                                         needs_redraw = true;
                                     }
+                                } else if library::scroll_down_hit(sx, sy) {
+                                    if library_scroll + library::VISIBLE < books.len() {
+                                        library_scroll += library::VISIBLE;
+                                        needs_redraw = true;
+                                    }
+                                } else if let Some(idx) =
+                                    library::card_hit(sx, sy, library_scroll, books.len())
+                                {
+                                    reader_path = String::from(books[idx].path());
+                                    reader_dirty = true;
+                                    reader_return = Screen::Library;
+                                    current_screen = Screen::Reader;
                                 }
-                                None => {}
                             }
                         }
-                    }
-                    Screen::Music => {
-                        if back_button_hit(sx, sy) {
-                            current_screen = Screen::Home;
-                            needs_redraw = true;
-                        } else if let Some(button) = music::hit(sx, sy) {
-                            // a control press keeps the page up and reports progress
-                            // on the bottom status line, then ok/error when done.
-                            music_command = Some(button);
-                            music_inline = true;
-                            music_anchor = None;
-                            music_status = Some("contacting server...");
-                            music_status_ticks = 0;
-                            music::draw_status(&mut display, "contacting server...");
-                            display.flush_partial_fast(music::status_rect()).ok();
-                            // no needs_redraw: keep the page, fetch on this pass.
-                            music.invalidate();
-                        } else {
-                            // a tap elsewhere refreshes the whole page.
-                            music_command = None;
-                            music_inline = false;
-                            music_status = None;
-                            music.refresh(music::View::Loading);
-                            music_anchor = None;
-                            needs_redraw = true;
-                        }
-                    }
-                    Screen::Environment => {
-                        if back_button_hit(sx, sy) {
-                            current_screen = Screen::Home;
-                            needs_redraw = true;
-                        } else {
-                            // a tap anywhere else re-fetches the latest reading.
-                            env.refresh(environment::View::Loading);
-                            needs_redraw = true;
-                        }
-                    }
-                    Screen::Weather => {
-                        if back_button_hit(sx, sy) {
-                            current_screen = Screen::Home;
-                            needs_redraw = true;
-                        } else {
-                            // a tap anywhere else re-fetches the latest forecast.
-                            weather.refresh(weather::View::Loading);
-                            needs_redraw = true;
-                        }
-                    }
-                    Screen::Library => {
-                        if back_button_hit(sx, sy) {
-                            current_screen = Screen::Home;
-                            needs_redraw = true;
-                        } else if let library::View::Ready(books) = &library.view {
-                            if library::scroll_up_hit(sx, sy) {
-                                if library_scroll >= library::VISIBLE {
-                                    library_scroll -= library::VISIBLE;
-                                    needs_redraw = true;
-                                }
-                            } else if library::scroll_down_hit(sx, sy) {
-                                if library_scroll + library::VISIBLE < books.len() {
-                                    library_scroll += library::VISIBLE;
-                                    needs_redraw = true;
-                                }
-                            } else if let Some(idx) =
-                                library::card_hit(sx, sy, library_scroll, books.len())
-                            {
-                                reader_path = String::from(books[idx].path());
-                                reader_dirty = true;
-                                reader_return = Screen::Library;
-                                current_screen = Screen::Reader;
+                        #[cfg(feature = "gps")]
+                        Screen::Gps => {
+                            if back_button_hit(sx, sy) {
+                                current_screen = Screen::Home;
+                                needs_redraw = true;
+                            } else if download_button_hit(sx, sy) {
+                                // pre-download the surrounding area on the next pass.
+                                gps_download = true;
+                            } else if fullscreen_button_hit(sx, sy) {
+                                // open the fullscreen map at native zoom.
+                                full_zoom = 0;
+                                current_screen = Screen::MapFull;
+                                needs_redraw = true;
+                            } else {
+                                // a tap anywhere else forces a map refresh for the
+                                // current fix. panel-only (no full-page redraw): the
+                                // fetch block below reloads the cell and repaints just
+                                // the panel.
+                                gps_map.invalidate();
                             }
                         }
-                    }
-                    #[cfg(feature = "gps")]
-                    Screen::Gps => {
-                        if back_button_hit(sx, sy) {
-                            current_screen = Screen::Home;
-                            needs_redraw = true;
-                        } else if download_button_hit(sx, sy) {
-                            // pre-download the surrounding area on the next pass.
-                            gps_download = true;
-                        } else if fullscreen_button_hit(sx, sy) {
-                            // open the fullscreen map at native zoom.
-                            full_zoom = 0;
-                            current_screen = Screen::MapFull;
-                            needs_redraw = true;
-                        } else {
-                            // a tap anywhere else forces a map refresh for the
-                            // current fix. panel-only (no full-page redraw): the
-                            // fetch block below reloads the cell and repaints just
-                            // the panel.
-                            gps_map.invalidate();
-                        }
-                    }
-                    #[cfg(feature = "gps")]
-                    Screen::MapFull => match full_touch(sx, sy) {
-                        FullAction::Back => {
-                            current_screen = Screen::Gps;
-                            needs_redraw = true;
-                        }
-                        FullAction::ZoomOut => {
-                            if full_zoom < FULL_ZOOM_MAX {
-                                full_zoom += 1;
+                        #[cfg(feature = "gps")]
+                        Screen::MapFull => match full_touch(sx, sy) {
+                            FullAction::Back => {
+                                current_screen = Screen::Gps;
                                 needs_redraw = true;
                             }
-                        }
-                        FullAction::ZoomIn => {
-                            if full_zoom > FULL_ZOOM_MIN {
-                                full_zoom -= 1;
+                            FullAction::ZoomOut => {
+                                if full_zoom < FULL_ZOOM_MAX {
+                                    full_zoom += 1;
+                                    needs_redraw = true;
+                                }
+                            }
+                            FullAction::ZoomIn => {
+                                if full_zoom > FULL_ZOOM_MIN {
+                                    full_zoom -= 1;
+                                    needs_redraw = true;
+                                }
+                            }
+                            // re-center on the current fix (re-render at same zoom).
+                            FullAction::Recenter => needs_redraw = true,
+                        },
+                        _ => {
+                            if back_button_hit(sx, sy) {
+                                current_screen = Screen::Home;
                                 needs_redraw = true;
                             }
-                        }
-                        // re-center on the current fix (re-render at same zoom).
-                        FullAction::Recenter => needs_redraw = true,
-                    },
-                    _ => {
-                        if back_button_hit(sx, sy) {
-                            current_screen = Screen::Home;
-                            needs_redraw = true;
                         }
                     }
                 }
             }
-            Some(_) => {}
-            None => touch_active = false,
+        }
+
+        // flush the lora message box once for whatever this pass's event
+        // drain changed, instead of once per character: a normal single
+        // keystroke still flushes right away (the loop above drained exactly
+        // one event), but a backlog of queued taps (typing outpaced the
+        // previous flush) gets drawn character-by-character above and
+        // written to the panel in this one pass. more than one character in
+        // the same pass means the panel is still behind, so take the
+        // cheaper waveform to keep draining rather than add to that debt;
+        // the settle branch below pays it off once typing actually pauses.
+        if lora_message_dirty {
+            if lora_chars_this_pass > 1 {
+                display.flush_partial_quick(message_box_native_rect()).ok();
+                lora_message_quick_pending = true;
+            } else {
+                display.flush_partial_fast(message_box_native_rect()).ok();
+                lora_message_quick_pending = false;
+            }
+            lora_message_dirty = false;
+        } else if lora_message_quick_pending
+            && now_us().saturating_sub(lora_message_last_edit_us) > MESSAGE_SETTLE_IDLE_US
+        {
+            draw_message(&mut display, &lora_message);
+            display.flush_partial_fast(message_box_native_rect()).ok();
+            lora_message_quick_pending = false;
         }
 
         // persist any settings change once, after leaving the settings screens
@@ -2859,6 +3034,7 @@ async fn main(spawner: Spawner) -> ! {
         draw_screensaver(&mut display, pct);
     }
     display.flush(DrawMode::BlackOnWhite).expect("to flush");
-    // hand LPWR back from the clock for the deep-sleep path.
-    display.deep_sleep(clock.into_inner(), input_ctl, None)
+    // hand LPWR back from the clock for the deep-sleep path; GPIO0 is always
+    // enabled as a wake source and was never claimed elsewhere this boot.
+    display.deep_sleep(clock.into_inner(), peripherals.GPIO0.degrade(), None)
 }

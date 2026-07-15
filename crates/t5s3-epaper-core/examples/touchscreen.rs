@@ -25,62 +25,68 @@ fn main() -> ! {
 
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
 
-    let i2c_bus =
-        t5s3_epaper_core::i2c::Bus::new(peripherals.I2C0, peripherals.GPIO39, peripherals.GPIO40)
-            .expect("to build i2c bus");
+    let i2c_worker = t5s3_epaper_core::i2c::Worker::new(
+        peripherals.I2C0,
+        peripherals.GPIO39,
+        peripherals.GPIO40,
+        t5s3_epaper_core::touch_pin_config!(peripherals),
+    )
+    .expect("to build i2c worker");
+    static mut I2C_CORE_STACK: esp_hal::system::Stack<16384> = esp_hal::system::Stack::new();
+    let mut cpu_control = esp_hal::system::CpuControl::new(peripherals.CPU_CTRL);
+    let i2c_core_guard = cpu_control
+        .start_app_core(
+            unsafe { &mut *core::ptr::addr_of_mut!(I2C_CORE_STACK) },
+            move || i2c_worker.run(),
+        )
+        .expect("to start the i2c worker on the second core");
+    core::mem::forget(i2c_core_guard);
+
     let mut display = Display::new(
         pin_config!(peripherals),
-        &i2c_bus,
         peripherals.DMA_CH0,
         peripherals.LCD_CAM,
         peripherals.RMT,
     )
     .expect("to initialize display");
-    let mut input_ctl = t5s3_epaper_core::input::Controller::new(
-        &i2c_bus,
-        t5s3_epaper_core::input_pin_config!(peripherals),
-    );
 
     let delay = Delay::new();
     display.power_on().expect("to power on display");
     delay.delay_millis(10);
     display.clear().expect("to clear display");
-    esp_println::println!(
-        "Touch resolution {:?}, display bounds {:?}",
-        input_ctl.touch_resolution(),
-        display.bounding_box().size
-    );
+    esp_println::println!("display bounds {:?}", display.bounding_box().size);
 
     loop {
-        let input = input_ctl.state().expect("to read input state");
-        if input.buttons.home {
-            esp_println::println!("home button pressed");
-        }
-        if let Some(state) = input.touch {
-            if let Some(point) = state.first_point() {
-                esp_println::println!("touch x={} y={} size={}", point.x, point.y, point.size);
-                let radius = 12i32;
-                let center = Point::new(point.x as i32, point.y as i32);
-                let top_left = center - Point::new(radius, radius);
+        while let Some(event) = t5s3_epaper_core::i2c::poll_event() {
+            match event {
+                t5s3_epaper_core::i2c::Event::Home => {
+                    esp_println::println!("home button pressed");
+                }
+                t5s3_epaper_core::i2c::Event::Tap { x, y } => {
+                    esp_println::println!("touch x={} y={}", x, y);
+                    let radius = 12i32;
+                    let center = Point::new(x as i32, y as i32);
+                    let top_left = center - Point::new(radius, radius);
 
-                Circle::new(top_left, (radius * 2) as u32)
-                    .into_styled(PrimitiveStyle::with_fill(Gray4::BLACK))
-                    .draw(&mut display)
-                    .expect("to draw touch indicator");
+                    Circle::new(top_left, (radius * 2) as u32)
+                        .into_styled(PrimitiveStyle::with_fill(Gray4::BLACK))
+                        .draw(&mut display)
+                        .expect("to draw touch indicator");
 
-                let area = Rectangle {
-                    x: point.x.saturating_sub(radius as u16 + 2),
-                    y: point.y.saturating_sub(radius as u16 + 2),
-                    width: (((radius as u16) * 2 + 4).min(Display::WIDTH)).min(
-                        Display::WIDTH.saturating_sub(point.x.saturating_sub(radius as u16 + 2)),
-                    ),
-                    height: (((radius as u16) * 2 + 4).min(Display::HEIGHT)).min(
-                        Display::HEIGHT.saturating_sub(point.y.saturating_sub(radius as u16 + 2)),
-                    ),
-                };
-                display
-                    .flush_partial_fast(area)
-                    .expect("to flush touch indicator");
+                    let area = Rectangle {
+                        x: x.saturating_sub(radius as u16 + 2),
+                        y: y.saturating_sub(radius as u16 + 2),
+                        width: (((radius as u16) * 2 + 4).min(Display::WIDTH)).min(
+                            Display::WIDTH.saturating_sub(x.saturating_sub(radius as u16 + 2)),
+                        ),
+                        height: (((radius as u16) * 2 + 4).min(Display::HEIGHT)).min(
+                            Display::HEIGHT.saturating_sub(y.saturating_sub(radius as u16 + 2)),
+                        ),
+                    };
+                    display
+                        .flush_partial_fast(area)
+                        .expect("to flush touch indicator");
+                }
             }
         }
 
