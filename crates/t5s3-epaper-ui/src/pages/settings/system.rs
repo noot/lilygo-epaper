@@ -28,6 +28,7 @@ const TZ_VAL_W: u32 = 90;
 const FMT_Y: i32 = 300;
 const ICONS_Y: i32 = 390;
 const ICON_SIZE_Y: i32 = 480;
+const IO48_Y: i32 = 570;
 pub(crate) enum Hit {
     Back,
     TzMinus,
@@ -35,6 +36,7 @@ pub(crate) enum Hit {
     ToggleFormat,
     CycleIcons,
     CycleIconSize,
+    CycleIo48,
 }
 
 pub(crate) fn hit_test(sx: i32, sy: i32) -> Option<Hit> {
@@ -50,6 +52,8 @@ pub(crate) fn hit_test(sx: i32, sy: i32) -> Option<Hit> {
         Some(Hit::CycleIcons)
     } else if in_rect(sx, sy, WIDE_BTN_X, ICON_SIZE_Y, WIDE_BTN_W, BTN_H) {
         Some(Hit::CycleIconSize)
+    } else if in_rect(sx, sy, WIDE_BTN_X, IO48_Y, WIDE_BTN_W, BTN_H) {
+        Some(Hit::CycleIo48)
     } else {
         None
     }
@@ -75,6 +79,10 @@ pub(crate) fn draw(display: &mut Display, settings: &Settings) {
 
     label(display, "Icon size", ICON_SIZE_Y);
     draw_icon_size_button(display, settings);
+
+    // IO48 button action selection.
+    label(display, "IO48 Button", IO48_Y);
+    draw_io48_button(display, settings);
 }
 
 fn draw_tz_value(display: &mut Display, offset_hours: i8) {
@@ -154,4 +162,22 @@ pub(crate) fn redraw_icons(display: &mut Display, settings: &Settings) {
 
 pub(crate) fn redraw_icon_size(display: &mut Display, settings: &Settings) {
     draw_icon_size_button(display, settings);
+}
+
+fn draw_io48_button(display: &mut Display, settings: &Settings) {
+    button(
+        display,
+        WIDE_BTN_X,
+        IO48_Y,
+        WIDE_BTN_W,
+        settings.io48_action.label(),
+    );
+}
+
+pub(crate) fn io48_button_rect() -> t5s3_epaper_core::display::Rectangle {
+    screen_to_native_rect(WIDE_BTN_X, IO48_Y, WIDE_BTN_W as i32, BTN_H as i32)
+}
+
+pub(crate) fn redraw_io48(display: &mut Display, settings: &Settings) {
+    draw_io48_button(display, settings);
 }
