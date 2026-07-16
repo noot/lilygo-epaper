@@ -5,7 +5,7 @@ use embedded_graphics::{
     mono_font::{ascii::FONT_9X15, MonoFont, MonoTextStyle},
     pixelcolor::BinaryColor,
     prelude::*,
-    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle, Triangle},
+    primitives::{Polyline, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle},
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
@@ -194,38 +194,41 @@ fn draw_label(display: &mut Display, cx: i32, cy: i32, label: &str, color: Gray4
     .ok();
 }
 
-// upward arrow: the standard shift glyph. drawn instead of a text label so
-// it stays legible at the key's small footprint.
+// upward arrow: the standard shift glyph, drawn as a single outline (not
+// filled) so it reads as an icon rather than a solid blob. drawn instead of
+// a text label so it stays legible at the key's small footprint.
 fn draw_shift_icon(display: &mut Display, cx: i32, cy: i32, color: Gray4) {
-    let style = PrimitiveStyle::with_fill(color);
-    Triangle::new(
+    let points = [
         Point::new(cx, cy - 12),
-        Point::new(cx - 11, cy + 2),
         Point::new(cx + 11, cy + 2),
-    )
-    .into_styled(style)
-    .draw(display)
-    .ok();
-    Rectangle::new(Point::new(cx - 5, cy + 2), Size::new(10, 10))
-        .into_styled(style)
+        Point::new(cx + 5, cy + 2),
+        Point::new(cx + 5, cy + 12),
+        Point::new(cx - 5, cy + 12),
+        Point::new(cx - 5, cy + 2),
+        Point::new(cx - 11, cy + 2),
+        Point::new(cx, cy - 12),
+    ];
+    Polyline::new(&points)
+        .into_styled(PrimitiveStyle::with_stroke(color, 2))
         .draw(display)
         .ok();
 }
 
-// leftward arrow: reads as "backspace" (delete-back-one), not the
+// leftward arrow outline: reads as "backspace" (delete-back-one), not the
 // delete-forward the old "del" text label implied.
 fn draw_backspace_icon(display: &mut Display, cx: i32, cy: i32, color: Gray4) {
-    let style = PrimitiveStyle::with_fill(color);
-    Triangle::new(
+    let points = [
         Point::new(cx - 13, cy),
         Point::new(cx - 1, cy - 11),
+        Point::new(cx - 1, cy - 6),
+        Point::new(cx + 14, cy - 6),
+        Point::new(cx + 14, cy + 6),
+        Point::new(cx - 1, cy + 6),
         Point::new(cx - 1, cy + 11),
-    )
-    .into_styled(style)
-    .draw(display)
-    .ok();
-    Rectangle::new(Point::new(cx - 1, cy - 6), Size::new(15, 12))
-        .into_styled(style)
+        Point::new(cx - 13, cy),
+    ];
+    Polyline::new(&points)
+        .into_styled(PrimitiveStyle::with_stroke(color, 2))
         .draw(display)
         .ok();
 }
