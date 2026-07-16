@@ -12,8 +12,9 @@ use t5s3_epaper_core::Display;
 
 use super::{button, in_rect, title, BTN_H};
 use crate::{
-    layout::{screen_to_native_rect, SCREEN_W},
+    layout::SCREEN_W,
     settings::Settings,
+    text_field::TextField,
     widgets::draw_back_button,
     wifi::ScanEntry,
 };
@@ -40,10 +41,12 @@ const FORGET_BTN_W: u32 = 90;
 const FORGET_BTN_H: u32 = 44;
 const FORGET_BTN_DY: i32 = (ROW_H - FORGET_BTN_H as i32) / 2;
 
-const PW_BOX_X: i32 = 30;
-const PW_BOX_Y: i32 = 195;
-const PW_BOX_W: u32 = 480;
-const PW_BOX_H: u32 = 60;
+pub(crate) const PW_BOX_X: i32 = 30;
+pub(crate) const PW_BOX_Y: i32 = 195;
+pub(crate) const PW_BOX_W: i32 = 480;
+pub(crate) const PW_BOX_H: i32 = 60;
+// wpa2 passphrases top out at 63 ascii characters.
+pub(crate) const PASSWORD_MAX: usize = 63;
 
 pub(crate) enum Hit {
     Back,
@@ -253,8 +256,7 @@ pub(crate) fn draw_password(
     ssid: &str,
     password: &str,
     hint: &str,
-    symbols: bool,
-    shift: bool,
+    field: &TextField,
 ) {
     draw_back_button(display);
     let mut heading = alloc::string::String::from("Join ");
@@ -268,44 +270,14 @@ pub(crate) fn draw_password(
     )
     .draw(display)
     .ok();
-    draw_password_box(display, password);
     // status line under the box, e.g. why the keyboard reopened after a
     // failed join.
     Text::new(
         hint,
-        Point::new(PW_BOX_X, PW_BOX_Y + PW_BOX_H as i32 + 30),
+        Point::new(PW_BOX_X, PW_BOX_Y + PW_BOX_H + 30),
         MonoTextStyle::new(&FONT_9X15, Gray4::new(6)),
     )
     .draw(display)
     .ok();
-    crate::keyboard::draw(display, symbols, shift, "SAVE");
-}
-
-fn draw_password_box(display: &mut Display, password: &str) {
-    Rectangle::new(
-        Point::new(PW_BOX_X, PW_BOX_Y),
-        Size::new(PW_BOX_W, PW_BOX_H),
-    )
-    .into_styled(
-        PrimitiveStyleBuilder::new()
-            .stroke_color(Gray4::BLACK)
-            .stroke_width(2)
-            .fill_color(Gray4::WHITE)
-            .build(),
-    )
-    .draw(display)
-    .ok();
-    let font = MonoTextStyle::new(&FONT_9X15, Gray4::BLACK);
-    let shown = truncate(password, 50);
-    Text::new(shown, Point::new(PW_BOX_X + 12, PW_BOX_Y + 36), font)
-        .draw(display)
-        .ok();
-}
-
-pub(crate) fn redraw_password(display: &mut Display, password: &str) {
-    draw_password_box(display, password);
-}
-
-pub(crate) fn password_box_rect() -> t5s3_epaper_core::display::Rectangle {
-    screen_to_native_rect(PW_BOX_X, PW_BOX_Y, PW_BOX_W as i32, PW_BOX_H as i32)
+    field.draw_full(display, password);
 }

@@ -1,30 +1,42 @@
 use alloc::vec::Vec;
 
 use embedded_graphics::{
-    mono_font::{ascii::FONT_9X15, MonoTextStyle},
+    image::GetPixel,
+    mono_font::{ascii::FONT_9X15, MonoFont, MonoTextStyle},
+    pixelcolor::BinaryColor,
     prelude::*,
-    primitives::{PrimitiveStyleBuilder, Rectangle, RoundedRectangle},
+    primitives::{Polyline, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle},
     text::{Alignment, Text},
 };
 use embedded_graphics_core::pixelcolor::{Gray4, GrayColor};
 use t5s3_epaper_core::Display;
 
-use crate::layout::{screen_to_native_rect, SCREEN_W};
+use crate::layout::{screen_to_native_rect, SAFE_W, SAFE_X, SCREEN_W};
 
-// on-screen touch keyboard shared by the lora composer and the wifi password
-// entry. the keys are static, so the whole board is painted once on entry (full
-// refresh); callers repaint just their input field on each keystroke (partial
-// refresh). the enter key's label is caller-supplied ("SEND", "SAVE", ...).
-const KB_KEY_W: i32 = 50;
+// on-screen touch keyboard shared by the lora composer, the wifi password
+// entry, the notes editor and the mesh alias editor. the keys are static, so
+// the whole board is painted once on entry (full refresh); callers repaint
+// just their input field on each keystroke (partial refresh). the enter
+// key's label is caller-supplied ("SEND", "SAVE", ...).
+const KB_KEY_W: i32 = 47;
 const KB_KEY_H: i32 = 78;
 const KB_GAP: i32 = 4;
 const KB_GAP_Y: i32 = 8;
 // keyboard sits at the bottom of the screen (rows end ~24px from the edge).
 const KB_TOP: i32 = 600;
-const KB_X: i32 = 2;
-const KB_FULL_W: i32 = 536;
+// inset to the same case-safe strip as the rest of the touch grid, so a
+// rounded key corner in the outer columns (q, p) doesn't sit under the
+// bezel.
+const KB_X: i32 = SAFE_X;
+const KB_FULL_W: i32 = SAFE_W;
 const KB_TOGGLE_W: i32 = 90;
 const KB_ENTER_W: i32 = 110;
+
+// letter keys draw FONT_9X15 nearest-neighbor scaled up by this factor
+// (see draw_scaled_char), rather than switching to a different, larger font
+// face: legible at arm's length while still reading as the same glyphs used
+// everywhere else in the ui.
+const CHAR_SCALE: i32 = 2;
 
 const KB_LETTERS: [&str; 3] = ["qwertyuiop", "asdfghjkl", "zxcvbnm"];
 const KB_SYMBOLS: [&str; 3] = ["1234567890", "@#$&-+()/", "*\"':;!?,"];
@@ -60,7 +72,7 @@ fn keyboard(symbols: bool, shift: bool) -> Vec<KeyBox> {
 
     for (row, &row_keys) in rows.iter().enumerate().take(2) {
         let n = row_keys.chars().count() as i32;
-        let ox = (SCREEN_W - (n * KB_KEY_W + (n - 1) * KB_GAP)) / 2;
+        let ox = KB_X + (KB_FULL_W - (n * KB_KEY_W + (n - 1) * KB_GAP)) / 2;
         let y = kb_row_y(row as i32);
         for (i, c) in row_keys.chars().enumerate() {
             let ch = if !symbols && shift {
@@ -81,7 +93,7 @@ fn keyboard(symbols: bool, shift: bool) -> Vec<KeyBox> {
     // third row: nine slots. letters -> [shift][7 letters][del]; symbols ->
     // [8 symbols][del].
     let y = kb_row_y(2);
-    let ox = (SCREEN_W - (9 * KB_KEY_W + 8 * KB_GAP)) / 2;
+    let ox = KB_X + (KB_FULL_W - (9 * KB_KEY_W + 8 * KB_GAP)) / 2;
     let mut x = ox;
     if !symbols {
         keys.push(KeyBox {
@@ -171,20 +183,101 @@ pub(crate) fn hit(sx: i32, sy: i32, symbols: bool, shift: bool) -> Option<Key> {
         .find_map(|k| (sx >= k.x && sx < k.x + k.w && sy >= k.y && sy < k.y + k.h).then_some(k.key))
 }
 
-fn key_label<'a>(key: Key, symbols: bool, enter_label: &'a str, buf: &'a mut [u8; 4]) -> &'a str {
-    match key {
-        Key::Char(c) => c.encode_utf8(buf),
-        Key::Shift => "shift",
-        Key::Symbols => {
-            if symbols {
-                "abc"
-            } else {
-                "123"
+fn draw_label(display: &mut Display, cx: i32, cy: i32, label: &str, color: Gray4) {
+    Text::with_alignment(
+        label,
+        Point::new(cx, cy + 5),
+        MonoTextStyle::new(&FONT_9X15, color),
+        Alignment::Center,
+    )
+    .draw(display)
+    .ok();
+}
+
+// upward arrow: the standard shift glyph, drawn as a single outline (not
+// filled) so it reads as an icon rather than a solid blob. drawn instead of
+// a text label so it stays legible at the key's small footprint.
+fn draw_shift_icon(display: &mut Display, cx: i32, cy: i32, color: Gray4) {
+    let points = [
+        Point::new(cx, cy - 12),
+        Point::new(cx + 11, cy + 2),
+        Point::new(cx + 5, cy + 2),
+        Point::new(cx + 5, cy + 12),
+        Point::new(cx - 5, cy + 12),
+        Point::new(cx - 5, cy + 2),
+        Point::new(cx - 11, cy + 2),
+        Point::new(cx, cy - 12),
+    ];
+    Polyline::new(&points)
+        .into_styled(PrimitiveStyle::with_stroke(color, 2))
+        .draw(display)
+        .ok();
+}
+
+// leftward arrow outline: reads as "backspace" (delete-back-one), not the
+// delete-forward the old "del" text label implied.
+fn draw_backspace_icon(display: &mut Display, cx: i32, cy: i32, color: Gray4) {
+    let points = [
+        Point::new(cx - 13, cy),
+        Point::new(cx - 1, cy - 11),
+        Point::new(cx - 1, cy - 6),
+        Point::new(cx + 14, cy - 6),
+        Point::new(cx + 14, cy + 6),
+        Point::new(cx - 1, cy + 6),
+        Point::new(cx - 1, cy + 11),
+        Point::new(cx - 13, cy),
+    ];
+    Polyline::new(&points)
+        .into_styled(PrimitiveStyle::with_stroke(color, 2))
+        .draw(display)
+        .ok();
+}
+
+// draws `c` from `font`'s bitmap nearest-neighbor scaled up by `scale`,
+// centered at (cx, cy): looks up the glyph's cell in the font's raw image
+// (the same lookup MonoFont uses internally) and blits each "on" pixel as a
+// `scale`-sized square, merging consecutive on-pixels within a row into one
+// rectangle so a glyph is a handful of draw calls rather than one per pixel.
+fn draw_scaled_char(
+    display: &mut Display,
+    font: &MonoFont,
+    c: char,
+    cx: i32,
+    cy: i32,
+    scale: i32,
+    color: Gray4,
+) {
+    let cell = font.character_size;
+    let glyphs_per_row = font.image.size().width / cell.width;
+    let glyph_index = font.glyph_mapping.index(c) as u32;
+    let row = glyph_index / glyphs_per_row;
+    let col = glyph_index - row * glyphs_per_row;
+    let origin = Point::new((col * cell.width) as i32, (row * cell.height) as i32);
+    let top_left = Point::new(
+        cx - (cell.width as i32 * scale) / 2,
+        cy - (cell.height as i32 * scale) / 2,
+    );
+    let style = PrimitiveStyle::with_fill(color);
+    for gy in 0..cell.height as i32 {
+        let mut run_start: Option<i32> = None;
+        for gx in 0..=cell.width as i32 {
+            let on = gx < cell.width as i32
+                && font.image.pixel(origin + Point::new(gx, gy)) == Some(BinaryColor::On);
+            match (on, run_start) {
+                (true, None) => run_start = Some(gx),
+                (false, Some(start)) => {
+                    Rectangle::new(
+                        Point::new(top_left.x + start * scale, top_left.y + gy * scale),
+                        Size::new(((gx - start) * scale) as u32, scale as u32),
+                    )
+                    .into_styled(style)
+                    .draw(display)
+                    .ok();
+                    run_start = None;
+                }
+                _ => {}
             }
         }
-        Key::Backspace => "del",
-        Key::Space => "space",
-        Key::Enter => enter_label,
     }
 }
 
@@ -211,16 +304,17 @@ pub(crate) fn draw(display: &mut Display, symbols: bool, shift: bool, enter_labe
         .draw(display)
         .ok();
 
-        let mut buf = [0u8; 4];
-        let label = key_label(k.key, symbols, enter_label, &mut buf);
-        Text::with_alignment(
-            label,
-            Point::new(k.x + k.w / 2, k.y + k.h / 2 + 5),
-            MonoTextStyle::new(&FONT_9X15, fg),
-            Alignment::Center,
-        )
-        .draw(display)
-        .ok();
+        let cx = k.x + k.w / 2;
+        let cy = k.y + k.h / 2;
+        match k.key {
+            Key::Shift => draw_shift_icon(display, cx, cy, fg),
+            Key::Backspace => draw_backspace_icon(display, cx, cy, fg),
+            Key::Char(c) => draw_scaled_char(display, &FONT_9X15, c, cx, cy, CHAR_SCALE, fg),
+            Key::Symbols if symbols => draw_label(display, cx, cy, "abc", fg),
+            Key::Symbols => draw_label(display, cx, cy, "123", fg),
+            Key::Space => draw_label(display, cx, cy, "space", fg),
+            Key::Enter => draw_label(display, cx, cy, enter_label, fg),
+        }
     }
 }
 
