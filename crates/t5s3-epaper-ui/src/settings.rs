@@ -515,14 +515,14 @@ impl Settings {
         if buf[2] == V5_VERSION {
             return Self::decode_v5(buf);
         }
-        if buf[2] == V8_VERSION {
-            return Self::decode_v8(buf);
+        if buf[2] == V6_VERSION {
+            return Self::decode_v6(buf);
         }
         if buf[2] == V7_VERSION {
             return Self::decode_v7(buf);
         }
-        if buf[2] == V6_VERSION {
-            return Self::decode_v6(buf);
+        if buf[2] == V8_VERSION {
+            return Self::decode_v8(buf);
         }
         if buf[2] != VERSION {
             return None;
