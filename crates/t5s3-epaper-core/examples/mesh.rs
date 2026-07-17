@@ -281,6 +281,10 @@ fn main() -> ! {
                 println!("tx alias from {:08x} hops {}", a.origin.0, a.hops);
                 true
             }
+            Ok(wire::Message::Position(p)) => {
+                println!("tx position from {:08x} hops {}", p.origin.0, p.hops);
+                true
+            }
             Err(_) => false,
         };
         match radio.transmit(engine.packet()) {

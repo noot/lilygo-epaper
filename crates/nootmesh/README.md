@@ -225,6 +225,7 @@ enum Message {          // discriminant
     Text(Text),         // 2
     Recap(Recap),       // 3
     Alias(Alias),       // 4
+    Position(Position), // 5
 }
 ```
 
@@ -313,6 +314,29 @@ steady cost is only the name bytes. Receivers keep a 16-entry id → name
 table. Purely cosmetic: node id remains the protocol identity, and displays
 show `name (137c)` — name plus id tail — because claims are unauthenticated
 until the pubkey layer. Nodes that never announce appear as bare ids.
+
+Receiver: process the hello; dedup; record the claim; forward under the hop
+cap.
+
+### Position — GPS coordinates, flooded (~20 B on air)
+
+```rust
+Position {
+    hello: Hello,
+    origin: NodeId,
+    msg_id: u16,            // (origin, msg_id) dedup, like Text
+    hops: u8,
+    lat_e7: i32,            // degrees x 10^7 (~1 cm resolution)
+    lon_e7: i32,
+}
+```
+
+Flooded like a Text (same dedup, same hop cap). Never sent automatically —
+coordinates go out in plaintext, so announcements happen only on an explicit
+user action or an opt-in periodic setting (the t5s3 ui defaults to manual
+shares; its "Share location" setting floods every 10 minutes while a fix is
+held). Receivers keep a 16-entry id → position table aged by the local
+clock; uis derive distance/bearing rows and map markers from it.
 
 Receiver: process the hello; dedup; record the claim; forward under the hop
 cap.

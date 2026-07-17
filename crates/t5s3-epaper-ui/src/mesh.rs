@@ -10,6 +10,7 @@
 //! (hellos and texts carry no timing and are always accepted).
 
 use alloc::{format, string::String};
+use core::fmt::Write as _;
 
 use nootmesh::{
     airtime::Modulation,
@@ -40,6 +41,8 @@ fn now_us() -> u64 {
 pub(crate) struct Mesh {
     engine: Engine,
     node_id: u32,
+    /// last GPS fix recorded on this device, for distance/bearing rows.
+    own_position: Option<(i32, i32)>,
     rx_count: u32,
     tx_count: u32,
     last_rssi_dbm: Option<i16>,
@@ -77,6 +80,7 @@ impl Mesh {
         Ok(Self {
             engine,
             node_id: node_id.0,
+            own_position: None,
             rx_count: 0,
             tx_count: 0,
             last_rssi_dbm: None,
@@ -151,6 +155,38 @@ impl Mesh {
     /// from this device has gone on the air.
     pub(crate) fn texts_pending(&self) -> usize {
         self.engine.texts_pending()
+    }
+
+    /// Record the current GPS fix (degrees x 10^7) without announcing.
+    #[cfg(feature = "gps")]
+    pub(crate) fn update_position(&mut self, lat_e7: i32, lon_e7: i32) {
+        self.own_position = Some((lat_e7, lon_e7));
+        self.engine.update_position(lat_e7, lon_e7);
+    }
+
+    /// Flood the last recorded fix to the mesh (manual share button or the
+    /// opt-in periodic setting). False when there is no fix to share.
+    pub(crate) fn announce_position(&mut self) -> bool {
+        self.engine.announce_position()
+    }
+
+    /// A peer's last shared position with its distance/bearing from our own
+    /// fix, for map markers: `(lat_e7, lon_e7, age_us)`.
+    #[cfg(feature = "gps")]
+    pub(crate) fn peer_positions(&self) -> alloc::vec::Vec<(u32, i32, i32, u64)> {
+        let now = now_us();
+        let mut out = alloc::vec::Vec::new();
+        for peer in self.engine.peers(now) {
+            if let Some(position) = self.engine.position_of(peer.id) {
+                out.push((
+                    peer.id.0,
+                    position.lat_e7,
+                    position.lon_e7,
+                    now.saturating_sub(position.heard_at_us),
+                ));
+            }
+        }
+        out
     }
 
     /// Next received chat text as `(dedup key, author id, origination utc,
@@ -230,7 +266,7 @@ impl Mesh {
                 Some(slot) => format!("{slot}"),
                 None => String::from("--"),
             };
-            let row = match (peer.rssi_dbm, peer.snr_db, peer.heard_age_us) {
+            let mut row = match (peer.rssi_dbm, peer.snr_db, peer.heard_age_us) {
                 (Some(dbm), Some(snr), Some(age)) => {
                     let age_s = age / 1_000_000;
                     format!("{name:<22}{slot:<7}{dbm:<6}{snr:<5}{age_s}s ago")
@@ -242,6 +278,18 @@ impl Mesh {
                     None => format!("{name:<22}{slot}"),
                 },
             };
+            // distance and bearing, when both ends have shared a position
+            if let (Some(own), Some(theirs)) = (self.own_position, self.engine.position_of(peer.id))
+            {
+                let to = (theirs.lat_e7, theirs.lon_e7);
+                let meters = crate::geo::distance_m(own, to);
+                let _ = write!(
+                    row,
+                    "  {} {}",
+                    crate::geo::distance_label(meters),
+                    crate::geo::compass8(own, to)
+                );
+            }
             rows.push(row);
         }
         rows
@@ -287,6 +335,13 @@ impl Mesh {
                                 "mesh tx alias from {:08x} hops {}",
                                 a.origin.0,
                                 a.hops
+                            )
+                        }
+                        Ok(wire::Message::Position(p)) => {
+                            esp_println::println!(
+                                "mesh tx position from {:08x} hops {}",
+                                p.origin.0,
+                                p.hops
                             )
                         }
                         Err(_) => {}

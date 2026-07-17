@@ -394,6 +394,9 @@ pub(crate) struct Settings {
     /// keep the lora radio and mesh membership alive on every screen (at a
     /// standing rx current cost), instead of only while the lora page is open.
     pub(crate) mesh_background: bool,
+    /// periodically flood this node's GPS position to the mesh (plaintext on
+    /// air, hence opt-in; manual shares work regardless).
+    pub(crate) mesh_share_location: bool,
     /// mesh display name, flooded as an alias claim; empty = id only.
     mesh_alias: [u8; ALIAS_CAP],
     mesh_alias_len: u8,
@@ -420,6 +423,7 @@ impl Default for Settings {
             icon_size: IconSize::Regular,
             io48_action: Io48Action::Sleep,
             mesh_background: false,
+            mesh_share_location: false,
             mesh_alias: [0; ALIAS_CAP],
             mesh_alias_len: 0,
             wifi_networks,
@@ -433,13 +437,20 @@ impl Default for Settings {
 // flash, older/newer layout, corruption) falls back to defaults, except the
 // immediately previous version which is migrated (see `decode_v5`).
 const MAGIC: [u8; 2] = [0x54, 0x35];
-const VERSION: u8 = 9;
+const VERSION: u8 = 10;
 /// mesh display-name capacity, matching nootmesh's wire cap.
 pub(crate) const ALIAS_CAP: usize = 12;
-// 13 scalar bytes (added io48_action at byte 12), an alias (len + 12), a
-// saved-network count, then WIFI_NETWORK_CAP fixed-size network entries (ssid
-// len + 32, password len + 64), then a trailing xor checksum.
-const ALIAS_OFF: usize = 13;
+// 14 scalar bytes (io48_action at 12, mesh_share_location at 13), an alias
+// (len + 12), a saved-network count, then WIFI_NETWORK_CAP fixed-size network
+// entries (ssid len + 32, password len + 64), then a trailing xor checksum.
+const ALIAS_OFF: usize = 14;
+
+// the version-9 layout: identical except it lacked the share-location byte,
+// so the alias offset was at 13.
+const V9_VERSION: u8 = 9;
+const V9_ALIAS_OFF: usize = 13;
+const V9_NETWORKS_OFF: usize = V9_ALIAS_OFF + 1 + ALIAS_CAP + 1;
+const V9_CHECKSUM_OFF: usize = V9_NETWORKS_OFF + WIFI_NETWORK_CAP * NETWORK_SIZE;
 const NETWORKS_OFF: usize = ALIAS_OFF + 1 + ALIAS_CAP + 1;
 const NETWORK_SIZE: usize = 1 + SSID_CAP + 1 + PASSWORD_CAP;
 const CHECKSUM_OFF: usize = NETWORKS_OFF + WIFI_NETWORK_CAP * NETWORK_SIZE;
@@ -494,6 +505,7 @@ impl Settings {
         buf[10] = self.icon_size.to_byte();
         buf[11] = u8::from(self.mesh_background);
         buf[12] = self.io48_action.to_byte();
+        buf[13] = u8::from(self.mesh_share_location);
         buf[ALIAS_OFF] = self.mesh_alias_len.min(ALIAS_CAP as u8);
         buf[ALIAS_OFF + 1..ALIAS_OFF + 1 + ALIAS_CAP].copy_from_slice(&self.mesh_alias);
         buf[NETWORKS_OFF - 1] = self.wifi_network_count.min(WIFI_NETWORK_CAP as u8);
@@ -524,6 +536,9 @@ impl Settings {
         if buf[2] == V8_VERSION {
             return Self::decode_v8(buf);
         }
+        if buf[2] == V9_VERSION {
+            return Self::decode_v9(buf);
+        }
         if buf[2] != VERSION {
             return None;
         }
@@ -551,6 +566,7 @@ impl Settings {
             icon_size: IconSize::from_byte(buf[10]),
             mesh_background: buf[11] != 0,
             io48_action: Io48Action::from_byte(buf[12]),
+            mesh_share_location: buf[13] != 0,
             mesh_alias: {
                 let mut alias = [0; ALIAS_CAP];
                 alias.copy_from_slice(&buf[ALIAS_OFF + 1..ALIAS_OFF + 1 + ALIAS_CAP]);
@@ -559,6 +575,45 @@ impl Settings {
             mesh_alias_len: buf[ALIAS_OFF].min(ALIAS_CAP as u8),
             wifi_networks,
             wifi_network_count: buf[NETWORKS_OFF - 1].min(WIFI_NETWORK_CAP as u8),
+        })
+    }
+
+    // migrate a version-9 blob: identical scalars, no share-location flag
+    // (defaults off), alias offset at 13.
+    fn decode_v9(buf: &[u8; BLOB_LEN]) -> Option<Self> {
+        let checksum = buf[0..V9_CHECKSUM_OFF].iter().fold(0u8, |acc, &b| acc ^ b);
+        if checksum != buf[V9_CHECKSUM_OFF] {
+            return None;
+        }
+        let mut wifi_networks = [WifiNetwork::EMPTY; WIFI_NETWORK_CAP];
+        for (i, net) in wifi_networks.iter_mut().enumerate() {
+            let off = V9_NETWORKS_OFF + i * NETWORK_SIZE;
+            net.ssid_len = buf[off].min(SSID_CAP as u8);
+            net.ssid.copy_from_slice(&buf[off + 1..off + 1 + SSID_CAP]);
+            net.password_len = buf[off + 1 + SSID_CAP].min(PASSWORD_CAP as u8);
+            net.password
+                .copy_from_slice(&buf[off + 2 + SSID_CAP..off + NETWORK_SIZE]);
+        }
+        Some(Self {
+            tz_offset_hours: buf[3] as i8,
+            time_24h: buf[4] != 0,
+            brightness: buf[5].min(100),
+            reader_font_size: FontSize::from_byte(buf[6]),
+            reader_font_family: FontFamily::from_byte(buf[7]),
+            reader_line_spacing: LineSpacing::from_byte(buf[8]),
+            icon_style: IconStyle::from_byte(buf[9]),
+            icon_size: IconSize::from_byte(buf[10]),
+            mesh_background: buf[11] != 0,
+            io48_action: Io48Action::from_byte(buf[12]),
+            mesh_share_location: false,
+            mesh_alias: {
+                let mut alias = [0; ALIAS_CAP];
+                alias.copy_from_slice(&buf[V9_ALIAS_OFF + 1..V9_ALIAS_OFF + 1 + ALIAS_CAP]);
+                alias
+            },
+            mesh_alias_len: buf[V9_ALIAS_OFF].min(ALIAS_CAP as u8),
+            wifi_networks,
+            wifi_network_count: buf[V9_NETWORKS_OFF - 1].min(WIFI_NETWORK_CAP as u8),
         })
     }
 
@@ -588,6 +643,7 @@ impl Settings {
             icon_style: IconStyle::from_byte(buf[9]),
             icon_size: IconSize::from_byte(buf[10]),
             mesh_background: buf[11] != 0,
+            mesh_share_location: false,
             io48_action: Io48Action::Sleep,
             mesh_alias: {
                 let mut alias = [0; ALIAS_CAP];
@@ -626,6 +682,7 @@ impl Settings {
             icon_style: IconStyle::from_byte(buf[9]),
             icon_size: IconSize::from_byte(buf[10]),
             mesh_background: buf[11] != 0,
+            mesh_share_location: false,
             io48_action: Io48Action::Sleep,
             mesh_alias: [0; ALIAS_CAP],
             mesh_alias_len: 0,
@@ -660,6 +717,7 @@ impl Settings {
             icon_style: IconStyle::from_byte(buf[9]),
             icon_size: IconSize::from_byte(buf[10]),
             mesh_background: false,
+            mesh_share_location: false,
             io48_action: Io48Action::Sleep,
             mesh_alias: [0; ALIAS_CAP],
             mesh_alias_len: 0,
@@ -695,6 +753,7 @@ impl Settings {
             icon_style: IconStyle::from_byte(buf[9]),
             icon_size: IconSize::from_byte(buf[10]),
             mesh_background: false,
+            mesh_share_location: false,
             io48_action: Io48Action::Sleep,
             mesh_alias: [0; ALIAS_CAP],
             mesh_alias_len: 0,

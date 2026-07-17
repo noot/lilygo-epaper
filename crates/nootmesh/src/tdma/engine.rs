@@ -54,6 +54,9 @@ const SEEN_CAP: usize = 32;
 /// Peers whose display names are remembered.
 const ALIAS_TABLE_CAP: usize = 16;
 
+/// Peers whose last announced position is remembered.
+const POSITION_TABLE_CAP: usize = 16;
+
 /// A set alias is re-flooded this often (local clock), so late joiners learn
 /// names without asking. It rides a data slot that would have carried a bare
 /// hello, so the steady-state cost is only the name bytes.
@@ -140,6 +143,15 @@ pub enum Received {
     DuplicateAlias {
         origin: NodeId,
     },
+    /// A position announcement, recorded in the position table (and
+    /// forwarded when under the hop cap).
+    Position {
+        origin: NodeId,
+    },
+    /// An already-seen position flood copy; dropped after the hello refresh.
+    DuplicatePosition {
+        origin: NodeId,
+    },
 }
 
 impl core::fmt::Display for Received {
@@ -155,6 +167,10 @@ impl core::fmt::Display for Received {
             Self::Alias { origin } => write!(f, "alias from {:08x}", origin.0),
             Self::DuplicateAlias { origin } => {
                 write!(f, "duplicate alias from {:08x}", origin.0)
+            }
+            Self::Position { origin } => write!(f, "position from {:08x}", origin.0),
+            Self::DuplicatePosition { origin } => {
+                write!(f, "duplicate position from {:08x}", origin.0)
             }
         }
     }
@@ -205,6 +221,8 @@ pub struct Engine {
     alias: Option<heapless::Vec<u8, { wire::ALIAS_CAP }>>,
     aliases: heapless::FnvIndexMap<NodeId, heapless::Vec<u8, { wire::ALIAS_CAP }>, ALIAS_TABLE_CAP>,
     alias_next_us: u64,
+    own_position: Option<(i32, i32)>,
+    positions: heapless::FnvIndexMap<NodeId, PeerPosition, POSITION_TABLE_CAP>,
     store_enabled: bool,
     store: heapless::Deque<Stored, STORE_CAP>,
     replay_start_us: u64,
@@ -233,6 +251,10 @@ enum OutKind {
     Alias {
         name: heapless::Vec<u8, { wire::ALIAS_CAP }>,
     },
+    Position {
+        lat_e7: i32,
+        lon_e7: i32,
+    },
 }
 
 struct Stored {
@@ -258,6 +280,16 @@ struct PersistEntry {
     timestamp: Option<u64>,
     remaining_us: u64,
     body: heapless::Vec<u8, { wire::TEXT_CAP }>,
+}
+
+/// A peer's last announced position, aged by the local clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerPosition {
+    /// degrees scaled by 10^7.
+    pub lat_e7: i32,
+    pub lon_e7: i32,
+    /// local clock when the announcement was received.
+    pub heard_at_us: u64,
 }
 
 /// What the packet in `tx_buf` commits to when its transmit is confirmed.
@@ -344,6 +376,8 @@ impl Engine {
             alias: None,
             aliases: heapless::FnvIndexMap::new(),
             alias_next_us: 0,
+            own_position: None,
+            positions: heapless::FnvIndexMap::new(),
             store_enabled: false,
             store: heapless::Deque::new(),
             replay_start_us: 0,
@@ -461,6 +495,44 @@ impl Engine {
                 }
                 Ok(Received::Alias {
                     origin: alias.origin,
+                })
+            }
+            wire::Message::Position(position) => {
+                let duplicate = Ok(Received::DuplicatePosition {
+                    origin: position.origin,
+                });
+                if position.hello.sender == self.node_id {
+                    return duplicate;
+                }
+                self.hello_heard(rx_end_us, &position.hello, rssi_dbm, snr_db);
+                let key = (position.origin, position.msg_id);
+                if position.origin == self.node_id || self.seen.iter().any(|seen| *seen == key) {
+                    return duplicate;
+                }
+                self.mark_seen(key);
+                // remember the claim; a full table drops new entries rather
+                // than evicting (bounded, display-only data)
+                let _ = self.positions.insert(
+                    position.origin,
+                    PeerPosition {
+                        lat_e7: position.lat_e7,
+                        lon_e7: position.lon_e7,
+                        heard_at_us: rx_end_us,
+                    },
+                );
+                if position.hops < MAX_TEXT_HOPS {
+                    let _ = self.outbox.push_back(Outgoing {
+                        origin: position.origin,
+                        msg_id: position.msg_id,
+                        hops: position.hops + 1,
+                        kind: OutKind::Position {
+                            lat_e7: position.lat_e7,
+                            lon_e7: position.lon_e7,
+                        },
+                    });
+                }
+                Ok(Received::Position {
+                    origin: position.origin,
                 })
             }
             wire::Message::Recap(recap) => {
@@ -636,6 +708,41 @@ impl Engine {
     /// This node's own display name, if set.
     pub fn alias(&self) -> Option<&[u8]> {
         self.alias.as_deref()
+    }
+
+    /// Record this node's current position (degrees scaled by 10^7) without
+    /// announcing anything; [`announce_position`](Self::announce_position)
+    /// floods the latest recorded value.
+    pub fn update_position(&mut self, lat_e7: i32, lon_e7: i32) {
+        self.own_position = Some((lat_e7, lon_e7));
+    }
+
+    /// Flood this node's last recorded position to the mesh (an explicit
+    /// action or opt-in periodic share — coordinates are plaintext, so
+    /// nothing announces by default). Returns false when no position has
+    /// been recorded or the outbox is full.
+    pub fn announce_position(&mut self) -> bool {
+        let Some((lat_e7, lon_e7)) = self.own_position else {
+            return false;
+        };
+        if self.outbox.is_full() {
+            return false;
+        }
+        let msg_id = self.next_msg_id;
+        self.next_msg_id = self.next_msg_id.wrapping_add(1);
+        self.mark_seen((self.node_id, msg_id));
+        let _ = self.outbox.push_back(Outgoing {
+            origin: self.node_id,
+            msg_id,
+            hops: 0,
+            kind: OutKind::Position { lat_e7, lon_e7 },
+        });
+        true
+    }
+
+    /// The last position `id` announced, if one has been heard.
+    pub fn position_of(&self, id: NodeId) -> Option<PeerPosition> {
+        self.positions.get(&id).copied()
     }
 
     /// A store node retains delivered (and own) texts and replays them to
@@ -1024,6 +1131,14 @@ impl Outgoing {
                 msg_id: self.msg_id,
                 hops: self.hops,
                 name: name.clone(),
+            }),
+            OutKind::Position { lat_e7, lon_e7 } => wire::Message::Position(wire::Position {
+                hello,
+                origin: self.origin,
+                msg_id: self.msg_id,
+                hops: self.hops,
+                lat_e7: *lat_e7,
+                lon_e7: *lon_e7,
             }),
         }
     }
@@ -1789,6 +1904,43 @@ mod tests {
         assert!(matches!(
             wire::decode(e.packet()),
             Ok(wire::Message::Recap(_))
+        ));
+    }
+
+    #[test]
+    fn positions_flood_and_are_remembered() {
+        let mut a = engine(1, 7);
+        let mut b = engine(2, 8);
+        assert!(!a.announce_position()); // nothing recorded yet
+        a.update_position(405_231_337, -740_059_712);
+        assert!(a.announce_position());
+
+        let at_a = step_to_data_tx(&mut a, 20_000_000);
+        let position = match wire::decode(a.packet()) {
+            Ok(wire::Message::Position(position)) => position,
+            other => panic!("expected position, got {other:?}"),
+        };
+        assert_eq!(position.origin, NodeId(1));
+        assert_eq!(position.lat_e7, 405_231_337);
+
+        assert_eq!(
+            b.on_packet(at_a + 500_000, a.packet(), -60, 9),
+            Ok(Received::Position { origin: NodeId(1) })
+        );
+        let peer = b.position_of(NodeId(1)).unwrap();
+        assert_eq!(peer.lon_e7, -740_059_712);
+        assert_eq!(peer.heard_at_us, at_a + 500_000);
+        assert_eq!(b.position_of(NodeId(9)), None);
+        assert_eq!(
+            b.on_packet(at_a + 600_000, a.packet(), -60, 9),
+            Ok(Received::DuplicatePosition { origin: NodeId(1) })
+        );
+
+        // b forwards the flood with the hop bumped
+        let _ = step_to_data_tx(&mut b, 21_000_000);
+        assert!(matches!(
+            wire::decode(b.packet()),
+            Ok(wire::Message::Position(p)) if p.hops == 1 && p.hello.sender == NodeId(2)
         ));
     }
 

@@ -7,6 +7,7 @@ extern crate t5s3_epaper_core;
 mod chatlog;
 mod datetime;
 mod fmt;
+mod geo;
 mod io48;
 mod keyboard;
 mod layout;
@@ -137,6 +138,7 @@ use crate::{
             draw_lora_screen,
             draw_lora_status,
             draw_recv_list,
+            draw_share_loc,
             info_native_rect,
             lora_status_native_rect,
             make_radio,
@@ -147,6 +149,8 @@ use crate::{
             recv_scroll_max,
             recv_scroll_up_hit,
             recv_visible_rows,
+            share_loc_hit,
+            share_loc_native_rect,
             tab_hit,
             Tab as LoraTab,
             LIST_MAX,
@@ -201,6 +205,10 @@ esp_bootloader_esp_idf::esp_app_desc!();
 // made the percentage top out at ~54%; the boot block below (re)programs the
 // gauge whenever its stored design capacity differs. adjust for a new pack.
 const BATTERY_MAH: u16 = 1620;
+
+/// opt-in periodic location-share cadence.
+#[cfg(feature = "gps")]
+const LOC_SHARE_SECS: u64 = 600;
 
 // last visited screen, stored in RTC fast memory so it survives the reset that
 // deep sleep performs. zeroed (Home) on first boot, then retained across sleep.
@@ -618,6 +626,9 @@ async fn main(spawner: Spawner) -> ! {
     // else refreshes the send tab's action line since the info tab took
     // over the periodic status).
     let mut lora_send_pending = false;
+    // last periodic location share (seconds); the opt-in cadence.
+    #[cfg(feature = "gps")]
+    let mut loc_share_at_secs: u64 = 0;
     let mut chat_loaded = false;
     let mut chat_size: u64 = 0;
     // ticks since the info page was last refreshed (uptime/temp/voltage).
@@ -1201,7 +1212,16 @@ async fn main(spawner: Spawner) -> ! {
                             None
                         }
                     };
-                    render_full_map(&mut display, card.as_ref(), last_fix, full_zoom);
+                    // mesh peers who shared a position, labeled by alias
+                    let peers: Vec<(String, i32, i32)> = match &lora_mesh {
+                        Some(m) => m
+                            .peer_positions()
+                            .into_iter()
+                            .map(|(id, lat, lon, _age)| (m.display_name(id), lat, lon))
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    render_full_map(&mut display, card.as_ref(), last_fix, full_zoom, &peers);
                     draw_full_controls(&mut display, full_zoom);
                 }
                 #[cfg(not(feature = "gps"))]
@@ -1498,6 +1518,18 @@ async fn main(spawner: Spawner) -> ! {
                                     recv_clear_armed = false;
                                     recv_fetch_sent = false;
                                     needs_redraw = true;
+                                }
+                            } else if lora_tab == LoraTab::Info && share_loc_hit(sx, sy) {
+                                // manual location share: one deliberate flood
+                                // of the current fix (coordinates are
+                                // plaintext, so sends are user actions or the
+                                // opt-in periodic setting, never automatic)
+                                let sent =
+                                    lora_mesh.as_mut().is_some_and(|m| m.announce_position());
+                                draw_share_loc(&mut display, Some(sent));
+                                display.flush_partial_fast(share_loc_native_rect()).ok();
+                                if sent {
+                                    esp_println::println!("mesh: manual location share");
                                 }
                             } else if lora_tab == LoraTab::Recv {
                                 if recv_fetch_hit(sx, sy) {
@@ -1994,6 +2026,20 @@ async fn main(spawner: Spawner) -> ! {
                                         display
                                             .flush_partial_fast(
                                                 settings_page::mesh::radio_button_rect(),
+                                            )
+                                            .ok();
+                                    }
+                                    Some(settings_page::mesh::Hit::ToggleShare) => {
+                                        settings.mesh_share_location =
+                                            !settings.mesh_share_location;
+                                        settings_dirty = true;
+                                        settings_page::mesh::redraw_share(
+                                            &mut display,
+                                            settings.mesh_share_location,
+                                        );
+                                        display
+                                            .flush_partial_fast(
+                                                settings_page::mesh::share_button_rect(),
                                             )
                                             .ok();
                                     }
@@ -2822,6 +2868,20 @@ async fn main(spawner: Spawner) -> ! {
                     if fix_ok {
                         if let Some(utc) = g.utc_seconds() {
                             m.on_gps_second(utc);
+                        }
+                        // keep the mesh's copy of our position fresh (silent;
+                        // nothing goes on the air without a share action)
+                        if let Some(fix) = last_fix {
+                            m.update_position((fix.lat() * 1e7) as i32, (fix.lon() * 1e7) as i32);
+                            // opt-in periodic share, one flood per interval
+                            let now_secs = clock.now_us() / 1_000_000;
+                            if settings.mesh_share_location
+                                && now_secs.saturating_sub(loc_share_at_secs) >= LOC_SHARE_SECS
+                                && m.announce_position()
+                            {
+                                loc_share_at_secs = now_secs;
+                                esp_println::println!("mesh: periodic location share");
+                            }
                         }
                     }
                 }

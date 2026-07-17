@@ -618,6 +618,7 @@ pub(crate) fn render_full_map(
     card: Option<&SdCard>,
     fix: Option<GpsFix>,
     zoom_step: i32,
+    peers: &[(alloc::string::String, i32, i32)],
 ) {
     let center = Point::new(FULL_MAP_X + FULL_MAP_W / 2, FULL_MAP_Y + FULL_MAP_H / 2);
     let (Some(fix), Some(card)) = (fix, card) else {
@@ -684,6 +685,19 @@ pub(crate) fn render_full_map(
                 (dy1 - dy0).max(1) as u32,
                 clip,
             );
+        }
+    }
+
+    // mesh peers who shared their position, wherever they land in view
+    // (coordinates arrive as degrees x 10^7 from the wire).
+    for (name, lat_e7, lon_e7) in peers {
+        let (wx, wy) = project(f64::from(*lat_e7) / 1e7, f64::from(*lon_e7) / 1e7);
+        let sx = to_sx(wx);
+        let sy = to_sy(wy);
+        if (FULL_MAP_X..FULL_MAP_X + FULL_MAP_W).contains(&sx)
+            && (FULL_MAP_Y..FULL_MAP_Y + FULL_MAP_H).contains(&sy)
+        {
+            draw_peer_marker(display, sx, sy, name);
         }
     }
 
@@ -771,6 +785,41 @@ fn draw_marker(display: &mut Display, cx: i32, cy: i32) {
         .into_styled(PrimitiveStyle::with_fill(Gray4::BLACK))
         .draw(display)
         .ok();
+}
+
+// a mesh peer's position: a square (distinct from the round "you are here")
+// with the peer's name alongside, haloed for legibility over map tones.
+fn draw_peer_marker(display: &mut Display, cx: i32, cy: i32, name: &str) {
+    let halo = 8;
+    Rectangle::new(
+        Point::new(cx - halo, cy - halo),
+        Size::new((halo * 2) as u32, (halo * 2) as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(Gray4::WHITE))
+    .draw(display)
+    .ok();
+    Rectangle::new(
+        Point::new(cx - halo, cy - halo),
+        Size::new((halo * 2) as u32, (halo * 2) as u32),
+    )
+    .into_styled(PrimitiveStyle::with_stroke(Gray4::BLACK, 2))
+    .draw(display)
+    .ok();
+    let dot = 3;
+    Rectangle::new(
+        Point::new(cx - dot, cy - dot),
+        Size::new((dot * 2) as u32, (dot * 2) as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(Gray4::BLACK))
+    .draw(display)
+    .ok();
+    Text::new(
+        name,
+        Point::new(cx + halo + 4, cy + 4),
+        MonoTextStyle::new(&FONT_6X10, Gray4::BLACK),
+    )
+    .draw(display)
+    .ok();
 }
 
 fn map_label(display: &mut Display, text: &str) {

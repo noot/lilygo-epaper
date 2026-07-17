@@ -10,6 +10,7 @@ use crate::{
 
 const NAME_Y: i32 = 210;
 const RADIO_Y: i32 = 300;
+const SHARE_Y: i32 = 390;
 
 // the name editor: a bordered input box above the keyboard, shown while the
 // name row is being edited.
@@ -22,6 +23,7 @@ pub(crate) enum Hit {
     Back,
     EditName,
     ToggleRadio,
+    ToggleShare,
 }
 
 pub(crate) fn hit_test(sx: i32, sy: i32) -> Option<Hit> {
@@ -31,6 +33,8 @@ pub(crate) fn hit_test(sx: i32, sy: i32) -> Option<Hit> {
         Some(Hit::EditName)
     } else if in_rect(sx, sy, WIDE_BTN_X, RADIO_Y, WIDE_BTN_W, BTN_H) {
         Some(Hit::ToggleRadio)
+    } else if in_rect(sx, sy, WIDE_BTN_X, SHARE_Y, WIDE_BTN_W, BTN_H) {
+        Some(Hit::ToggleShare)
     } else {
         None
     }
@@ -55,6 +59,11 @@ pub(crate) fn draw(
     // background at a standing rx current cost.
     label(display, "Mesh radio", RADIO_Y);
     draw_radio_button(display, settings.mesh_background);
+
+    // periodic gps-position floods; off by default because coordinates go
+    // out in plaintext (manual shares from the lora page work regardless).
+    label(display, "Share location", SHARE_Y);
+    draw_share_button(display, settings.mesh_share_location);
 
     if editing {
         field.draw_full(display, draft);
@@ -84,6 +93,24 @@ fn draw_radio_button(display: &mut Display, background: bool) {
             "Lora page only"
         },
     );
+}
+
+fn draw_share_button(display: &mut Display, share: bool) {
+    button(
+        display,
+        WIDE_BTN_X,
+        SHARE_Y,
+        WIDE_BTN_W,
+        if share { "Every 10 min" } else { "Manual only" },
+    );
+}
+
+pub(crate) fn share_button_rect() -> t5s3_epaper_core::display::Rectangle {
+    screen_to_native_rect(WIDE_BTN_X, SHARE_Y, WIDE_BTN_W as i32, BTN_H as i32)
+}
+
+pub(crate) fn redraw_share(display: &mut Display, share: bool) {
+    draw_share_button(display, share);
 }
 
 pub(crate) fn radio_button_rect() -> t5s3_epaper_core::display::Rectangle {

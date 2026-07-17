@@ -38,6 +38,7 @@ pub enum Message {
     Text(Text),
     Recap(Recap),
     Alias(Alias),
+    Position(Position),
 }
 
 /// Chat text broadcast in a data slot and flooded across the mesh: every
@@ -83,6 +84,20 @@ pub struct Alias {
     pub msg_id: u16,
     pub hops: u8,
     pub name: heapless::Vec<u8, ALIAS_CAP>,
+}
+
+/// A node's GPS position, flooded like a text (same `(origin, msg_id)`
+/// dedup, same hop cap). Coordinates are degrees scaled by 10^7 (~1 cm
+/// resolution). Plaintext like everything else — nodes only announce on an
+/// explicit user action or an opt-in periodic setting, never by default.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Position {
+    pub hello: Hello,
+    pub origin: NodeId,
+    pub msg_id: u16,
+    pub hops: u8,
+    pub lat_e7: i32,
+    pub lon_e7: i32,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -176,6 +191,25 @@ mod tests {
         // ver 1 + disc 1 + hello 6 + origin 1 + msg_id 2 + hops 1
         //   + timestamp 1+5 + body 1+10
         assert_eq!(len, 29);
+    }
+
+    #[test]
+    fn position_roundtrips() {
+        let len = roundtrip(Message::Position(Position {
+            hello: Hello {
+                sender: NodeId(77),
+                slot: Some(42),
+                neighbors: heapless::Vec::new(),
+            },
+            origin: NodeId(77),
+            msg_id: 300,
+            hops: 1,
+            lat_e7: 405_231_337,
+            lon_e7: -740_059_712,
+        }));
+        // ver 1 + disc 1 + hello 4 + origin 1 + msg_id 2 + hops 1 + zigzag
+        //   varint coords ~5 each
+        assert_eq!(len, 20);
     }
 
     #[test]

@@ -371,6 +371,9 @@ pub(crate) fn draw_info_tab(display: &mut Display, mesh: Option<&crate::mesh::Me
     let m = Modulation::default();
     let rssi_floor = m.sensitivity_floor_dbm();
     let snr_floor = m.snr_floor_db();
+    // paired readings, not independent conditions: snr is the decode gate
+    // and the rssi figure is its quiet-band equivalent (they disagree only
+    // under interference, where snr wins)
     let note = format!(
         "link holds above ~{}dBm / {}dB snr; gone near {}dBm / {}dB (sf{})",
         rssi_floor + 10,
@@ -386,6 +389,63 @@ pub(crate) fn draw_info_tab(display: &mut Display, mesh: Option<&crate::mesh::Me
     )
     .draw(display)
     .ok();
+}
+
+// manual location-share button, centered below the peer table (outside the
+// periodic refresh rect: it only changes on taps, which flush it locally).
+const SHARE_LOC_W: u32 = 220;
+const SHARE_LOC_H: u32 = 60;
+const SHARE_LOC_X: i32 = (crate::layout::SCREEN_W - SHARE_LOC_W as i32) / 2;
+const SHARE_LOC_Y: i32 = 780;
+
+pub(crate) fn share_loc_hit(sx: i32, sy: i32) -> bool {
+    (SHARE_LOC_X..SHARE_LOC_X + SHARE_LOC_W as i32).contains(&sx)
+        && (SHARE_LOC_Y..SHARE_LOC_Y + SHARE_LOC_H as i32).contains(&sy)
+}
+
+/// `state`: None = idle, Some(true) = shared, Some(false) = no fix to share.
+/// always filled white before the label: a fast partial refresh cannot fully
+/// erase a longer previous label, so a tinted fill leaves the two overlapped
+/// and unreadable.
+pub(crate) fn draw_share_loc(display: &mut Display, state: Option<bool>) {
+    let label = match state {
+        None => "SHARE LOCATION",
+        Some(true) => "SHARED",
+        Some(false) => "NO GPS FIX",
+    };
+    Rectangle::new(
+        Point::new(SHARE_LOC_X, SHARE_LOC_Y),
+        Size::new(SHARE_LOC_W, SHARE_LOC_H),
+    )
+    .into_styled(
+        PrimitiveStyleBuilder::new()
+            .stroke_color(Gray4::BLACK)
+            .stroke_width(if state.is_some() { 4 } else { 2 })
+            .fill_color(Gray4::WHITE)
+            .build(),
+    )
+    .draw(display)
+    .ok();
+    Text::with_alignment(
+        label,
+        Point::new(
+            SHARE_LOC_X + SHARE_LOC_W as i32 / 2,
+            SHARE_LOC_Y + SHARE_LOC_H as i32 / 2 + 4,
+        ),
+        MonoTextStyle::new(&FONT_9X15, Gray4::BLACK),
+        Alignment::Center,
+    )
+    .draw(display)
+    .ok();
+}
+
+pub(crate) fn share_loc_native_rect() -> t5s3_epaper_core::display::Rectangle {
+    screen_to_native_rect(
+        SHARE_LOC_X,
+        SHARE_LOC_Y,
+        SHARE_LOC_W as i32,
+        SHARE_LOC_H as i32,
+    )
 }
 
 pub(crate) fn info_native_rect() -> t5s3_epaper_core::display::Rectangle {
@@ -407,7 +467,10 @@ pub(crate) fn draw_lora_screen(
     draw_back_button(display);
     draw_tabs(display, tab);
     match tab {
-        Tab::Info => draw_info_tab(display, mesh),
+        Tab::Info => {
+            draw_info_tab(display, mesh);
+            draw_share_loc(display, None);
+        }
         Tab::Send => {
             field.draw_full(display, message);
             draw_lora_status(display, status);

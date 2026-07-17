@@ -16,7 +16,7 @@ pub mod engine;
 mod slots;
 mod sync;
 
-pub use engine::{Action, Engine, Received};
+pub use engine::{Action, Engine, PeerPosition, Received};
 pub use slots::{Coloring, Hello, MAX_NEIGHBORS, PEER_ROWS, PeerInfo};
 pub use sync::{Beacon, Sync};
 

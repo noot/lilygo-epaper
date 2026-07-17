@@ -29,6 +29,7 @@ const FMT_Y: i32 = 300;
 const ICONS_Y: i32 = 390;
 const ICON_SIZE_Y: i32 = 480;
 const IO48_Y: i32 = 570;
+
 pub(crate) enum Hit {
     Back,
     TzMinus,
