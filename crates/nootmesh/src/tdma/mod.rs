@@ -164,18 +164,20 @@ impl Config {
 
 impl Default for Config {
     /// The fleet profile every node must share (a mismatched frame layout
-    /// cannot sync), sized to [`Modulation::default`]'s SF9/125 kHz: 450 ms
-    /// slots fit a 71-byte payload (411 ms) inside 15 ms guards, and 20
+    /// cannot sync), sized to [`Modulation::default`]'s SF9/125 kHz: 750 ms
+    /// slots fit a 138-byte payload (720 ms) inside 15 ms guards, and 12
     /// slots make a 9-second frame (whole seconds, anchoring at
-    /// `utc % 9 == 0`). 3 beacon + 3 contention slots leave 14 data slots.
-    /// See the modulation ladder in nootmesh.md for the slot/frame sizing at
-    /// other spreading factors.
+    /// `utc % 9 == 0`). 3 beacon + 3 contention slots leave 6 data slots.
+    /// Slots are sized so the 41-byte encrypted beacon (288 ms) fits half
+    /// the budget, leaving the other half as transmit jitter range for root
+    /// decorrelation (see `beacon_tx_jitter_us`). See the modulation ladder
+    /// in nootmesh.md for the slot/frame sizing at other spreading factors.
     ///
     /// [`Modulation::default`]: crate::airtime::Modulation::default
     fn default() -> Self {
         Self {
-            slot_us: 450_000,
-            slots_per_frame: 20,
+            slot_us: 750_000,
+            slots_per_frame: 12,
             guard_us: 15_000,
             beacon_slots: 3,
             contention_slots: 3,
@@ -183,12 +185,12 @@ impl Default for Config {
     }
 }
 
-/// A fixed 16-second, 100-slot layout for unit tests, so their arithmetic is
+/// A fixed 16-second, 64-slot layout for unit tests, so their arithmetic is
 /// independent of whatever the deployed profile in [`Config::default`]
 /// currently is.
 #[cfg(test)]
 pub(crate) fn test_config() -> Config {
-    match Config::new(160_000, 100, 15_000, 4, 6) {
+    match Config::new(250_000, 64, 15_000, 4, 6) {
         Ok(config) => config,
         Err(_) => unreachable!("test layout is valid"),
     }
@@ -209,9 +211,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_profile_is_9s_20_slots() {
+    fn default_profile_is_9s_12_slots() {
         let config = Config::default();
-        assert_eq!(config, Config::new(450_000, 20, 15_000, 3, 3).unwrap());
+        assert_eq!(config, Config::new(750_000, 12, 15_000, 3, 3).unwrap());
         assert_eq!(config.frame_us(), 9_000_000);
         assert_eq!(config.frame_seconds(), 9);
         assert_eq!(config.first_data_slot(), 6);
@@ -222,12 +224,13 @@ mod tests {
             crate::airtime::Modulation::default(),
             crate::NodeId(1),
             7,
+            &[7; 32],
         );
         assert!(engine.is_ok());
     }
 
     #[test]
-    fn test_layout_is_16s_100_slots() {
+    fn test_layout_is_16s_64_slots() {
         let config = test_config();
         assert_eq!(config.frame_us(), 16_000_000);
         assert_eq!(config.frame_seconds(), 16);
@@ -242,7 +245,7 @@ mod tests {
         assert_eq!(config.slot_kind(3), SlotKind::Contention);
         assert_eq!(config.slot_kind(5), SlotKind::Contention);
         assert_eq!(config.slot_kind(6), SlotKind::Data);
-        assert_eq!(config.slot_kind(19), SlotKind::Data);
+        assert_eq!(config.slot_kind(11), SlotKind::Data);
     }
 
     #[test]

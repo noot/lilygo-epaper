@@ -287,8 +287,8 @@ mod tests {
         let sync = synced_via_gps(1, 20_000_000, 16_005);
         let position = sync.position(20_000_000).unwrap();
         assert_eq!(position.frame_number, 1_000);
-        assert_eq!(position.slot, 31);
-        assert_eq!(position.offset_us, 40_000);
+        assert_eq!(position.slot, 20);
+        assert_eq!(position.offset_us, 0);
 
         let position = sync.position(20_000_000 + 11_000_000 + FRAME_US).unwrap();
         assert_eq!(position.frame_number, 1_002);
@@ -318,8 +318,8 @@ mod tests {
 
         let position = sync.position(origin + 200_000).unwrap();
         assert_eq!(position.frame_number, 42);
-        assert_eq!(position.slot, 1);
-        assert_eq!(position.offset_us, 40_000);
+        assert_eq!(position.slot, 0);
+        assert_eq!(position.offset_us, 200_000);
 
         let (slot, relayed) = sync.beacon(origin + 200_000).unwrap();
         assert_eq!(slot, 1);
@@ -422,7 +422,7 @@ mod tests {
     fn free_running_root_fallback() {
         let mut sync = Sync::new(test_config(), NodeId(2));
         sync.become_root(50_000_000);
-        let position = sync.position(50_000_000 + FRAME_US + 200_000).unwrap();
+        let position = sync.position(50_000_000 + FRAME_US + 300_000).unwrap();
         assert_eq!(position.frame_number, 1);
         assert_eq!(position.slot, 1);
         let (slot, beacon) = sync.beacon(51_000_000).unwrap();
@@ -460,7 +460,7 @@ mod tests {
         let (_, beacon) = sync.beacon(60_100_000).unwrap();
         assert!(beacon.root_has_gps);
         assert_eq!(beacon.frame_number, 1_000);
-        assert_eq!(sync.position(60_100_000).unwrap().slot, 50);
+        assert_eq!(sync.position(60_100_000).unwrap().slot, 32);
     }
 
     #[test]
@@ -481,8 +481,8 @@ mod tests {
         let mut sync = synced_via_gps(1, 20_000_000, 16_000);
         sync.on_gps_second(21_000_000, 16_003);
         let position = sync.position(21_000_000).unwrap();
-        assert_eq!(position.slot, 18);
-        assert_eq!(position.offset_us, 120_000);
+        assert_eq!(position.slot, 12);
+        assert_eq!(position.offset_us, 0);
     }
 
     #[test]

@@ -30,6 +30,18 @@ const SLICE_BUDGET_US: u64 = 30_000;
 /// than deferred to a later pass (which could overshoot the slot's guard).
 const TX_WAIT_HORIZON_US: u64 = 120_000;
 
+// meshnet-wide symmetric key baked in at build time from the MESH_KEY env
+// (64 hex chars, see .env); every packet is sealed with it, so all nodes
+// must share it. falls back to a public dev key so unkeyed builds still
+// work — Mesh::new logs a warning when the fallback is active.
+const MESH_KEY: [u8; 32] = match option_env!("MESH_KEY") {
+    Some(hex) => match wire::key_from_hex(hex) {
+        Some(key) => key,
+        None => panic!("MESH_KEY must be exactly 64 hex chars"),
+    },
+    None => [0u8; 32],
+};
+
 fn now_us() -> u64 {
     esp_hal::time::Instant::now()
         .duration_since_epoch()
@@ -64,12 +76,19 @@ impl Mesh {
         let m = mac.as_bytes();
         let node_id = NodeId(u32::from_be_bytes([m[2], m[3], m[4], m[5]]));
         let rng = esp_hal::rng::Rng::new();
+        // the seed also feeds the cipher's nonce counter, so it must be
+        // fresh entropy every boot (the trng is best while an rf subsystem
+        // runs, but its weaker sar-adc seeding is still fine here)
         let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
+        if MESH_KEY == [0u8; 32] {
+            esp_println::println!("mesh: MESH_KEY unset, using public dev key");
+        }
         let mut engine = Engine::new(
             nootmesh::tdma::Config::default(),
             Modulation::default(),
             node_id,
             seed,
+            &MESH_KEY,
         )?;
         if store {
             engine.enable_store();
@@ -308,7 +327,7 @@ impl Mesh {
                     if self.poll_until(radio, &mut buf, at_us, &mut stale) {
                         continue; // a packet may have rescheduled us
                     }
-                    match wire::decode(self.engine.packet()) {
+                    match self.engine.try_decode(self.engine.packet()) {
                         Ok(wire::Message::Beacon(b)) => {
                             esp_println::println!(
                                 "mesh tx beacon s{} f{}",
@@ -398,7 +417,7 @@ impl Mesh {
                     let rssi = radio.rssi();
                     let snr = radio.snr();
                     if was_stale {
-                        if let Ok(wire::Message::Beacon(_)) = wire::decode(&buf[..n]) {
+                        if let Ok(wire::Message::Beacon(_)) = self.engine.try_decode(&buf[..n]) {
                             esp_println::println!("mesh: dropped stale-timestamped beacon");
                             continue;
                         }

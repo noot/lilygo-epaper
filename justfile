@@ -10,13 +10,13 @@ clock:
 ui:
     # re-touch so the env-baked credentials pick up any .env changes
     touch crates/t5s3-epaper-ui/src/main.rs
-    SSID="$SSID" PASSWORD="$PASSWORD" TZ_OFFSET_HOURS="$TZ_OFFSET_HOURS" SERVER_HOST="$SERVER_HOST" SERVER_PORT="$SERVER_PORT" FUNNEL_HOST="${FUNNEL_HOST:-}" SERVER_TOKEN="${SERVER_TOKEN:-}" ESP_LOG="${ESP_LOG:-}" cargo run -p t5s3-epaper-ui --features gps
+    SSID="$SSID" PASSWORD="$PASSWORD" TZ_OFFSET_HOURS="$TZ_OFFSET_HOURS" SERVER_HOST="$SERVER_HOST" SERVER_PORT="$SERVER_PORT" FUNNEL_HOST="${FUNNEL_HOST:-}" SERVER_TOKEN="${SERVER_TOKEN:-}" MESH_KEY="${MESH_KEY:-}" ESP_LOG="${ESP_LOG:-}" cargo run -p t5s3-epaper-ui --features gps
 
 # flash a release build of the touchscreen ui, no serial monitor afterward
 ui-release:
     # re-touch so the env-baked credentials pick up any .env changes
     touch crates/t5s3-epaper-ui/src/main.rs
-    SSID="$SSID" PASSWORD="$PASSWORD" TZ_OFFSET_HOURS="$TZ_OFFSET_HOURS" SERVER_HOST="$SERVER_HOST" SERVER_PORT="$SERVER_PORT" FUNNEL_HOST="${FUNNEL_HOST:-}" SERVER_TOKEN="${SERVER_TOKEN:-}" ESP_LOG="${ESP_LOG:-}" cargo build --release -p t5s3-epaper-ui --features gps
+    SSID="$SSID" PASSWORD="$PASSWORD" TZ_OFFSET_HOURS="$TZ_OFFSET_HOURS" SERVER_HOST="$SERVER_HOST" SERVER_PORT="$SERVER_PORT" FUNNEL_HOST="${FUNNEL_HOST:-}" SERVER_TOKEN="${SERVER_TOKEN:-}" MESH_KEY="${MESH_KEY:-}" ESP_LOG="${ESP_LOG:-}" cargo build --release -p t5s3-epaper-ui --features gps
     espflash flash --chip esp32s3 target/xtensa-esp32s3-none-elf/release/t5s3-epaper-ui
 
 # flash the ble ⇄ lora bridge example (faster scheduler tick so the radio thread can service advertising)
@@ -25,11 +25,15 @@ ble:
 
 # flash the nootmesh tdma node example (t3-s3); flash the same example on every board
 mesh:
-    cargo run -p t3s3-epaper --example mesh
+    # re-touch so the env-baked mesh key picks up any .env changes
+    touch crates/t3s3-epaper/examples/mesh.rs
+    MESH_KEY="${MESH_KEY:-}" cargo run -p t3s3-epaper --example mesh
 
 # flash the nootmesh tdma node example (t5-s3, with gps: becomes the mesh's utc root)
 mesh-t5:
-    cargo run -p t5s3-epaper-core --example mesh --features lora,gps
+    # re-touch so the env-baked mesh key picks up any .env changes
+    touch crates/t5s3-epaper-core/examples/mesh.rs
+    MESH_KEY="${MESH_KEY:-}" cargo run -p t5s3-epaper-core --example mesh --features lora,gps
 
 # check that everything compiles
 check:

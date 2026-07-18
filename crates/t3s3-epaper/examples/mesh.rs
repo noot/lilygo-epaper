@@ -60,6 +60,17 @@ esp_bootloader_esp_idf::esp_app_desc!();
 /// ghosting.
 const FULL_REFRESH_EVERY: u32 = 10;
 
+// meshnet-wide symmetric key baked in at build time from the MESH_KEY env
+// (64 hex chars, see .env); every packet is sealed with it, so all nodes
+// must share it. falls back to a public dev key so unkeyed builds still work.
+const MESH_KEY: [u8; 32] = match option_env!("MESH_KEY") {
+    Some(hex) => match wire::key_from_hex(hex) {
+        Some(key) => key,
+        None => panic!("MESH_KEY must be exactly 64 hex chars"),
+    },
+    None => [0u8; 32],
+};
+
 /// the replay store's snapshot file, in the SD card's FAT root.
 const STORE_FILE: &str = "STORE.BIN";
 
@@ -349,8 +360,17 @@ fn main() -> ! {
     let rng = Rng::new();
     let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
 
-    let mut engine =
-        Engine::new(nootmesh::tdma::Config::default(), modulation, node_id, seed).unwrap();
+    if MESH_KEY == [0u8; 32] {
+        println!("mesh: MESH_KEY unset, using public dev key");
+    }
+    let mut engine = Engine::new(
+        nootmesh::tdma::Config::default(),
+        modulation,
+        node_id,
+        seed,
+        &MESH_KEY,
+    )
+    .unwrap();
     // this board is always-on infrastructure: retain recent texts and answer
     // recap requests from nodes that were offline. the boot-time recap
     // rebuilds our own history from other store nodes after a power cycle.
@@ -493,7 +513,7 @@ fn main() -> ! {
         let Action::Transmit { .. } = action else {
             continue;
         };
-        let is_hello = match wire::decode(engine.packet()) {
+        let is_hello = match engine.try_decode(engine.packet()) {
             Ok(wire::Message::Beacon(b)) => {
                 println!("tx beacon stratum {} frame {}", b.stratum, b.frame_number);
                 false

@@ -1,14 +1,9 @@
-use super::{Coloring, Config, FramePosition, Hello, Sync, mix, sync::beacon_tx_jitter_us};
+use super::{Beacon, Coloring, Config, FramePosition, Hello, Sync, mix, sync::beacon_tx_jitter_us};
 use crate::{NodeId, airtime::Modulation, wire};
 
 /// Frames to listen after first syncing before claiming a data slot, so the
 /// neighbor table informs the first pick.
 const LISTEN_FRAMES: u64 = 2;
-
-/// Smallest packet capacity a slot must fit (beacons are 13 bytes).
-const MIN_PACKET_LEN: u8 = 16;
-
-const MAX_PACKET: usize = 255;
 
 const SALT_RELAY: u64 = 1;
 const SALT_CONTENTION_SEND: u64 = 2;
@@ -16,6 +11,7 @@ const SALT_CONTENTION_SLOT: u64 = 3;
 const SALT_ROOT_FALLBACK: u64 = 4;
 const SALT_MSG_ID: u64 = 5;
 const SALT_REPLAY_STAGGER: u64 = 7;
+const SALT_NONCE: u64 = 8;
 
 /// A recap request is retransmitted this many times (one data slot apart): a
 /// single shot can vanish into a receiver's display-refresh deafness window,
@@ -90,7 +86,7 @@ pub enum Action {
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     #[error(
-        "slot budget of {budget_us} us cannot fit a {MIN_PACKET_LEN}-byte packet ({airtime_us} us) plus beacon jitter headroom"
+        "slot budget of {budget_us} us cannot fit a beacon packet ({airtime_us} us) plus beacon jitter headroom"
     )]
     SlotTooShort { budget_us: u64, airtime_us: u64 },
 }
@@ -228,7 +224,8 @@ pub struct Engine {
     replay_start_us: u64,
     recap_sends_left: u8,
     recap_next_us: u64,
-    tx_buf: [u8; MAX_PACKET],
+    cipher: wire::Cipher,
+    tx_buf: [u8; wire::MAX_PACKET],
     tx_len: usize,
 }
 
@@ -307,28 +304,46 @@ enum Payload {
 }
 
 impl Engine {
-    /// `seed` decorrelates random skips between nodes; give it boot entropy
-    /// (it is additionally mixed with the node id, so equal seeds are safe).
+    /// `seed` decorrelates random skips between nodes and seeds the cipher's
+    /// nonce counter; give it boot entropy (it is additionally mixed with
+    /// the node id, so equal seeds are safe). `key` is the meshnet-wide
+    /// symmetric key every packet is sealed with.
     pub fn new(
         config: Config,
         modulation: Modulation,
         node_id: NodeId,
         seed: u64,
+        key: &[u8; 32],
     ) -> Result<Self, Error> {
         let budget_us = config.slot_us() - 2 * config.guard_us();
-        // beacons ride up to half the budget of transmit jitter (see
-        // `beacon_tx_jitter_us`), so they must fit in the other half
-        if 2 * modulation.packet_airtime_us(MIN_PACKET_LEN) > budget_us {
+        let seed = seed ^ u64::from(node_id.0);
+        let mut cipher = wire::Cipher::new(key, node_id, mix(seed, 0, SALT_NONCE));
+        let mut probe_buf = [0u8; wire::MAX_PACKET];
+        // probe the worst-case beacon length (frame_number clamped to
+        // u32::MAX, 5 varint bytes: centuries of frames): beacons ride up to
+        // half the budget of transmit jitter (see `beacon_tx_jitter_us`), so
+        // they must fit in the other half
+        let beacon_probe = wire::Message::Beacon(Beacon {
+            root: NodeId(u32::MAX),
+            root_has_gps: true,
+            stratum: u8::MAX,
+            frame_number: u64::from(u32::MAX),
+        });
+        let beacon_len = match wire::encode(&beacon_probe, &mut cipher, &mut probe_buf) {
+            Ok(packet) => u8::try_from(packet.len()).unwrap_or(u8::MAX),
+            // unreachable: the probe buffer is the radio maximum
+            Err(_) => u8::MAX,
+        };
+        if 2 * modulation.packet_airtime_us(beacon_len) > budget_us {
             return Err(Error::SlotTooShort {
                 budget_us,
-                airtime_us: modulation.packet_airtime_us(MIN_PACKET_LEN),
+                airtime_us: modulation.packet_airtime_us(beacon_len),
             });
         }
-        let max_packet_len = (MIN_PACKET_LEN..=u8::MAX)
+        let max_packet_len = (beacon_len..=u8::MAX)
             .take_while(|len| modulation.packet_airtime_us(*len) <= budget_us)
             .last()
-            .unwrap_or(MIN_PACKET_LEN);
-        let seed = seed ^ u64::from(node_id.0);
+            .unwrap_or(beacon_len);
         let fallback_frames = ROOT_FALLBACK_MIN_FRAMES
             + mix(seed, 0, SALT_ROOT_FALLBACK) % ROOT_FALLBACK_JITTER_FRAMES;
         let fallback_jitter_us = mix(seed, 1, SALT_ROOT_FALLBACK) % config.frame_us();
@@ -348,8 +363,7 @@ impl Engine {
             timestamp: Some(u64::from(u32::MAX)),
             body: heapless::Vec::new(),
         });
-        let mut probe_buf = [0u8; MAX_PACKET];
-        let overhead = match wire::encode(&probe, &mut probe_buf) {
+        let overhead = match wire::encode(&probe, &mut cipher, &mut probe_buf) {
             Ok(packet) => packet.len(),
             Err(_) => usize::from(max_packet_len),
         };
@@ -383,7 +397,8 @@ impl Engine {
             replay_start_us: 0,
             recap_sends_left: 0,
             recap_next_us: 0,
-            tx_buf: [0; MAX_PACKET],
+            cipher,
+            tx_buf: [0; wire::MAX_PACKET],
             tx_len: 0,
         })
     }
@@ -405,7 +420,7 @@ impl Engine {
         rssi_dbm: i16,
         snr_db: i16,
     ) -> Result<Received, wire::Error> {
-        match wire::decode(packet)? {
+        match wire::try_decode(packet, &self.cipher)? {
             wire::Message::Beacon(beacon) => {
                 let len = u8::try_from(packet.len()).unwrap_or(u8::MAX);
                 let airtime_us = self.modulation.packet_airtime_us(len);
@@ -961,6 +976,12 @@ impl Engine {
         &self.tx_buf[..self.tx_len]
     }
 
+    /// Decode a packet with the mesh key without feeding it to the engine —
+    /// for callers' tx/rx logging and pre-ingest peeks.
+    pub fn try_decode(&self, bytes: &[u8]) -> Result<wire::Message, wire::Error> {
+        wire::try_decode(bytes, &self.cipher)
+    }
+
     pub fn position(&self, now_us: u64) -> Option<FramePosition> {
         self.sync.position(now_us)
     }
@@ -1012,7 +1033,11 @@ impl Engine {
             return false;
         };
         self.tx_carries = TxCarries::Nothing;
-        match wire::encode(&wire::Message::Beacon(beacon), &mut self.tx_buf) {
+        match wire::encode(
+            &wire::Message::Beacon(beacon),
+            &mut self.cipher,
+            &mut self.tx_buf,
+        ) {
             Ok(packet) => {
                 self.tx_len = packet.len();
                 true
@@ -1086,7 +1111,7 @@ impl Engine {
                 (Some(out), _) => out.to_message(hello.clone()),
                 (None, _) => wire::Message::Hello(hello.clone()),
             };
-            if let Ok(packet) = wire::encode(&message, &mut self.tx_buf)
+            if let Ok(packet) = wire::encode(&message, &mut self.cipher, &mut self.tx_buf)
                 && packet.len() <= usize::from(self.max_packet_len)
             {
                 self.tx_len = packet.len();
@@ -1151,8 +1176,33 @@ mod tests {
 
     const FRAME_US: u64 = 16_000_000;
 
+    const TEST_KEY: [u8; 32] = [7; 32];
+
     fn engine(id: u32, seed: u64) -> Engine {
-        Engine::new(test_config(), test_modulation(), NodeId(id), seed).unwrap()
+        Engine::new(
+            test_config(),
+            test_modulation(),
+            NodeId(id),
+            seed,
+            &TEST_KEY,
+        )
+        .unwrap()
+    }
+
+    fn test_cipher(id: u32) -> wire::Cipher {
+        wire::Cipher::new(&TEST_KEY, NodeId(id), 0)
+    }
+
+    /// Test-side encode with the shared test key, standing in for a peer's
+    /// transmission.
+    fn encode<'a>(message: &wire::Message, buf: &'a mut [u8]) -> Result<&'a [u8], wire::Error> {
+        wire::encode(message, &mut test_cipher(0), buf)
+    }
+
+    /// Test-side decode with the shared test key, for inspecting an
+    /// engine's scheduled packet.
+    fn decode(packet: &[u8]) -> Result<wire::Message, wire::Error> {
+        wire::try_decode(packet, &test_cipher(0))
     }
 
     #[test]
@@ -1171,7 +1221,7 @@ mod tests {
         // 150 slots of 40 ms = 6 s frame; 10 ms budget fits no packet
         let config = Config::new(40_000, 150, 15_000, 1, 1).unwrap();
         assert!(matches!(
-            Engine::new(config, test_modulation(), NodeId(1), 7),
+            Engine::new(config, test_modulation(), NodeId(1), 7, &TEST_KEY),
             Err(Error::SlotTooShort { .. })
         ));
     }
@@ -1188,7 +1238,7 @@ mod tests {
                     let slot = e.position(at_us).unwrap().slot;
                     if test_config().slot_kind(slot) == SlotKind::Data {
                         assert!(matches!(
-                            wire::decode(e.packet()),
+                            decode(e.packet()),
                             Ok(wire::Message::Hello(h)) if h.slot == e.slot()
                         ));
                     }
@@ -1263,13 +1313,32 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_key_packets_are_rejected() {
+        let mut buf = [0u8; 255];
+        let beacon = wire::Message::Beacon(Beacon {
+            root: NodeId(1),
+            root_has_gps: true,
+            stratum: 0,
+            frame_number: 42,
+        });
+        let packet = encode(&beacon, &mut buf).unwrap();
+        let mut e = Engine::new(test_config(), test_modulation(), NodeId(2), 7, &[8; 32]).unwrap();
+        assert!(matches!(
+            e.on_packet(20_000_000, packet, -80, 5),
+            Err(wire::Error::Auth)
+        ));
+        // the rejected beacon must not have synced the engine
+        assert_eq!(e.position(20_100_000), None);
+    }
+
+    #[test]
     fn queued_text_rides_the_data_slot() {
         let mut a = engine(1, 7);
         let mut b = engine(2, 8);
-        assert_eq!(a.max_text_len(), 48);
+        assert_eq!(a.max_text_len(), 80);
         assert_eq!(
-            a.queue_text(5_000_000, &[0u8; 64]),
-            Err(QueueError::TooLong { len: 64, max: 48 })
+            a.queue_text(5_000_000, &[0u8; 96]),
+            Err(QueueError::TooLong { len: 96, max: 80 })
         );
         a.queue_text(5_000_000, b"hi from a").unwrap();
         a.queue_text(5_000_000, b"two").unwrap();
@@ -1278,7 +1347,7 @@ mod tests {
         assert_eq!(a.queue_text(5_000_000, b"overflow"), Err(QueueError::Busy));
 
         let at_us = step_to_data_tx(&mut a, 20_000_000);
-        let text = match wire::decode(a.packet()) {
+        let text = match decode(a.packet()) {
             Ok(wire::Message::Text(text)) => text,
             other => panic!("expected text, got {other:?}"),
         };
@@ -1299,7 +1368,7 @@ mod tests {
         // unconfirmed: rebuilt next frame; confirmed: the queue advances
         let at_us = step_to_data_tx(&mut a, at_us + 60_000);
         assert!(matches!(
-            wire::decode(a.packet()),
+            decode(a.packet()),
             Ok(wire::Message::Text(t)) if t.body.as_slice() == b"hi from a"
         ));
         assert_eq!(a.texts_pending(), 4);
@@ -1308,7 +1377,7 @@ mod tests {
         a.on_transmitted(); // no tx since build: must NOT pop another entry
         let _ = step_to_data_tx(&mut a, at_us + 60_000);
         assert!(matches!(
-            wire::decode(a.packet()),
+            decode(a.packet()),
             Ok(wire::Message::Text(t)) if t.body.as_slice() == b"two"
         ));
     }
@@ -1344,7 +1413,7 @@ mod tests {
         assert_eq!(b.take_text(), None);
 
         let at_b = step_to_data_tx(&mut b, 21_000_000);
-        let forward = match wire::decode(b.packet()) {
+        let forward = match decode(b.packet()) {
             Ok(wire::Message::Text(text)) => text,
             other => panic!("expected forward, got {other:?}"),
         };
@@ -1359,10 +1428,7 @@ mod tests {
 
         // the duplicate never re-enters b's outbox: next data tx is a hello
         let _ = step_to_data_tx(&mut b, at_b + 60_000);
-        assert!(matches!(
-            wire::decode(b.packet()),
-            Ok(wire::Message::Hello(_))
-        ));
+        assert!(matches!(decode(b.packet()), Ok(wire::Message::Hello(_))));
 
         // c receives the forward attributed to the author, not the relay
         c.on_packet(21_500_000, &from_b[..len_b], -60, 9).unwrap();
@@ -1395,14 +1461,11 @@ mod tests {
             body,
         });
         let mut buf = [0u8; 255];
-        let packet = wire::encode(&capped, &mut buf).unwrap();
+        let packet = encode(&capped, &mut buf).unwrap();
         d.on_packet(20_500_000, packet, -60, 9).unwrap();
         assert!(d.take_text().is_some());
         let _ = step_to_data_tx(&mut d, 21_000_000);
-        assert!(matches!(
-            wire::decode(d.packet()),
-            Ok(wire::Message::Hello(_))
-        ));
+        assert!(matches!(decode(d.packet()), Ok(wire::Message::Hello(_))));
     }
 
     #[test]
@@ -1414,13 +1477,13 @@ mod tests {
 
         let at_us = step_to_data_tx(&mut a, 21_600_000);
         assert!(matches!(
-            wire::decode(a.packet()),
+            decode(a.packet()),
             Ok(wire::Message::Text(t)) if t.body.as_slice() == b"early" && t.timestamp.is_none()
         ));
         a.on_transmitted();
         let _ = step_to_data_tx(&mut a, at_us + 60_000);
         assert!(matches!(
-            wire::decode(a.packet()),
+            decode(a.packet()),
             Ok(wire::Message::Text(t))
                 if t.body.as_slice() == b"later" && t.timestamp == Some(16_001)
         ));
@@ -1435,7 +1498,7 @@ mod tests {
                 neighbors: heapless::Vec::new(),
             },
         });
-        wire::encode(&message, buf).unwrap().len()
+        encode(&message, buf).unwrap().len()
     }
 
     #[test]
@@ -1467,7 +1530,7 @@ mod tests {
         let mut at_r = 30_000_000;
         loop {
             at_r = step_to_data_tx(&mut relay, at_r);
-            let idle = matches!(wire::decode(relay.packet()), Ok(wire::Message::Hello(_)));
+            let idle = matches!(decode(relay.packet()), Ok(wire::Message::Hello(_)));
             relay.on_transmitted();
             at_r += 60_000;
             if idle {
@@ -1493,7 +1556,7 @@ mod tests {
             heapless::Vec::new();
         for _ in 0..16 {
             let at = step_to_data_tx(&mut relay, now);
-            if let Ok(wire::Message::Text(t)) = wire::decode(relay.packet()) {
+            if let Ok(wire::Message::Text(t)) = decode(relay.packet()) {
                 assert_eq!(t.hops, MAX_TEXT_HOPS);
                 replayed.push(t.body.clone()).unwrap();
             }
@@ -1510,7 +1573,7 @@ mod tests {
         // session drained: back to bare hellos
         let _ = step_to_data_tx(&mut relay, now);
         assert!(matches!(
-            wire::decode(relay.packet()),
+            decode(relay.packet()),
             Ok(wire::Message::Hello(_))
         ));
     }
@@ -1540,7 +1603,7 @@ mod tests {
         let mut at_r = 30_000_000;
         loop {
             at_r = step_to_data_tx(&mut relay, at_r);
-            let idle = matches!(wire::decode(relay.packet()), Ok(wire::Message::Hello(_)));
+            let idle = matches!(decode(relay.packet()), Ok(wire::Message::Hello(_)));
             relay.on_transmitted();
             at_r += 60_000;
             if idle {
@@ -1561,7 +1624,7 @@ mod tests {
         let mut now = at_r + 150_000;
         for _ in 0..16 {
             let at = step_to_data_tx(&mut relay, now);
-            if let Ok(wire::Message::Text(t)) = wire::decode(relay.packet()) {
+            if let Ok(wire::Message::Text(t)) = decode(relay.packet()) {
                 assert_eq!(t.body.as_slice(), b"m2");
                 return;
             }
@@ -1591,7 +1654,7 @@ mod tests {
         let mut at_r = 30_000_000;
         loop {
             at_r = step_to_data_tx(&mut relay, at_r);
-            let idle = matches!(wire::decode(relay.packet()), Ok(wire::Message::Hello(_)));
+            let idle = matches!(decode(relay.packet()), Ok(wire::Message::Hello(_)));
             relay.on_transmitted();
             at_r += 60_000;
             if idle {
@@ -1612,7 +1675,7 @@ mod tests {
             frame_number: 3,
         });
         let mut buf = [0u8; 255];
-        let coup_len = wire::encode(&coup, &mut buf).unwrap().len();
+        let coup_len = encode(&coup, &mut buf).unwrap().len();
         relay
             .on_packet(at_r + 100_000, &buf[..coup_len], -60, 9)
             .unwrap();
@@ -1622,7 +1685,7 @@ mod tests {
         let mut now = at_r + 200_000;
         for _ in 0..12 {
             let at = step_to_data_tx(&mut relay, now);
-            if let Ok(wire::Message::Text(t)) = wire::decode(relay.packet()) {
+            if let Ok(wire::Message::Text(t)) = decode(relay.packet()) {
                 assert_eq!(t.body.as_slice(), b"m1");
                 assert_eq!(t.hops, MAX_TEXT_HOPS);
                 return;
@@ -1668,7 +1731,7 @@ mod tests {
         let mut at_r = 30_000_000;
         loop {
             at_r = step_to_data_tx(&mut reborn, at_r);
-            let idle = matches!(wire::decode(reborn.packet()), Ok(wire::Message::Hello(_)));
+            let idle = matches!(decode(reborn.packet()), Ok(wire::Message::Hello(_)));
             reborn.on_transmitted();
             at_r += 60_000;
             if idle {
@@ -1681,7 +1744,7 @@ mod tests {
         let mut now = at_r + 60_000;
         for _ in 0..12 {
             let at = step_to_data_tx(&mut reborn, now);
-            if let Ok(wire::Message::Text(t)) = wire::decode(reborn.packet()) {
+            if let Ok(wire::Message::Text(t)) = decode(reborn.packet()) {
                 assert_eq!(t.body.as_slice(), b"keep me");
                 return;
             }
@@ -1733,7 +1796,7 @@ mod tests {
         a.set_alias(5_000_000, b"noot").unwrap();
 
         let at_a = step_to_data_tx(&mut a, 20_000_000);
-        let alias = match wire::decode(a.packet()) {
+        let alias = match decode(a.packet()) {
             Ok(wire::Message::Alias(alias)) => alias,
             other => panic!("expected alias, got {other:?}"),
         };
@@ -1754,7 +1817,7 @@ mod tests {
         );
 
         let at_b = step_to_data_tx(&mut b, 21_000_000);
-        let fwd = match wire::decode(b.packet()) {
+        let fwd = match decode(b.packet()) {
             Ok(wire::Message::Alias(alias)) => alias,
             other => panic!("expected alias forward, got {other:?}"),
         };
@@ -1766,7 +1829,7 @@ mod tests {
         let mut copy = [0u8; 255];
         let len = {
             let mut buf = [0u8; 255];
-            let p = wire::encode(&wire::Message::Alias(fwd), &mut buf).unwrap();
+            let p = encode(&wire::Message::Alias(fwd), &mut buf).unwrap();
             copy[..p.len()].copy_from_slice(p);
             p.len()
         };
@@ -1777,10 +1840,7 @@ mod tests {
         // the 10-minute re-announce comes due
         a.on_transmitted();
         let _ = step_to_data_tx(&mut a, at_a + 500_000);
-        assert!(matches!(
-            wire::decode(a.packet()),
-            Ok(wire::Message::Hello(_))
-        ));
+        assert!(matches!(decode(a.packet()), Ok(wire::Message::Hello(_))));
     }
 
     #[test]
@@ -1821,7 +1881,7 @@ mod tests {
             neighbors,
         });
         let mut buf = [0u8; 255];
-        let len = wire::encode(&hello, &mut buf).unwrap().len();
+        let len = encode(&hello, &mut buf).unwrap().len();
         e.on_packet(1_000_000, &buf[..len], -87, 9).unwrap();
 
         let peers = e.peers(1_500_000);
@@ -1850,7 +1910,7 @@ mod tests {
             neighbors: heapless::Vec::new(),
         });
         let mut buf = [0u8; 255];
-        let len = wire::encode(&hello, &mut buf).unwrap().len();
+        let len = encode(&hello, &mut buf).unwrap().len();
 
         // first appearance: not a return, no recap beyond the join-time one
         e.request_recap();
@@ -1859,27 +1919,18 @@ mod tests {
         let mut now = 20_000_000;
         for _ in 0..RECAP_SENDS {
             now = step_to_data_tx(&mut e, now);
-            assert!(matches!(
-                wire::decode(e.packet()),
-                Ok(wire::Message::Recap(_))
-            ));
+            assert!(matches!(decode(e.packet()), Ok(wire::Message::Recap(_))));
             e.on_transmitted();
             now += 60_000;
         }
         now = step_to_data_tx(&mut e, now);
-        assert!(matches!(
-            wire::decode(e.packet()),
-            Ok(wire::Message::Hello(_))
-        ));
+        assert!(matches!(decode(e.packet()), Ok(wire::Message::Hello(_))));
 
         // silence past the neighbor TTL, then the peer reappears: recap
         let gap = now + 5 * FRAME_US;
         e.on_packet(gap, &buf[..len], -60, 9).unwrap();
         let _ = step_to_data_tx(&mut e, gap + 100_000);
-        assert!(matches!(
-            wire::decode(e.packet()),
-            Ok(wire::Message::Recap(_))
-        ));
+        assert!(matches!(decode(e.packet()), Ok(wire::Message::Recap(_))));
     }
 
     #[test]
@@ -1893,18 +1944,12 @@ mod tests {
             now += 60_000;
         }
         now = step_to_data_tx(&mut e, now);
-        assert!(matches!(
-            wire::decode(e.packet()),
-            Ok(wire::Message::Hello(_))
-        ));
+        assert!(matches!(decode(e.packet()), Ok(wire::Message::Hello(_))));
 
         // past the heartbeat period, the data slot carries a request again
         let later = now + RECAP_PERIOD_US + FRAME_US;
         let _ = step_to_data_tx(&mut e, later);
-        assert!(matches!(
-            wire::decode(e.packet()),
-            Ok(wire::Message::Recap(_))
-        ));
+        assert!(matches!(decode(e.packet()), Ok(wire::Message::Recap(_))));
     }
 
     #[test]
@@ -1916,7 +1961,7 @@ mod tests {
         assert!(a.announce_position());
 
         let at_a = step_to_data_tx(&mut a, 20_000_000);
-        let position = match wire::decode(a.packet()) {
+        let position = match decode(a.packet()) {
             Ok(wire::Message::Position(position)) => position,
             other => panic!("expected position, got {other:?}"),
         };
@@ -1939,7 +1984,7 @@ mod tests {
         // b forwards the flood with the hop bumped
         let _ = step_to_data_tx(&mut b, 21_000_000);
         assert!(matches!(
-            wire::decode(b.packet()),
+            decode(b.packet()),
             Ok(wire::Message::Position(p)) if p.hops == 1 && p.hello.sender == NodeId(2)
         ));
     }
@@ -1954,7 +1999,7 @@ mod tests {
             neighbors: heapless::Vec::new(),
         });
         let mut buf = [0u8; 255];
-        let len = wire::encode(&hello, &mut buf).unwrap().len();
+        let len = encode(&hello, &mut buf).unwrap().len();
         e.on_packet(1_000_000, &buf[..len], -60, 9).unwrap();
         assert_eq!(e.peer_count(1_100_000), 1);
         // silent past the 4-frame neighbor TTL: out of range
@@ -2002,7 +2047,7 @@ mod tests {
         assert!(at_us >= start + 2 * FRAME_US);
         assert!(at_us <= start + 7 * FRAME_US);
         assert!(matches!(
-            wire::decode(e.packet()),
+            decode(e.packet()),
             Ok(wire::Message::Beacon(b)) if b.root == NodeId(3) && !b.root_has_gps
         ));
     }

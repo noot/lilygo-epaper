@@ -56,6 +56,17 @@ fn now_us() -> u64 {
     Instant::now().duration_since_epoch().as_micros()
 }
 
+// meshnet-wide symmetric key baked in at build time from the MESH_KEY env
+// (64 hex chars, see .env); every packet is sealed with it, so all nodes
+// must share it. falls back to a public dev key so unkeyed builds still work.
+const MESH_KEY: [u8; 32] = match option_env!("MESH_KEY") {
+    Some(hex) => match wire::key_from_hex(hex) {
+        Some(key) => key,
+        None => panic!("MESH_KEY must be exactly 64 hex chars"),
+    },
+    None => [0u8; 32],
+};
+
 /// derive the radio configuration from the fleet profile, so the modulation
 /// the airtime math assumes is the modulation the radio actually uses (this
 /// driver's own default is SF10, which the T3-S3 nodes cannot demodulate).
@@ -170,8 +181,17 @@ fn main() -> ! {
     let rng = Rng::new();
     let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
 
-    let mut engine = Engine::new(nootmesh::tdma::Config::default(), modulation, node_id, seed)
-        .expect("slot budget fits the modulation");
+    if MESH_KEY == [0u8; 32] {
+        println!("mesh: MESH_KEY unset, using public dev key");
+    }
+    let mut engine = Engine::new(
+        nootmesh::tdma::Config::default(),
+        modulation,
+        node_id,
+        seed,
+        &MESH_KEY,
+    )
+    .expect("slot budget fits the modulation");
     // catch up on chat missed while powered off: store nodes replay history
     engine.request_recap();
 
@@ -251,7 +271,7 @@ fn main() -> ! {
         let Action::Transmit { .. } = action else {
             continue;
         };
-        let is_hello = match wire::decode(engine.packet()) {
+        let is_hello = match engine.try_decode(engine.packet()) {
             Ok(wire::Message::Beacon(b)) => {
                 println!("tx beacon stratum {} frame {}", b.stratum, b.frame_number);
                 false
